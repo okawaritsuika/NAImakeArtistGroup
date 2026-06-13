@@ -2,11 +2,66 @@ import hashlib
 import json
 import sqlite3
 import struct
+import tempfile
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
 from style_logic import build_artist_prompt, normalize_style_artists, style_hash
+
+
+def _load_settings(settings_path):
+    try:
+        data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_settings(settings_path, settings):
+    path = Path(settings_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(settings, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
+def load_app_key(settings_path):
+    value = _load_settings(settings_path).get("novelai_app_key")
+    return value if type(value) is str else ""
+
+
+def save_app_key(settings_path, app_key):
+    if type(app_key) is not str or not app_key:
+        raise ValueError("NovelAI App Key를 입력하세요.")
+    settings = _load_settings(settings_path)
+    settings["novelai_app_key"] = app_key
+    _write_settings(settings_path, settings)
+
+
+def delete_app_key(settings_path):
+    path = Path(settings_path)
+    settings = _load_settings(path)
+    settings.pop("novelai_app_key", None)
+    if settings:
+        _write_settings(path, settings)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def connect_db(db_path):
