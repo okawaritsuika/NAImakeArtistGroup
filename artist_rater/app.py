@@ -12,6 +12,8 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
+from style_logic import assign_weights, build_artist_prompt, select_artists, style_hash
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -715,6 +717,103 @@ def api_list_ratings():
             item["sample_post_ids"] = []
         items.append(item)
     return json_response(items)
+
+
+@app.route("/api/style-maker/artists", methods=["POST"])
+def api_style_maker_artists():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response({"ok": False, "error": "요청 내용을 확인하세요."}, 400)
+
+    try:
+        rng_seed = payload.get("rng_seed")
+        if rng_seed is not None:
+            rng_seed = int(rng_seed)
+        supplied = payload.get("artists") if "artists" in payload else None
+        if supplied is not None:
+            artists = validate_supplied_style_artists(supplied)
+        else:
+            scores = payload.get("scores", [1, 2, 3, 4, 5])
+            if not isinstance(scores, list) or not scores:
+                raise ValueError("선택할 평점을 하나 이상 지정하세요.")
+            try:
+                scores = [int(score) for score in scores]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("평점은 1부터 5 사이여야 합니다.") from exc
+            if any(score not in SCORE_RANGE for score in scores):
+                raise ValueError("평점은 1부터 5 사이여야 합니다.")
+            with closing(db()) as conn:
+                rows = conn.execute("SELECT artist_tag, score FROM ratings").fetchall()
+            pool = [
+                {"artist": row["artist_tag"], "score": row["score"]}
+                for row in rows
+            ]
+            artists = select_artists(
+                pool,
+                payload.get("count", 12),
+                scores,
+                rng_seed=rng_seed,
+            )
+
+        weighted = assign_weights(
+            artists,
+            payload.get("weight_mode", "balanced"),
+            payload.get("min_weight", 0.1),
+            payload.get("max_weight", 2.3),
+            bool(payload.get("prefer_high_scores", False)),
+            payload.get("ranges") or [],
+            rng_seed=rng_seed,
+        )
+        artist_prompt = build_artist_prompt(weighted)
+        return json_response(
+            {
+                "ok": True,
+                "artists": weighted,
+                "artist_prompt": artist_prompt,
+                "style_hash": style_hash(weighted),
+            }
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"ok": False, "error": str(exc)}, 400)
+
+
+SCORE_RANGE = {1, 2, 3, 4, 5}
+
+
+def validate_supplied_style_artists(supplied):
+    if not isinstance(supplied, list) or not supplied:
+        raise ValueError("작가 목록을 하나 이상 입력하세요.")
+
+    artists = []
+    seen = set()
+    for item in supplied:
+        if not isinstance(item, dict):
+            raise ValueError("작가 목록 형식을 확인하세요.")
+        artist = str(item.get("artist") or "").strip()
+        try:
+            score = int(item.get("score"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("작가 평점은 1부터 5 사이여야 합니다.") from exc
+        if not artist or score not in SCORE_RANGE:
+            raise ValueError("작가 태그와 평점을 확인하세요.")
+        if artist in seen:
+            raise ValueError("중복된 작가는 사용할 수 없습니다.")
+        artists.append({"artist": artist, "score": score})
+        seen.add(artist)
+
+    placeholders = ", ".join("?" for _ in artists)
+    with closing(db()) as conn:
+        rows = conn.execute(
+            f"SELECT artist_tag, score FROM ratings WHERE artist_tag IN ({placeholders})",
+            [item["artist"] for item in artists],
+        ).fetchall()
+    ratings = {row["artist_tag"]: int(row["score"]) for row in rows}
+    for item in artists:
+        if item["artist"] not in ratings:
+            raise ValueError(f"평가되지 않은 작가입니다: {item['artist']}")
+        if ratings[item["artist"]] != item["score"]:
+            raise ValueError(f"저장된 평점과 일치하지 않습니다: {item['artist']}")
+    return artists
 
 
 @app.route("/api/ratings/<int:rating_id>", methods=["PATCH"])

@@ -7,7 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import app
-from style_logic import build_artist_prompt, normalize_style_artists, style_hash
+from style_logic import (
+    assign_weights,
+    build_artist_prompt,
+    normalize_style_artists,
+    select_artists,
+    style_hash,
+)
 from style_store import connect_db, get_style_detail, list_styles, save_generated_result
 
 
@@ -98,6 +104,290 @@ class StyleIdentityTest(unittest.TestCase):
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize_style_artists(invalid)
+
+
+class ArtistSelectionTest(unittest.TestCase):
+    def setUp(self):
+        self.pool = [
+            {"artist": f"artist_{index}", "score": score}
+            for index, score in enumerate(
+                [1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 5, 4], start=1
+            )
+        ]
+
+    def test_selection_deduplicates_artist_records(self):
+        pool = self.pool + [
+            {"artist": "artist_1", "score": 5},
+            {"artist": "artist_2", "score": 2},
+        ]
+
+        selected = select_artists(pool, 12, [1, 2, 3, 4, 5], rng_seed=7)
+
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(len({item["artist"] for item in selected}), 12)
+
+    def test_selection_filters_scores_and_rejects_invalid_count(self):
+        selected = select_artists(self.pool, 3, [5], rng_seed=3)
+
+        self.assertEqual({item["score"] for item in selected}, {5})
+        with self.assertRaisesRegex(ValueError, "선택 가능한 작가"):
+            select_artists(self.pool, 4, [5], rng_seed=3)
+        with self.assertRaisesRegex(ValueError, "선택 가능한 작가"):
+            select_artists(self.pool, 0, [5], rng_seed=3)
+        with self.assertRaisesRegex(ValueError, "선택 가능한 작가"):
+            select_artists(self.pool, 1.5, [5], rng_seed=3)
+
+    def test_selection_is_deterministic_with_seed(self):
+        first = select_artists(self.pool, 6, [1, 2, 3, 4, 5], rng_seed=19)
+        second = select_artists(self.pool, 6, [1, 2, 3, 4, 5], rng_seed=19)
+
+        self.assertEqual(first, second)
+
+
+class WeightEngineTest(unittest.TestCase):
+    def setUp(self):
+        self.artists = [
+            {"artist": f"artist_{index}", "score": score}
+            for index, score in enumerate(
+                [1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 5, 4], start=1
+            )
+        ]
+
+    def test_balanced_twelve_has_exact_default_tiers_and_preserves_order(self):
+        weighted = assign_weights(
+            self.artists, "balanced", 0.1, 2.3, True, [], rng_seed=9
+        )
+
+        self.assertEqual(
+            [item["artist"] for item in weighted],
+            [item["artist"] for item in self.artists],
+        )
+        self.assertEqual(sum(item["weight"] < 1.0 for item in weighted), 5)
+        self.assertEqual(sum(1.0 <= item["weight"] < 1.5 for item in weighted), 4)
+        self.assertEqual(sum(item["weight"] >= 1.5 for item in weighted), 3)
+
+    def test_balanced_high_tier_never_exceeds_twenty_five_percent(self):
+        artists = [
+            {"artist": f"artist_{index}", "score": (index % 5) + 1}
+            for index in range(20)
+        ]
+
+        weighted = assign_weights(
+            artists, "balanced", 0.1, 2.3, False, [], rng_seed=4
+        )
+
+        self.assertLessEqual(sum(item["weight"] >= 1.5 for item in weighted), 5)
+
+    def test_balanced_handles_tiny_counts_and_clipped_ranges(self):
+        for minimum, maximum in (
+            (0.4, 0.8),
+            (0.91, 0.99),
+            (1.1, 1.4),
+            (1.8, 2.0),
+        ):
+            with self.subTest(minimum=minimum, maximum=maximum):
+                weighted = assign_weights(
+                    self.artists[:2],
+                    "balanced",
+                    minimum,
+                    maximum,
+                    True,
+                    [],
+                    rng_seed=2,
+                )
+                self.assertEqual(len(weighted), 2)
+                self.assertTrue(
+                    all(minimum <= item["weight"] <= maximum for item in weighted)
+                )
+
+    def test_custom_mode_rejects_invalid_ranges_and_capacity(self):
+        with self.assertRaisesRegex(ValueError, "수용 인원"):
+            assign_weights(
+                self.artists[:4],
+                "custom",
+                0.1,
+                2.3,
+                False,
+                [{"min": 0.1, "max": 0.9, "max_people": 3}],
+                rng_seed=1,
+            )
+        invalid_ranges = (
+            [{"min": 0, "max": 0.9, "max_people": 4}],
+            [{"min": 0.1, "max": 2.4, "max_people": 4}],
+            [{"min": 0.1, "max": 0.9, "max_people": 4.5}],
+            [
+                {"min": 0.1, "max": 1.0, "max_people": 2},
+                {"min": 0.9, "max": 1.5, "max_people": 2},
+            ],
+        )
+        for ranges in invalid_ranges:
+            with self.subTest(ranges=ranges), self.assertRaisesRegex(
+                ValueError, "사용자 구간"
+            ):
+                assign_weights(
+                    self.artists[:4],
+                    "custom",
+                    0.1,
+                    2.3,
+                    False,
+                    ranges,
+                    rng_seed=1,
+                )
+
+    def test_empty_custom_ranges_fall_back_to_seeded_random(self):
+        first = assign_weights(
+            self.artists[:3], "custom", 0.1, 2.3, False, [], rng_seed=2
+        )
+        second = assign_weights(
+            self.artists[:3], "custom", 0.1, 2.3, False, [], rng_seed=2
+        )
+
+        self.assertEqual(first, second)
+        self.assertTrue(all(0.1 <= item["weight"] <= 2.3 for item in first))
+
+    def test_score_priority_is_a_tendency_not_a_hard_exclusion(self):
+        artists = [
+            {"artist": "low", "score": 1},
+            {"artist": "high", "score": 5},
+            {"artist": "mid_a", "score": 3},
+            {"artist": "mid_b", "score": 3},
+        ]
+        low_weights = []
+        high_weights = []
+        low_reached_high_tier = False
+        for seed in range(100):
+            weighted = assign_weights(
+                artists, "balanced", 0.1, 2.3, True, [], rng_seed=seed
+            )
+            by_artist = {item["artist"]: item["weight"] for item in weighted}
+            low_weights.append(by_artist["low"])
+            high_weights.append(by_artist["high"])
+            low_reached_high_tier |= by_artist["low"] >= 1.5
+
+        self.assertGreater(sum(high_weights) / 100, sum(low_weights) / 100)
+        self.assertTrue(low_reached_high_tier)
+
+    def test_rejects_invalid_global_range_and_unknown_mode(self):
+        invalid_bounds = ((float("nan"), 2.3), (0, 2.3), (2.0, 1.0))
+        for minimum, maximum in invalid_bounds:
+            with self.subTest(minimum=minimum, maximum=maximum), self.assertRaises(
+                ValueError
+            ):
+                assign_weights(
+                    self.artists[:1],
+                    "random",
+                    minimum,
+                    maximum,
+                    False,
+                    [],
+                )
+        with self.assertRaisesRegex(ValueError, "가중치 모드"):
+            assign_weights(
+                self.artists[:1], "mystery", 0.1, 2.3, False, [], rng_seed=1
+            )
+
+
+class ArtistStyleEndpointTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.temp_dir.name)
+        self.originals = (
+            app.DATA_DIR,
+            app.THUMBNAIL_DIR,
+            app.GENERATED_DIR,
+            app.SETTINGS_JSON_PATH,
+            app.DB_PATH,
+        )
+        app.DATA_DIR = self.data_dir
+        app.THUMBNAIL_DIR = self.data_dir / "thumbnails"
+        app.GENERATED_DIR = self.data_dir / "generated"
+        app.SETTINGS_JSON_PATH = self.data_dir / "settings.json"
+        app.DB_PATH = self.data_dir / "artist_rater.sqlite"
+        app.init_db()
+        self.client = app.app.test_client()
+        with closing(app.db()) as conn, conn:
+            for artist, score in (("alpha", 5), ("beta", 4), ("gamma", 2)):
+                conn.execute(
+                    """
+                    INSERT INTO ratings (
+                        artist_tag, score, mode, created_at, updated_at
+                    ) VALUES (?, ?, 'manual', ?, ?)
+                    """,
+                    (artist, score, app.now_text(), app.now_text()),
+                )
+
+    def tearDown(self):
+        (
+            app.DATA_DIR,
+            app.THUMBNAIL_DIR,
+            app.GENERATED_DIR,
+            app.SETTINGS_JSON_PATH,
+            app.DB_PATH,
+        ) = self.originals
+        self.temp_dir.cleanup()
+
+    def test_endpoint_selects_from_ratings_table(self):
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 2,
+                "scores": [4, 5],
+                "weight_mode": "random",
+                "min_weight": 0.5,
+                "max_weight": 1.5,
+                "prefer_high_scores": True,
+                "rng_seed": 8,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual({item["artist"] for item in data["artists"]}, {"alpha", "beta"})
+        self.assertIn("artist_prompt", data)
+        self.assertIn("style_hash", data)
+
+    def test_optional_artists_preserve_order_and_only_reroll_weights(self):
+        supplied = [
+            {"artist": "gamma", "score": 2},
+            {"artist": "alpha", "score": 5},
+        ]
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "artists": supplied,
+                "weight_mode": "random",
+                "min_weight": 0.1,
+                "max_weight": 2.3,
+                "rng_seed": 11,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [item["artist"] for item in response.get_json()["artists"]],
+            ["gamma", "alpha"],
+        )
+
+    def test_endpoint_returns_400_for_invalid_user_input(self):
+        invalid_payloads = (
+            {"count": 4, "scores": [5]},
+            {
+                "artists": [
+                    {"artist": "alpha", "score": 5},
+                    {"artist": "alpha", "score": 5},
+                ]
+            },
+            {"artists": [{"artist": "alpha", "score": 1}]},
+            {"artists": [{"artist": "missing", "score": 5}]},
+            {"count": 1, "scores": [5], "weight_mode": "unknown"},
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/style-maker/artists", json=payload)
+                self.assertEqual(response.status_code, 400)
+                self.assertFalse(response.get_json()["ok"])
+                self.assertTrue(response.get_json()["error"])
 
 
 class StyleStoreIntegrationTest(unittest.TestCase):
