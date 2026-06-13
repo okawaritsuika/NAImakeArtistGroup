@@ -733,8 +733,14 @@ def api_style_maker_artists():
 
     try:
         rng_seed = payload.get("rng_seed")
-        if rng_seed is not None:
-            rng_seed = int(rng_seed)
+        if rng_seed is not None and type(rng_seed) is not int:
+            raise ValueError("난수 시드는 JSON 정수여야 합니다.")
+        if (
+            "prefer_high_scores" in payload
+            and type(payload["prefer_high_scores"]) is not bool
+        ):
+            raise ValueError("평점 우선 여부는 JSON 불리언이어야 합니다.")
+        prefer_high_scores = payload.get("prefer_high_scores", False)
         supplied = payload.get("artists") if "artists" in payload else None
         if supplied is not None:
             artists = validate_supplied_style_artists(supplied)
@@ -761,7 +767,7 @@ def api_style_maker_artists():
             payload.get("weight_mode", "balanced"),
             payload.get("min_weight", 0.1),
             payload.get("max_weight", 2.3),
-            bool(payload.get("prefer_high_scores", False)),
+            prefer_high_scores,
             payload.get("ranges") or [],
             rng_seed=rng_seed,
         )

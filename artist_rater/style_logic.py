@@ -70,7 +70,14 @@ def select_artists(pool, count, allowed_scores, rng_seed=None):
 
 
 def random_weight(rng, low, high):
-    return round(rng.uniform(float(low), float(high)), 2)
+    low = float(low)
+    high = float(high)
+    epsilon = 1e-9
+    minimum_cent = max(1, math.ceil(low * 100 - epsilon))
+    maximum_cent = math.floor(high * 100 + epsilon)
+    if minimum_cent > maximum_cent:
+        raise ValueError("범위 안에 유효한 양수 센트 가중치가 없습니다.")
+    return rng.randint(minimum_cent, maximum_cent) / 100
 
 
 def _tier_counts(count, tier_names):
@@ -164,10 +171,15 @@ def validate_custom_ranges(ranges, artist_count, minimum, maximum):
     return validated
 
 
-def assign_items_to_tiers(items, tiers, rng):
+def assign_items_to_tiers(items, tiers, rng, high_first):
     assigned = []
     item_index = 0
-    for tier in sorted(tiers, key=lambda item: item["min"], reverse=True):
+    ordered_tiers = (
+        sorted(tiers, key=lambda item: item["min"], reverse=True)
+        if high_first
+        else tiers
+    )
+    for tier in ordered_tiers:
         for _ in range(tier["max_people"]):
             if item_index >= len(items):
                 return assigned
@@ -224,12 +236,17 @@ def assign_weights(
     if prefer_high_scores:
         ranked = sorted(
             items,
-            key=lambda item: float(item.get("score") or 0) + rng.random() * 8,
+            key=lambda item: float(item.get("score") or 0) + rng.random() * 4,
             reverse=True,
         )
     else:
         ranked = rng.sample(items, len(items))
-    assigned = assign_items_to_tiers(ranked, tiers, rng)
+    assigned = assign_items_to_tiers(
+        ranked,
+        tiers,
+        rng,
+        high_first=mode == "balanced",
+    )
     weights_by_index = {item["_index"]: item["weight"] for item in assigned}
     return [
         {key: value for key, value in item.items() if key != "_index"}

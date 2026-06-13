@@ -11,6 +11,7 @@ from style_logic import (
     assign_weights,
     build_artist_prompt,
     normalize_style_artists,
+    random_weight,
     select_artists,
     style_hash,
 )
@@ -169,6 +170,45 @@ class WeightEngineTest(unittest.TestCase):
             )
         ]
 
+    def test_random_weight_uses_only_positive_cent_values_inside_range(self):
+        import random
+
+        rng = random.Random(7)
+        with self.assertRaisesRegex(ValueError, "센트"):
+            random_weight(rng, 0.006, 0.006)
+        with self.assertRaisesRegex(ValueError, "센트"):
+            random_weight(rng, 0.011, 0.019)
+
+        narrow = {random_weight(rng, 0.011, 0.021) for _ in range(20)}
+        normal = {random_weight(rng, 0.1, 2.3) for _ in range(100)}
+        self.assertEqual(narrow, {0.02})
+        self.assertTrue(all(0.1 <= value <= 2.3 and value > 0 for value in normal))
+        self.assertTrue(
+            all(abs(value * 100 - round(value * 100)) < 1e-9 for value in normal)
+        )
+
+    def test_all_assignment_modes_reject_ranges_without_a_valid_cent(self):
+        for mode, ranges in (
+            ("random", []),
+            ("balanced", []),
+            (
+                "custom",
+                [{"min": 0.006, "max": 0.006, "max_people": 1}],
+            ),
+        ):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                ValueError, "센트"
+            ):
+                assign_weights(
+                    self.artists[:1],
+                    mode,
+                    0.006,
+                    0.006,
+                    False,
+                    ranges,
+                    rng_seed=1,
+                )
+
     def test_balanced_twelve_has_exact_default_tiers_and_preserves_order(self):
         weighted = assign_weights(
             self.artists, "balanced", 0.1, 2.3, True, [], rng_seed=9
@@ -277,9 +317,72 @@ class WeightEngineTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(all(0.1 <= item["weight"] <= 2.3 for item in first))
 
+    def test_custom_ranges_allocate_in_user_supplied_order(self):
+        class ControlledRng:
+            def sample(self, items, count):
+                return list(items)
+
+            def randint(self, low, high):
+                return low
+
+        with patch("style_logic.random.Random", return_value=ControlledRng()):
+            weighted = assign_weights(
+                self.artists[:2],
+                "custom",
+                0.1,
+                2.3,
+                False,
+                [
+                    {"min": 0.1, "max": 0.2, "max_people": 1},
+                    {"min": 1.5, "max": 1.6, "max_people": 1},
+                ],
+                rng_seed=1,
+            )
+
+        self.assertEqual(weighted[0]["weight"], 0.1)
+        self.assertEqual(weighted[1]["weight"], 1.5)
+
+    def test_score_priority_uses_exact_four_point_jitter(self):
+        class ControlledRng:
+            def __init__(self, values):
+                self.values = iter(values)
+
+            def random(self):
+                return next(self.values)
+
+            def randint(self, low, high):
+                return low
+
+        artists = [
+            {"artist": "low", "score": 2},
+            {"artist": "high", "score": 5},
+            {"artist": "other_a", "score": 1},
+            {"artist": "other_b", "score": 1},
+        ]
+        with patch(
+            "style_logic.random.Random",
+            return_value=ControlledRng([0.76, 0.0, 0.0, 0.0]),
+        ):
+            weighted = assign_weights(
+                artists, "balanced", 0.1, 2.3, True, [], rng_seed=1
+            )
+        by_artist = {item["artist"]: item["weight"] for item in weighted}
+        self.assertGreaterEqual(by_artist["low"], 1.5)
+
+        artists[0]["score"] = 1
+        with patch(
+            "style_logic.random.Random",
+            return_value=ControlledRng([0.99, 0.0, 0.0, 0.0]),
+        ):
+            weighted = assign_weights(
+                artists, "balanced", 0.1, 2.3, True, [], rng_seed=1
+            )
+        by_artist = {item["artist"]: item["weight"] for item in weighted}
+        self.assertGreaterEqual(by_artist["high"], 1.5)
+
     def test_score_priority_is_a_tendency_not_a_hard_exclusion(self):
         artists = [
-            {"artist": "low", "score": 1},
+            {"artist": "low", "score": 2},
             {"artist": "high", "score": 5},
             {"artist": "mid_a", "score": 3},
             {"artist": "mid_b", "score": 3},
@@ -483,6 +586,55 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["artists"][0]["score"], 5)
+
+    def test_endpoint_requires_json_integer_rng_seed(self):
+        for rng_seed in (True, 1.0, 1.5, "1"):
+            with self.subTest(rng_seed=rng_seed):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json={"count": 1, "scores": [5], "rng_seed": rng_seed},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("시드", response.get_json()["error"])
+
+        for payload in (
+            {"count": 1, "scores": [5]},
+            {"count": 1, "scores": [5], "rng_seed": None},
+            {"count": 1, "scores": [5], "rng_seed": 7},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    self.client.post(
+                        "/api/style-maker/artists", json=payload
+                    ).status_code,
+                    200,
+                )
+
+    def test_endpoint_requires_boolean_score_priority(self):
+        for prefer_high_scores in (None, 0, 1, "false", []):
+            with self.subTest(prefer_high_scores=prefer_high_scores):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json={
+                        "count": 1,
+                        "scores": [5],
+                        "prefer_high_scores": prefer_high_scores,
+                    },
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("우선", response.get_json()["error"])
+
+        for prefer_high_scores in (False, True):
+            with self.subTest(prefer_high_scores=prefer_high_scores):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json={
+                        "count": 1,
+                        "scores": [5],
+                        "prefer_high_scores": prefer_high_scores,
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
 
 
 class StyleStoreIntegrationTest(unittest.TestCase):
