@@ -43,6 +43,8 @@ def _validate_png(png_bytes):
     chunk_index = 0
     saw_idat = False
     saw_iend = False
+    idat_parts = []
+    image_header = None
     while offset < len(data):
         if len(data) - offset < 12:
             raise ValueError("PNG chunk is truncated.")
@@ -77,14 +79,17 @@ def _validate_png(png_bytes):
                 or bit_depth not in valid_depths.get(color_type, set())
                 or compression != 0
                 or filtering != 0
-                or interlace not in {0, 1}
             ):
                 raise ValueError("PNG IHDR fields are invalid.")
+            if interlace != 0:
+                raise ValueError("Interlaced PNG images are not supported.")
+            image_header = (width, height, bit_depth, color_type)
         elif chunk_type == b"IHDR":
             raise ValueError("PNG contains multiple IHDR chunks.")
 
         if chunk_type == b"IDAT":
             saw_idat = True
+            idat_parts.append(chunk_data)
         if chunk_type == b"IEND":
             if length != 0 or not saw_idat:
                 raise ValueError("PNG IEND or IDAT structure is invalid.")
@@ -97,6 +102,24 @@ def _validate_png(png_bytes):
 
     if not saw_iend:
         raise ValueError("PNG is missing IEND.")
+    try:
+        decompressor = zlib.decompressobj()
+        scanlines = decompressor.decompress(b"".join(idat_parts))
+        scanlines += decompressor.flush()
+    except zlib.error as exc:
+        raise ValueError("PNG IDAT data is not valid zlib data.") from exc
+    if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
+        raise ValueError("PNG IDAT data is not a complete zlib stream.")
+
+    width, height, bit_depth, color_type = image_header
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+    row_bytes = (width * channels * bit_depth + 7) // 8
+    expected_length = height * (1 + row_bytes)
+    if len(scanlines) != expected_length:
+        raise ValueError("PNG scanline data has an invalid length.")
+    for row in range(height):
+        if scanlines[row * (1 + row_bytes)] not in range(5):
+            raise ValueError("PNG scanline has an invalid filter type.")
     return data
 
 
@@ -301,20 +324,43 @@ def reconcile_generated_storage(db_path, generated_dir):
     root.mkdir(parents=True, exist_ok=True)
     conn = connect_db(db_path)
     try:
-        rows = conn.execute("SELECT image_path FROM generated_images").fetchall()
+        rows = conn.execute("SELECT id, style_id, image_path FROM generated_images").fetchall()
     finally:
         conn.close()
 
     referenced = set()
+    missing_image_ids = []
+    affected_style_ids = set()
     for row in rows:
         final_path = (root / row["image_path"]).resolve()
         if root not in final_path.parents:
+            missing_image_ids.append(row["id"])
+            affected_style_ids.add(row["style_id"])
             continue
-        referenced.add(final_path)
         staged_path = _staged_file_path(final_path)
         if not final_path.exists() and staged_path.is_file():
             final_path.parent.mkdir(parents=True, exist_ok=True)
             staged_path.replace(final_path)
+        if final_path.is_file():
+            referenced.add(final_path)
+        else:
+            missing_image_ids.append(row["id"])
+            affected_style_ids.add(row["style_id"])
+
+    if missing_image_ids:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        conn = connect_db(db_path)
+        try:
+            with conn:
+                placeholders = ",".join("?" for _ in missing_image_ids)
+                conn.execute(
+                    f"DELETE FROM generated_images WHERE id IN ({placeholders})",
+                    missing_image_ids,
+                )
+                for style_id in affected_style_ids:
+                    _recompute_style(conn, style_id, timestamp)
+        finally:
+            conn.close()
 
     for temp_path in root.rglob("*.tmp"):
         temp_path.unlink(missing_ok=True)

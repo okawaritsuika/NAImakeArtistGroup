@@ -17,12 +17,26 @@ def png_chunk(chunk_type, data):
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
 
 
-def tiny_png(pixel=b"\x00\xff\x00\x00\xff"):
+def tiny_png(scanlines=b"\x00\xff\x00\x00\xff", width=1, height=1, interlace=0):
+    return b"".join(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            png_chunk(
+                b"IHDR",
+                struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, interlace),
+            ),
+            png_chunk(b"IDAT", zlib.compress(scanlines)),
+            png_chunk(b"IEND", b""),
+        )
+    )
+
+
+def png_with_idat(idat_payload):
     return b"".join(
         (
             b"\x89PNG\r\n\x1a\n",
             png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)),
-            png_chunk(b"IDAT", zlib.compress(pixel)),
+            png_chunk(b"IDAT", idat_payload),
             png_chunk(b"IEND", b""),
         )
     )
@@ -195,6 +209,24 @@ class StyleStoreIntegrationTest(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM art_styles").fetchone()[0], 0)
         self.assertEqual(list(self.generated_dir.rglob("*")), [])
 
+    def test_rejects_invalid_zlib_and_invalid_scanlines(self):
+        invalid_images = (
+            ("invalid-zlib", png_with_idat(b"not-zlib")),
+            ("wrong-length", tiny_png(b"\x00\xff\x00\x00")),
+            ("invalid-filter", tiny_png(b"\x05\xff\x00\x00\xff")),
+            ("interlaced", tiny_png(interlace=1)),
+        )
+
+        for request_id, invalid_png in invalid_images:
+            with self.subTest(request_id=request_id), self.assertRaises(ValueError):
+                save_generated_result(
+                    self.db_path,
+                    self.generated_dir,
+                    request_id=request_id,
+                    artists=[{"artist": "artist_a", "weight": 1}],
+                    png_bytes=invalid_png,
+                )
+
     def test_request_id_retry_returns_existing_result_without_rewriting(self):
         first_png = tiny_png()
         common = {
@@ -291,6 +323,58 @@ class StyleStoreIntegrationTest(unittest.TestCase):
 
         self.assertTrue(final_path.is_file())
         self.assertFalse(staged_path.exists())
+
+    def test_reconcile_removes_missing_image_record_and_allows_retry(self):
+        request_id = "missing-only-image"
+        saved = save_generated_result(
+            self.db_path,
+            self.generated_dir,
+            request_id=request_id,
+            artists=[{"artist": "artist_a", "weight": 1}],
+            png_bytes=tiny_png(),
+        )
+        (self.generated_dir / saved["image_path"]).unlink()
+
+        app.init_db()
+
+        self.assertEqual(list_styles(self.db_path), [])
+        retried = save_generated_result(
+            self.db_path,
+            self.generated_dir,
+            request_id=request_id,
+            artists=[{"artist": "artist_a", "weight": 1}],
+            png_bytes=tiny_png(),
+        )
+        self.assertTrue((self.generated_dir / retried["image_path"]).is_file())
+
+    def test_reconcile_recomputes_style_with_one_remaining_image(self):
+        artists = [{"artist": "artist_a", "weight": 1}]
+        first = save_generated_result(
+            self.db_path,
+            self.generated_dir,
+            request_id="remaining-image",
+            artists=artists,
+            png_bytes=tiny_png(),
+        )
+        missing = save_generated_result(
+            self.db_path,
+            self.generated_dir,
+            request_id="missing-newest-image",
+            artists=artists,
+            png_bytes=tiny_png(b"\x00\x00\xff\x00\xff"),
+        )
+        (self.generated_dir / missing["image_path"]).unlink()
+
+        app.init_db()
+
+        style = list_styles(self.db_path)[0]
+        self.assertEqual(style["image_count"], 1)
+        self.assertEqual(style["representative_image_path"], first["image_path"])
+        detail = get_style_detail(self.db_path, first["style_id"])
+        self.assertEqual(
+            [image["image_path"] for image in detail["images"]],
+            [first["image_path"]],
+        )
 
 
 if __name__ == "__main__":
