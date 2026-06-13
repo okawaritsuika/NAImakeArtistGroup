@@ -13,7 +13,7 @@ import requests
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
 from novelai import NovelAIError, test_novelai_subscription
-from style_store import delete_app_key, load_app_key, save_app_key
+from style_store import SettingsError, delete_app_key, load_app_key, save_app_key
 
 from style_logic import (
     assign_weights,
@@ -792,26 +792,46 @@ def api_style_maker_artists():
 
 @app.route("/api/settings/novelai", methods=["GET", "PUT", "DELETE"])
 def api_novelai_settings():
-    if request.method == "GET":
-        return json_response({"configured": bool(load_app_key(SETTINGS_JSON_PATH))})
+    try:
+        if request.method == "GET":
+            return json_response(
+                {"configured": bool(load_app_key(SETTINGS_JSON_PATH, DATA_DIR))}
+            )
 
-    if request.method == "DELETE":
-        delete_app_key(SETTINGS_JSON_PATH)
-        return json_response({"configured": False})
+        if request.method == "DELETE":
+            delete_app_key(SETTINGS_JSON_PATH, DATA_DIR)
+            return json_response({"configured": False})
 
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return json_response({"error": "요청 내용은 JSON 객체여야 합니다."}, 400)
-    app_key = payload.get("app_key")
-    if type(app_key) is not str or not app_key:
-        return json_response({"error": "NovelAI App Key를 입력하세요."}, 400)
-    save_app_key(SETTINGS_JSON_PATH, app_key)
-    return json_response({"configured": True})
+        if request.mimetype != "application/json":
+            return json_response({"error": "Request must use application/json."}, 400)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json_response({"error": "Request body must be a JSON object."}, 400)
+        try:
+            save_app_key(SETTINGS_JSON_PATH, payload.get("app_key"), DATA_DIR)
+        except ValueError as exc:
+            return json_response({"error": str(exc)}, 400)
+        return json_response({"configured": True})
+    except SettingsError:
+        return json_response(
+            {"error": "Settings file is invalid or unsafe; no changes were made."},
+            409,
+        )
 
 
 @app.route("/api/settings/novelai/test", methods=["POST"])
 def api_test_novelai_settings():
-    app_key = load_app_key(SETTINGS_JSON_PATH)
+    try:
+        app_key = load_app_key(SETTINGS_JSON_PATH, DATA_DIR)
+    except SettingsError:
+        return json_response(
+            {
+                "ok": False,
+                "configured": False,
+                "error": "Settings file is invalid or unsafe; no changes were made.",
+            },
+            409,
+        )
     if not app_key:
         return json_response(
             {

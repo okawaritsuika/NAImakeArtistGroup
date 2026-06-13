@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import sqlite3
 import struct
 import tempfile
@@ -10,19 +11,63 @@ from pathlib import Path
 from style_logic import build_artist_prompt, normalize_style_artists, style_hash
 
 
-def _load_settings(settings_path):
+MAX_APP_KEY_LENGTH = 8192
+
+
+class SettingsError(Exception):
+    pass
+
+
+def _absolute_path(path):
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _reject_symlink_components(path):
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            if current.is_symlink():
+                raise SettingsError("Settings path must not contain symlinks.")
+        except OSError as exc:
+            raise SettingsError("Settings path could not be validated.") from exc
+
+
+def _validated_settings_path(settings_path, trusted_root):
+    if trusted_root is None:
+        raise SettingsError("A trusted settings directory is required.")
+    path = _absolute_path(settings_path)
+    root = _absolute_path(trusted_root)
+    if path.parent != root:
+        raise SettingsError("Settings file must be a direct child of the trusted directory.")
+    _reject_symlink_components(root)
+    _reject_symlink_components(path)
+    return path
+
+
+def _load_trusted_settings(settings_path, trusted_root):
+    path = _validated_settings_path(settings_path, trusted_root)
     try:
-        data = json.loads(Path(settings_path).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        raw = path.read_bytes()
+    except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    except OSError as exc:
+        raise SettingsError("Settings file could not be read.") from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SettingsError("Settings file is corrupt.") from exc
+    if not isinstance(data, dict):
+        raise SettingsError("Settings file must contain a JSON object.")
+    return data
 
 
-def _write_settings(settings_path, settings):
-    path = Path(settings_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _write_trusted_settings(settings_path, settings, trusted_root):
+    path = _validated_settings_path(settings_path, trusted_root)
     temp_path = None
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _reject_symlink_components(path.parent)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -35,33 +80,52 @@ def _write_settings(settings_path, settings):
             handle.write("\n")
             temp_path = Path(handle.name)
         temp_path.replace(path)
-    except Exception:
+    except SettingsError:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
         raise
+    except OSError as exc:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise SettingsError("Settings file could not be saved.") from exc
 
 
-def load_app_key(settings_path):
-    value = _load_settings(settings_path).get("novelai_app_key")
+def normalize_app_key(app_key):
+    if type(app_key) is not str:
+        raise ValueError("NovelAI App Key must be a string.")
+    normalized = app_key.strip()
+    if not normalized:
+        raise ValueError("NovelAI App Key is required.")
+    if len(normalized) > MAX_APP_KEY_LENGTH:
+        raise ValueError("NovelAI App Key is too long.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+        raise ValueError("NovelAI App Key contains invalid control characters.")
+    return normalized
+
+
+def load_app_key(settings_path, trusted_root):
+    value = _load_trusted_settings(settings_path, trusted_root).get("novelai_app_key")
     return value if type(value) is str else ""
 
 
-def save_app_key(settings_path, app_key):
-    if type(app_key) is not str or not app_key:
-        raise ValueError("NovelAI App Key를 입력하세요.")
-    settings = _load_settings(settings_path)
-    settings["novelai_app_key"] = app_key
-    _write_settings(settings_path, settings)
+def save_app_key(settings_path, app_key, trusted_root):
+    normalized = normalize_app_key(app_key)
+    settings = _load_trusted_settings(settings_path, trusted_root)
+    settings["novelai_app_key"] = normalized
+    _write_trusted_settings(settings_path, settings, trusted_root)
 
 
-def delete_app_key(settings_path):
-    path = Path(settings_path)
-    settings = _load_settings(path)
+def delete_app_key(settings_path, trusted_root):
+    path = _validated_settings_path(settings_path, trusted_root)
+    settings = _load_trusted_settings(path, trusted_root)
     settings.pop("novelai_app_key", None)
     if settings:
-        _write_settings(path, settings)
+        _write_trusted_settings(path, settings, trusted_root)
     else:
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise SettingsError("Settings file could not be deleted.") from exc
 
 
 def connect_db(db_path):
