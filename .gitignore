@@ -1,0 +1,6 @@
+.worktrees/
+artist_rater/data/
+artist_rater/__pycache__/
+artist_rater/tests/__pycache__/
+artist_rater/server.err.log
+artist_rater/server.out.log
