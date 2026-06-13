@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -15,6 +16,8 @@ from flask import Flask, jsonify, render_template, request, send_from_directory
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 THUMBNAIL_DIR = DATA_DIR / "thumbnails"
+GENERATED_DIR = DATA_DIR / "generated"
+SETTINGS_JSON_PATH = DATA_DIR / "settings.json"
 DB_PATH = DATA_DIR / "artist_rater.sqlite"
 DANBOORU_BASE_URL = "https://danbooru.donmai.us"
 CUTOFF = datetime(2025, 1, 31, 23, 59, 59, tzinfo=timezone.utc)
@@ -35,9 +38,10 @@ def json_response(payload, status=200):
 
 
 def init_db():
-    DATA_DIR.mkdir(exist_ok=True)
-    THUMBNAIL_DIR.mkdir(exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ratings (
@@ -76,6 +80,46 @@ def init_db():
                 artist_tag TEXT PRIMARY KEY,
                 artist_post_count INTEGER DEFAULT 0,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS art_styles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                style_hash TEXT NOT NULL UNIQUE,
+                artists_json TEXT NOT NULL,
+                artist_prompt TEXT NOT NULL,
+                representative_image_path TEXT DEFAULT '',
+                image_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generated_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                style_id INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                base_prompt TEXT DEFAULT '',
+                negative_prompt TEXT DEFAULT '',
+                character_prompts_json TEXT DEFAULT '[]',
+                combined_prompt TEXT NOT NULL,
+                artist_prompt TEXT NOT NULL,
+                artists_json TEXT NOT NULL,
+                seed INTEGER NOT NULL,
+                width INTEGER NOT NULL,
+                height INTEGER NOT NULL,
+                sampler TEXT NOT NULL,
+                steps INTEGER NOT NULL,
+                scale REAL NOT NULL,
+                cfg_rescale REAL NOT NULL,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(style_id) REFERENCES art_styles(id)
             )
             """
         )
