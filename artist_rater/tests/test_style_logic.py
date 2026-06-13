@@ -101,6 +101,10 @@ class StyleIdentityTest(unittest.TestCase):
                 {"artist": "artist_a", "weight": 1},
                 {"artist": "artist_a", "weight": 2},
             ],
+            [{"artist": "artist_a", "weight": 1, "score": True}],
+            [{"artist": "artist_a", "weight": 1, "score": 4.5}],
+            [{"artist": "artist_a", "weight": 1, "score": "4.0"}],
+            [{"artist": "artist_a", "weight": 1, "score": 6}],
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize_style_artists(invalid)
@@ -143,6 +147,18 @@ class ArtistSelectionTest(unittest.TestCase):
 
         self.assertEqual(first, second)
 
+    def test_selection_rejects_non_integer_allowed_scores(self):
+        for score in (True, 1.0, 1.5, "1.0", "1.5", 0, 6):
+            with self.subTest(score=score), self.assertRaisesRegex(
+                ValueError, "평점"
+            ):
+                select_artists(self.pool, 1, [score], rng_seed=1)
+
+        self.assertEqual(
+            select_artists(self.pool, 1, ["5"], rng_seed=1)[0]["score"],
+            5,
+        )
+
 
 class WeightEngineTest(unittest.TestCase):
     def setUp(self):
@@ -177,6 +193,22 @@ class WeightEngineTest(unittest.TestCase):
         )
 
         self.assertLessEqual(sum(item["weight"] >= 1.5 for item in weighted), 5)
+
+    def test_balanced_without_low_keeps_high_cap_and_assigns_remainder_to_mid(self):
+        weighted = assign_weights(
+            self.artists, "balanced", 1.0, 2.3, False, [], rng_seed=4
+        )
+
+        self.assertEqual(sum(1.0 <= item["weight"] < 1.5 for item in weighted), 9)
+        self.assertEqual(sum(item["weight"] >= 1.5 for item in weighted), 3)
+
+    def test_balanced_high_only_range_explicitly_assigns_everyone_high(self):
+        weighted = assign_weights(
+            self.artists, "balanced", 1.5, 2.3, False, [], rng_seed=4
+        )
+
+        self.assertEqual(len(weighted), 12)
+        self.assertTrue(all(item["weight"] >= 1.5 for item in weighted))
 
     def test_balanced_handles_tiny_counts_and_clipped_ranges(self):
         for minimum, maximum in (
@@ -286,6 +318,32 @@ class WeightEngineTest(unittest.TestCase):
                 self.artists[:1], "mystery", 0.1, 2.3, False, [], rng_seed=1
             )
 
+    def test_assign_weights_rejects_non_integer_artist_scores(self):
+        for score in (True, 3.0, 3.5, "3.0", 0, 6):
+            with self.subTest(score=score), self.assertRaisesRegex(
+                ValueError, "평점"
+            ):
+                assign_weights(
+                    [{"artist": "artist_a", "score": score}],
+                    "random",
+                    0.1,
+                    2.3,
+                    False,
+                    [],
+                    rng_seed=1,
+                )
+
+        weighted = assign_weights(
+            [{"artist": "artist_a", "score": "3"}],
+            "random",
+            0.1,
+            2.3,
+            False,
+            [],
+            rng_seed=1,
+        )
+        self.assertEqual(weighted[0]["score"], 3)
+
 
 class ArtistStyleEndpointTest(unittest.TestCase):
     def setUp(self):
@@ -388,6 +446,43 @@ class ArtistStyleEndpointTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertFalse(response.get_json()["ok"])
                 self.assertTrue(response.get_json()["error"])
+
+    def test_endpoint_strictly_validates_selected_scores(self):
+        for score in (True, 1.0, 1.5, "1.0", "1.5", 0, 6):
+            with self.subTest(score=score):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json={"count": 1, "scores": [score]},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("평점", response.get_json()["error"])
+
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={"count": 1, "scores": ["5"], "rng_seed": 1},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["artists"][0]["score"], 5)
+
+    def test_endpoint_strictly_validates_supplied_artist_scores(self):
+        for score in (True, 5.0, 5.5, "5.0", "5.5", 0, 6):
+            with self.subTest(score=score):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json={"artists": [{"artist": "alpha", "score": score}]},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("평점", response.get_json()["error"])
+
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "artists": [{"artist": "alpha", "score": "5"}],
+                "rng_seed": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["artists"][0]["score"], 5)
 
 
 class StyleStoreIntegrationTest(unittest.TestCase):

@@ -19,11 +19,27 @@ def _integer_value(value, error_message):
     return int(numeric)
 
 
+def exact_score(value, error_message="평점은 1부터 5 사이의 정수여야 합니다."):
+    if isinstance(value, bool):
+        raise ValueError(error_message)
+    if isinstance(value, int):
+        score = value
+    elif isinstance(value, str) and value in {"1", "2", "3", "4", "5"}:
+        score = int(value)
+    else:
+        raise ValueError(error_message)
+    if score not in SCORE_SELECTION_WEIGHT:
+        raise ValueError(error_message)
+    return score
+
+
 def select_artists(pool, count, allowed_scores, rng_seed=None):
     try:
         requested_count = _integer_value(count, "선택 가능한 작가 수를 확인하세요.")
-        allowed = {int(score) for score in allowed_scores}
+        allowed = {exact_score(score) for score in allowed_scores}
     except (TypeError, ValueError, OverflowError) as exc:
+        if isinstance(exc, ValueError) and "평점" in str(exc):
+            raise
         raise ValueError("선택 가능한 작가 수와 평점을 확인하세요.") from exc
 
     remaining = []
@@ -32,10 +48,7 @@ def select_artists(pool, count, allowed_scores, rng_seed=None):
         if not isinstance(item, dict):
             continue
         artist = str(item.get("artist") or "").strip()
-        try:
-            score = int(item.get("score"))
-        except (TypeError, ValueError, OverflowError):
-            continue
+        score = exact_score(item.get("score"))
         if not artist or score not in allowed or score not in SCORE_SELECTION_WEIGHT:
             continue
         if artist in seen:
@@ -63,24 +76,24 @@ def random_weight(rng, low, high):
 def _tier_counts(count, tier_names):
     if count <= 0:
         return {name: 0 for name in tier_names}
-    if set(tier_names) == {"low", "mid", "high"}:
-        high = count // 4
-        mid = round(count * 0.33)
-        return {"low": count - mid - high, "mid": mid, "high": high}
+    names = set(tier_names)
+    counts = {name: 0 for name in tier_names}
+    if names == {"high"}:
+        counts["high"] = count
+        return counts
 
-    proportions = {"low": 0.42, "mid": 0.33, "high": 0.25}
-    total = sum(proportions[name] for name in tier_names)
-    raw = {name: count * proportions[name] / total for name in tier_names}
-    counts = {name: math.floor(raw[name]) for name in tier_names}
-    remainder = count - sum(counts.values())
-    priority = {"low": 2, "mid": 1, "high": 0}
-    order = sorted(
-        tier_names,
-        key=lambda name: (raw[name] - counts[name], priority[name]),
-        reverse=True,
-    )
-    for name in order[:remainder]:
-        counts[name] += 1
+    high = count // 4 if "high" in names else 0
+    if "high" in names:
+        counts["high"] = high
+    remaining = count - high
+    if "low" in names and "mid" in names:
+        mid = min(round(count * 0.33), remaining)
+        counts["mid"] = mid
+        counts["low"] = remaining - mid
+    elif "mid" in names:
+        counts["mid"] = remaining
+    elif "low" in names:
+        counts["low"] = remaining
     return counts
 
 
@@ -190,7 +203,12 @@ def assign_weights(
         raise ValueError("가중치 모드를 확인하세요.")
 
     rng = random.Random(rng_seed)
-    items = [{**item, "_index": index} for index, item in enumerate(artists or [])]
+    items = []
+    for index, item in enumerate(artists or []):
+        normalized = dict(item)
+        normalized["score"] = exact_score(item.get("score"))
+        normalized["_index"] = index
+        items.append(normalized)
     if mode == "random" or (mode == "custom" and not ranges):
         return [
             {key: value for key, value in item.items() if key != "_index"}
@@ -240,11 +258,14 @@ def normalize_style_artists(artists):
             raise ValueError("Artist weights must be positive numbers.") from exc
         if not math.isfinite(weight) or weight <= 0:
             raise ValueError("Artist weights must be positive numbers.")
-        try:
-            score = int(item.get("score") or 0)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("Artist scores must be integers.") from exc
-        normalized.append({"artist": artist, "weight": weight, "score": score})
+        raw_score = item.get("score")
+        normalized_item = {"artist": artist, "weight": weight}
+        if raw_score is not None:
+            normalized_item["score"] = exact_score(
+                raw_score,
+                "Artist scores must be integers from 1 to 5.",
+            )
+        normalized.append(normalized_item)
         seen.add(artist)
     if not normalized:
         raise ValueError("At least one artist is required.")

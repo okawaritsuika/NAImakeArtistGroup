@@ -12,7 +12,13 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
-from style_logic import assign_weights, build_artist_prompt, select_artists, style_hash
+from style_logic import (
+    assign_weights,
+    build_artist_prompt,
+    exact_score,
+    select_artists,
+    style_hash,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -736,12 +742,7 @@ def api_style_maker_artists():
             scores = payload.get("scores", [1, 2, 3, 4, 5])
             if not isinstance(scores, list) or not scores:
                 raise ValueError("선택할 평점을 하나 이상 지정하세요.")
-            try:
-                scores = [int(score) for score in scores]
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("평점은 1부터 5 사이여야 합니다.") from exc
-            if any(score not in SCORE_RANGE for score in scores):
-                raise ValueError("평점은 1부터 5 사이여야 합니다.")
+            scores = [exact_score(score) for score in scores]
             with closing(db()) as conn:
                 rows = conn.execute("SELECT artist_tag, score FROM ratings").fetchall()
             pool = [
@@ -777,9 +778,6 @@ def api_style_maker_artists():
         return json_response({"ok": False, "error": str(exc)}, 400)
 
 
-SCORE_RANGE = {1, 2, 3, 4, 5}
-
-
 def validate_supplied_style_artists(supplied):
     if not isinstance(supplied, list) or not supplied:
         raise ValueError("작가 목록을 하나 이상 입력하세요.")
@@ -790,12 +788,12 @@ def validate_supplied_style_artists(supplied):
         if not isinstance(item, dict):
             raise ValueError("작가 목록 형식을 확인하세요.")
         artist = str(item.get("artist") or "").strip()
-        try:
-            score = int(item.get("score"))
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("작가 평점은 1부터 5 사이여야 합니다.") from exc
-        if not artist or score not in SCORE_RANGE:
-            raise ValueError("작가 태그와 평점을 확인하세요.")
+        score = exact_score(
+            item.get("score"),
+            "작가 평점은 1부터 5 사이의 정수여야 합니다.",
+        )
+        if not artist:
+            raise ValueError("작가 태그를 확인하세요.")
         if artist in seen:
             raise ValueError("중복된 작가는 사용할 수 없습니다.")
         artists.append({"artist": artist, "score": score})
