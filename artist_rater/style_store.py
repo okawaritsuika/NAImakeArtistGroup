@@ -249,6 +249,7 @@ def _stored_result(row):
         "image_path": row["image_path"],
         "artist_prompt": row["artist_prompt"],
         "style_hash": row["style_hash"],
+        "seed": row["seed"],
     }
 
 
@@ -257,6 +258,7 @@ def _find_request(conn, request_id):
         """
         SELECT generated_images.id AS image_id, generated_images.style_id,
                generated_images.image_path, generated_images.artist_prompt,
+               generated_images.seed,
                art_styles.style_hash
         FROM generated_images
         JOIN art_styles ON art_styles.id = generated_images.style_id
@@ -264,6 +266,15 @@ def _find_request(conn, request_id):
         """,
         (request_id,),
     ).fetchone()
+
+
+def get_generated_result(db_path, request_id):
+    conn = connect_db(db_path)
+    try:
+        row = _find_request(conn, request_id)
+    finally:
+        conn.close()
+    return _stored_result(row) if row is not None else None
 
 
 def _recompute_style(conn, style_id, timestamp):
@@ -425,6 +436,7 @@ def save_generated_result(
             "image_path": relative_path,
             "artist_prompt": artist_prompt,
             "style_hash": identity_hash,
+            "seed": int(seed),
         }
     except Exception:
         if not committed:

@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,13 +13,30 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
-from novelai import NovelAIError, test_novelai_subscription
-from style_store import SettingsError, delete_app_key, load_app_key, save_app_key
+from novelai import (
+    MODEL,
+    NovelAIError,
+    combine_base_prompt,
+    generate_novelai_png,
+    normalize_generation_data,
+    test_novelai_subscription,
+)
+from style_store import (
+    SettingsError,
+    delete_app_key,
+    get_generated_result,
+    get_style_detail,
+    list_styles,
+    load_app_key,
+    save_app_key,
+    save_generated_result,
+)
 
 from style_logic import (
     assign_weights,
     build_artist_prompt,
     exact_score,
+    normalize_style_artists,
     select_artists,
     style_hash,
 )
@@ -38,6 +56,8 @@ USER_AGENT = "DanbooruArtistRater/1.0 (local personal tool)"
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+GENERATION_LOCK = threading.Lock()
+SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 def json_response(payload, status=200):
@@ -891,6 +911,121 @@ def validate_supplied_style_artists(supplied):
         if ratings[item["artist"]] != item["score"]:
             raise ValueError(f"저장된 평점과 일치하지 않습니다: {item['artist']}")
     return artists
+
+
+def _generation_response(result):
+    payload = {
+        "style_id": result["style_id"],
+        "image_id": result["image_id"],
+        "image_path": result["image_path"],
+        "image_url": f'/generated/{result["image_path"]}',
+        "artist_prompt": result["artist_prompt"],
+        "seed": result["seed"],
+    }
+    return payload
+
+
+def _validate_generation_request(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object.")
+    request_id = payload.get("request_id")
+    if type(request_id) is not str or not SAFE_REQUEST_ID.fullmatch(request_id):
+        raise ValueError("request_id must be a nonempty safe string up to 128 characters.")
+    normalized = normalize_generation_data(payload)
+    normalized["request_id"] = request_id
+    normalized["artists"] = normalize_style_artists(payload.get("artists"))
+    return normalized
+
+
+@app.route("/api/style-maker/generate", methods=["POST"])
+def api_style_maker_generate():
+    if not request.is_json:
+        return json_response({"error": "Request must use application/json."}, 400)
+    try:
+        data = _validate_generation_request(request.get_json(silent=True))
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+    request_id = data["request_id"]
+    with GENERATION_LOCK:
+        existing = get_generated_result(DB_PATH, request_id)
+        if existing is not None:
+            return json_response(_generation_response(existing))
+
+        try:
+            app_key = load_app_key(SETTINGS_JSON_PATH, DATA_DIR)
+        except SettingsError:
+            return json_response({"error": "Settings file is invalid or unsafe."}, 409)
+        if not app_key:
+            return json_response({"error": "No NovelAI App Key is configured."}, 400)
+
+        artist_prompt = build_artist_prompt(data["artists"])
+        combined_prompt = combine_base_prompt(data["base_prompt"], artist_prompt)
+        try:
+            png_bytes, actual_seed = generate_novelai_png(app_key, data, artist_prompt)
+            result = save_generated_result(
+                DB_PATH,
+                GENERATED_DIR,
+                request_id=request_id,
+                artists=data["artists"],
+                png_bytes=png_bytes,
+                base_prompt=data["base_prompt"],
+                negative_prompt=data["negative_prompt"],
+                character_prompts=data["character_prompts"],
+                combined_prompt=combined_prompt,
+                seed=actual_seed,
+                width=data["width"],
+                height=data["height"],
+                sampler=data["sampler"],
+                steps=data["steps"],
+                scale=data["scale"],
+                cfg_rescale=data["cfg_rescale"],
+                model=MODEL,
+            )
+        except NovelAIError as exc:
+            return json_response({"error": exc.public_message}, exc.status_code)
+        except (OSError, sqlite3.Error, ValueError):
+            return json_response({"error": "Could not store the generated image."}, 500)
+        result["seed"] = actual_seed
+        return json_response(_generation_response(result))
+
+
+def _add_generated_urls(item):
+    image_path = item.get("image_path") or ""
+    if image_path:
+        item["image_url"] = f"/generated/{image_path}"
+    representative = item.get("representative_image_path") or ""
+    if representative:
+        item["representative_image_url"] = f"/generated/{representative}"
+    return item
+
+
+@app.route("/api/art-styles", methods=["GET"])
+def api_art_styles():
+    return json_response([_add_generated_urls(item) for item in list_styles(DB_PATH)])
+
+
+@app.route("/api/art-styles/<int:style_id>", methods=["GET"])
+def api_art_style_detail(style_id):
+    detail = get_style_detail(DB_PATH, style_id)
+    if detail is None:
+        return json_response({"error": "Art style not found."}, 404)
+    _add_generated_urls(detail)
+    detail["images"] = [_add_generated_urls(image) for image in detail["images"]]
+    return json_response(detail)
+
+
+@app.route("/generated/<path:filename>")
+def generated(filename):
+    normalized = filename.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute() or ".." in path.parts or normalized != filename:
+        return json_response({"error": "Invalid generated image path."}, 400)
+    target = (GENERATED_DIR / path).resolve()
+    root = GENERATED_DIR.resolve()
+    if root not in target.parents:
+        return json_response({"error": "Invalid generated image path."}, 400)
+    return send_from_directory(root, path.as_posix())
 
 
 @app.route("/api/ratings/<int:rating_id>", methods=["PATCH"])

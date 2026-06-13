@@ -1,10 +1,13 @@
 import io
 import json
 import sqlite3
+import struct
 import tempfile
 import threading
 import unittest
 import urllib.error
+import zipfile
+import zlib
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +18,33 @@ import style_store
 
 
 SECRET_KEY = "secret-key-value"
+
+
+def valid_png():
+    def chunk(kind, payload):
+        checksum = zlib.crc32(kind)
+        checksum = zlib.crc32(payload, checksum) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\xff"))
+        + chunk(b"IEND", b"")
+    )
+
+
+def zip_response(entries):
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, value in entries:
+            archive.writestr(name, value)
+    response = Mock()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    response.read = Mock(return_value=payload.getvalue())
+    return response
 
 
 class SettingsStoreTest(unittest.TestCase):
@@ -284,6 +314,315 @@ class StyleApiTest(unittest.TestCase):
             {"theme": "dark"},
         )
         self.assert_secret_absent(response)
+
+
+class NovelAIGenerationTest(unittest.TestCase):
+    def generation_data(self, **overrides):
+        data = {
+            "width": 832,
+            "height": 1216,
+            "steps": 28,
+            "scale": 5.0,
+            "cfg_rescale": 0.4,
+            "sampler": "k_euler_ancestral",
+            "base_prompt": "masterpiece",
+            "negative_prompt": "lowres",
+            "character_prompts": ["hero", "  ", "villain"],
+        }
+        data.update(overrides)
+        return data
+
+    def test_combine_base_prompt_has_no_dangling_commas(self):
+        from novelai import combine_base_prompt
+
+        self.assertEqual(combine_base_prompt(" base ", " artist "), "base, artist")
+        self.assertEqual(combine_base_prompt("base", ""), "base")
+        self.assertEqual(combine_base_prompt("", "artist"), "artist")
+        self.assertEqual(combine_base_prompt("", ""), "")
+
+    def test_build_generation_payload_is_exact_v45_structure(self):
+        from novelai import MODEL, build_generation_payload
+
+        payload = build_generation_payload(self.generation_data(), "1.2::artist::", 42)
+        self.assertEqual(
+            payload,
+            {
+                "input": "masterpiece, 1.2::artist::",
+                "model": "nai-diffusion-4-5-full",
+                "action": "generate",
+                "parameters": {
+                    "width": 832,
+                    "height": 1216,
+                    "n_samples": 1,
+                    "seed": 42,
+                    "extra_noise_seed": 42,
+                    "sampler": "k_euler_ancestral",
+                    "steps": 28,
+                    "scale": 5.0,
+                    "negative_prompt": "lowres",
+                    "cfg_rescale": 0.4,
+                    "noise_schedule": "native",
+                    "params_version": 3,
+                    "legacy": False,
+                    "legacy_v3_extend": False,
+                    "add_original_image": True,
+                    "prefer_brownian": True,
+                    "use_coords": False,
+                    "v4_negative_prompt": {
+                        "caption": {"base_caption": "lowres", "char_captions": []},
+                        "legacy_uc": False,
+                    },
+                    "v4_prompt": {
+                        "caption": {
+                            "base_caption": "masterpiece, 1.2::artist::",
+                            "char_captions": [
+                                {"char_caption": "hero", "centers": [{"x": 0.5, "y": 0.5}]},
+                                {"char_caption": "villain", "centers": [{"x": 0.5, "y": 0.5}]},
+                            ],
+                        },
+                        "use_coords": False,
+                        "use_order": True,
+                    },
+                },
+            },
+        )
+        self.assertEqual(MODEL, payload["model"])
+
+    def test_generation_transport_posts_json_and_extracts_first_png(self):
+        from novelai import GENERATION_URL, generate_novelai_png
+
+        png = valid_png()
+        opener = Mock(return_value=zip_response([("notes.txt", b"x"), ("image.png", png)]))
+        image, seed = generate_novelai_png(
+            SECRET_KEY,
+            self.generation_data(seed=123),
+            "artist",
+            opener=opener,
+        )
+        self.assertEqual((image, seed), (png, 123))
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, GENERATION_URL)
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.headers["Content-type"], "application/json")
+        self.assertEqual(request.unredirected_hdrs["Authorization"], f"Bearer {SECRET_KEY}")
+        self.assertEqual(json.loads(request.data)["parameters"]["seed"], 123)
+
+    @patch("novelai.random.SystemRandom")
+    def test_generation_uses_bounded_random_seed_when_omitted(self, system_random):
+        from novelai import generate_novelai_png
+
+        system_random.return_value.randint.return_value = 4294967295
+        image, seed = generate_novelai_png(
+            SECRET_KEY,
+            self.generation_data(),
+            "artist",
+            opener=Mock(return_value=zip_response([("image.png", valid_png())])),
+        )
+        self.assertEqual(image, valid_png())
+        self.assertEqual(seed, 4294967295)
+        system_random.return_value.randint.assert_called_once_with(1, 4294967295)
+
+    def test_generation_rejects_unsafe_or_invalid_zip_content(self):
+        from novelai import MAX_IMAGE_BYTES, NovelAIError, generate_novelai_png
+
+        cases = (
+            Mock(return_value=zip_response([("../image.png", valid_png())])),
+            Mock(return_value=zip_response([("image.png", b"not-png")])),
+            Mock(return_value=zip_response([("image.png", b"x" * (MAX_IMAGE_BYTES + 1))])),
+            Mock(return_value=zip_response([("notes.txt", b"none")])),
+            Mock(return_value=Mock(__enter__=Mock(return_value=Mock(read=Mock(return_value=b"bad-zip"))), __exit__=Mock(return_value=False))),
+        )
+        for opener in cases:
+            with self.subTest(opener=opener), self.assertRaises(NovelAIError) as raised:
+                generate_novelai_png(SECRET_KEY, self.generation_data(seed=1), "artist", opener=opener)
+            self.assertEqual(raised.exception.status_code, 502)
+            self.assertNotIn(SECRET_KEY, str(raised.exception))
+
+    def test_generation_closes_and_sanitizes_http_error(self):
+        from novelai import NovelAIError, generate_novelai_png
+
+        body = io.BytesIO(f"upstream leaked {SECRET_KEY}".encode())
+        error = urllib.error.HTTPError("url", 429, "rate limited", {}, body)
+        with self.assertRaises(NovelAIError) as raised:
+            generate_novelai_png(
+                SECRET_KEY,
+                self.generation_data(seed=1),
+                "artist",
+                opener=Mock(side_effect=error),
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertNotIn(SECRET_KEY, str(raised.exception))
+        self.assertTrue(body.closed)
+
+
+class GenerationApiTest(StyleApiTest):
+    def setUp(self):
+        super().setUp()
+        with app.db() as conn:
+            conn.executemany(
+                "INSERT INTO ratings (artist_tag, score, mode, created_at, updated_at) VALUES (?, ?, 'random', ?, ?)",
+                [
+                    ("artist_a", 5, app.now_text(), app.now_text()),
+                    ("artist_b", 4, app.now_text(), app.now_text()),
+                ],
+            )
+
+    def request_payload(self, **overrides):
+        payload = {
+            "request_id": "request-001",
+            "artists": [
+                {"artist": "artist_b", "score": 4, "weight": 1.1},
+                {"artist": "artist_a", "score": 5, "weight": 1.2},
+            ],
+            "base_prompt": "masterpiece",
+            "negative_prompt": "lowres",
+            "character_prompts": [" hero ", "", "villain"],
+            "width": 832,
+            "height": 1216,
+            "sampler": "k_euler_ancestral",
+            "steps": 28,
+            "scale": 5.0,
+            "cfg_rescale": 0.4,
+            "seed": 123456,
+        }
+        payload.update(overrides)
+        return payload
+
+    def save_key(self):
+        response = self.client.put("/api/settings/novelai", json={"app_key": SECRET_KEY})
+        self.assertEqual(response.status_code, 200)
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_generation_saves_png_and_complete_metadata(self, generate):
+        self.save_key()
+        response = self.client.post("/api/style-maker/generate", json=self.request_payload())
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(set(data), {"style_id", "image_id", "image_url", "image_path", "artist_prompt", "seed"})
+        self.assertEqual(data["image_url"], f'/generated/{data["image_path"]}')
+        self.assertTrue((app.GENERATED_DIR / data["image_path"]).is_file())
+        generate.assert_called_once()
+        self.assertEqual(generate.call_args.args[0], SECRET_KEY)
+        self.assertNotIn(SECRET_KEY, response.get_data(as_text=True))
+
+        detail = self.client.get(f'/api/art-styles/{data["style_id"]}').get_json()
+        image = detail["images"][0]
+        self.assertEqual(image["base_prompt"], "masterpiece")
+        self.assertEqual(image["negative_prompt"], "lowres")
+        self.assertEqual(image["character_prompts"], ["hero", "villain"])
+        self.assertEqual(image["combined_prompt"], f'masterpiece, {data["artist_prompt"]}')
+        self.assertEqual(image["artists"], self.request_payload()["artists"])
+        self.assertEqual(image["seed"], 123456)
+        self.assertEqual(image["width"], 832)
+        self.assertEqual(image["height"], 1216)
+        self.assertEqual(image["sampler"], "k_euler_ancestral")
+        self.assertEqual(image["steps"], 28)
+        self.assertEqual(image["scale"], 5.0)
+        self.assertEqual(image["cfg_rescale"], 0.4)
+        self.assertEqual(image["model"], "nai-diffusion-4-5-full")
+        self.assertEqual(image["image_url"], f'/generated/{image["image_path"]}')
+        self.assertNotIn("app_key", json.dumps(detail))
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_duplicate_request_does_not_pay_twice(self, generate):
+        self.save_key()
+        first = self.client.post("/api/style-maker/generate", json=self.request_payload()).get_json()
+        second = self.client.post("/api/style-maker/generate", json=self.request_payload()).get_json()
+        self.assertEqual(first, second)
+        generate.assert_called_once()
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_style_identity_ignores_base_prompt_but_tracks_artist_order_and_weight(self, generate):
+        self.save_key()
+        first = self.client.post("/api/style-maker/generate", json=self.request_payload()).get_json()
+        second = self.client.post("/api/style-maker/generate", json=self.request_payload(request_id="request-002", base_prompt="portrait")).get_json()
+        reversed_artists = list(reversed(self.request_payload()["artists"]))
+        third = self.client.post("/api/style-maker/generate", json=self.request_payload(request_id="request-003", artists=reversed_artists)).get_json()
+        changed_weight = [dict(item) for item in self.request_payload()["artists"]]
+        changed_weight[0]["weight"] = 1.05
+        fourth = self.client.post("/api/style-maker/generate", json=self.request_payload(request_id="request-004", artists=changed_weight)).get_json()
+        self.assertEqual(first["style_id"], second["style_id"])
+        self.assertNotEqual(first["style_id"], third["style_id"])
+        self.assertNotEqual(first["style_id"], fourth["style_id"])
+        styles = self.client.get("/api/art-styles").get_json()
+        self.assertEqual(len(styles), 3)
+        grouped = next(item for item in styles if item["id"] == first["style_id"])
+        self.assertEqual(grouped["image_count"], 2)
+        self.assertTrue(grouped["representative_image_url"].startswith("/generated/"))
+
+    def test_generation_requires_saved_key(self):
+        response = self.client.post("/api/style-maker/generate", json=self.request_payload())
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn(SECRET_KEY, response.get_data(as_text=True))
+
+    @patch("app.generate_novelai_png")
+    def test_generation_returns_sanitized_upstream_failure(self, generate):
+        self.save_key()
+        generate.side_effect = app.NovelAIError(502, "NovelAI generation failed.")
+        response = self.client.post("/api/style-maker/generate", json=self.request_payload())
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.get_json(), {"error": "NovelAI generation failed."})
+        self.assertNotIn(SECRET_KEY, response.get_data(as_text=True))
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 999))
+    def test_generation_validates_request_strictly(self, generate):
+        self.save_key()
+        invalid = (
+            {"data": "[]", "content_type": "application/json"},
+            {"json": self.request_payload(request_id="")},
+            {"json": self.request_payload(request_id="../bad")},
+            {"json": self.request_payload(request_id="x" * 129)},
+            {"json": self.request_payload(artists=[])},
+            {"json": self.request_payload(base_prompt=1)},
+            {"json": self.request_payload(negative_prompt=[])},
+            {"json": self.request_payload(character_prompts="hero")},
+            {"json": self.request_payload(character_prompts=[1])},
+            {"json": self.request_payload(character_prompts=["x"] * 17)},
+            {"json": self.request_payload(width=0)},
+            {"json": self.request_payload(width=65)},
+            {"json": self.request_payload(width=2112)},
+            {"json": self.request_payload(height=True)},
+            {"json": self.request_payload(steps=0)},
+            {"json": self.request_payload(steps=True)},
+            {"json": self.request_payload(steps=51)},
+            {"json": self.request_payload(scale=float("inf"))},
+            {"json": self.request_payload(scale=-0.1)},
+            {"json": self.request_payload(scale=True)},
+            {"json": self.request_payload(cfg_rescale=float("nan"))},
+            {"json": self.request_payload(cfg_rescale=1.1)},
+            {"json": self.request_payload(sampler="")},
+            {"json": self.request_payload(sampler="bad sampler")},
+            {"json": self.request_payload(seed=True)},
+            {"json": self.request_payload(seed=None)},
+            {"json": self.request_payload(seed=0)},
+            {"json": self.request_payload(seed=4294967296)},
+        )
+        for kwargs in invalid:
+            with self.subTest(kwargs=kwargs):
+                response = self.client.post("/api/style-maker/generate", **kwargs)
+                self.assertEqual(response.status_code, 400)
+        generate.assert_not_called()
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_generated_route_serves_only_generated_directory(self, generate):
+        self.save_key()
+        result = self.client.post("/api/style-maker/generate", json=self.request_payload()).get_json()
+        image_response = self.client.get(result["image_url"])
+        try:
+            self.assertEqual(image_response.data, valid_png())
+        finally:
+            image_response.close()
+        secret = app.DATA_DIR / "outside.txt"
+        secret.write_text("secret", encoding="utf-8")
+        for path in ("../outside.txt", "%2e%2e/outside.txt", "1/../../outside.txt"):
+            with self.subTest(path=path):
+                response = self.client.get(f"/generated/{path}")
+                self.assertIn(response.status_code, (400, 404))
+                self.assertNotIn(b"secret", response.data)
+
+    def test_unknown_style_returns_404(self):
+        response = self.client.get("/api/art-styles/999")
+        self.assertEqual(response.status_code, 404)
 
 
 class NovelAISubscriptionTest(unittest.TestCase):
