@@ -124,6 +124,10 @@ def init_db():
             """
         )
 
+    from style_store import reconcile_generated_storage
+
+    reconcile_generated_storage(DB_PATH, GENERATED_DIR)
+
 
 def db():
     conn = sqlite3.connect(DB_PATH)

@@ -1,8 +1,8 @@
 import hashlib
 import json
-import re
 import sqlite3
-import uuid
+import struct
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,16 +19,140 @@ def connect_db(db_path):
 def generated_file_path(generated_dir, style_id, request_id):
     root = Path(generated_dir).resolve()
     request_text = str(request_id)
-    safe_request_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", request_text).strip("._")
-    if not safe_request_id:
-        raise ValueError("request_id must contain a filename-safe character.")
-    if safe_request_id != request_text:
-        digest = hashlib.sha256(request_text.encode("utf-8")).hexdigest()[:12]
-        safe_request_id = f"{safe_request_id}-{digest}"
-    target = (root / str(int(style_id)) / f"{safe_request_id}.png").resolve()
+    if not request_text.strip():
+        raise ValueError("request_id is required.")
+    filename = f"{hashlib.sha256(request_text.encode('utf-8')).hexdigest()}.png"
+    target = (root / str(int(style_id)) / filename).resolve()
     if root not in target.parents:
         raise ValueError("Generated image path must remain under generated_dir.")
     return target
+
+
+def _staged_file_path(final_path):
+    return final_path.with_name(f".{final_path.name}.staged.tmp")
+
+
+def _validate_png(png_bytes):
+    if not isinstance(png_bytes, (bytes, bytearray)):
+        raise ValueError("png_bytes must contain a PNG image.")
+    data = bytes(png_bytes)
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("png_bytes must contain a PNG image.")
+
+    offset = 8
+    chunk_index = 0
+    saw_idat = False
+    saw_iend = False
+    while offset < len(data):
+        if len(data) - offset < 12:
+            raise ValueError("PNG chunk is truncated.")
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        chunk_type = data[offset + 4 : offset + 8]
+        chunk_end = offset + 12 + length
+        if chunk_end > len(data):
+            raise ValueError("PNG chunk is truncated.")
+        chunk_data = data[offset + 8 : offset + 8 + length]
+        expected_crc = struct.unpack(">I", data[offset + 8 + length : chunk_end])[0]
+        actual_crc = zlib.crc32(chunk_type)
+        actual_crc = zlib.crc32(chunk_data, actual_crc) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            raise ValueError("PNG chunk CRC is invalid.")
+
+        if chunk_index == 0:
+            if chunk_type != b"IHDR" or length != 13:
+                raise ValueError("PNG must start with a valid IHDR chunk.")
+            width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
+                ">IIBBBBB", chunk_data
+            )
+            valid_depths = {
+                0: {1, 2, 4, 8, 16},
+                2: {8, 16},
+                3: {1, 2, 4, 8},
+                4: {8, 16},
+                6: {8, 16},
+            }
+            if (
+                width == 0
+                or height == 0
+                or bit_depth not in valid_depths.get(color_type, set())
+                or compression != 0
+                or filtering != 0
+                or interlace not in {0, 1}
+            ):
+                raise ValueError("PNG IHDR fields are invalid.")
+        elif chunk_type == b"IHDR":
+            raise ValueError("PNG contains multiple IHDR chunks.")
+
+        if chunk_type == b"IDAT":
+            saw_idat = True
+        if chunk_type == b"IEND":
+            if length != 0 or not saw_idat:
+                raise ValueError("PNG IEND or IDAT structure is invalid.")
+            saw_iend = True
+            if chunk_end != len(data):
+                raise ValueError("PNG contains data after IEND.")
+            break
+        offset = chunk_end
+        chunk_index += 1
+
+    if not saw_iend:
+        raise ValueError("PNG is missing IEND.")
+    return data
+
+
+def _stored_result(row):
+    return {
+        "style_id": row["style_id"],
+        "image_id": row["image_id"],
+        "image_path": row["image_path"],
+        "artist_prompt": row["artist_prompt"],
+        "style_hash": row["style_hash"],
+    }
+
+
+def _find_request(conn, request_id):
+    return conn.execute(
+        """
+        SELECT generated_images.id AS image_id, generated_images.style_id,
+               generated_images.image_path, generated_images.artist_prompt,
+               art_styles.style_hash
+        FROM generated_images
+        JOIN art_styles ON art_styles.id = generated_images.style_id
+        WHERE generated_images.request_id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+
+
+def _recompute_style(conn, style_id, timestamp):
+    rows = conn.execute(
+        """
+        SELECT image_path FROM generated_images
+        WHERE style_id = ? ORDER BY created_at DESC, id DESC
+        """,
+        (style_id,),
+    ).fetchall()
+    if not rows:
+        conn.execute("DELETE FROM art_styles WHERE id = ?", (style_id,))
+        return
+    conn.execute(
+        """
+        UPDATE art_styles
+        SET representative_image_path = ?, image_count = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (rows[0]["image_path"], len(rows), timestamp, style_id),
+    )
+
+
+def _compensate_failed_promotion(db_path, image_id, style_id, timestamp):
+    conn = connect_db(db_path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM generated_images WHERE id = ?", (image_id,))
+            _recompute_style(conn, style_id, timestamp)
+    finally:
+        conn.close()
 
 
 def save_generated_result(
@@ -51,11 +175,10 @@ def save_generated_result(
     cfg_rescale=0.0,
     model="",
 ):
-    request_id = str(request_id or "").strip()
-    if not request_id:
+    request_id = str(request_id or "")
+    if not request_id.strip():
         raise ValueError("request_id is required.")
-    if not isinstance(png_bytes, (bytes, bytearray)) or not png_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError("png_bytes must contain a PNG image.")
+    png_data = _validate_png(png_bytes)
 
     normalized_artists = normalize_style_artists(artists)
     artists_json = json.dumps(normalized_artists, ensure_ascii=False, separators=(",", ":"))
@@ -67,13 +190,19 @@ def save_generated_result(
     timestamp = datetime.now(timezone.utc).isoformat()
     generated_root = Path(generated_dir).resolve()
     generated_root.mkdir(parents=True, exist_ok=True)
-    temporary_path = None
+    staged_path = None
     final_path = None
-    final_replaced = False
+    committed = False
+    image_id = None
+    style_id = None
 
     conn = connect_db(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        existing = _find_request(conn, request_id)
+        if existing is not None:
+            conn.commit()
+            return _stored_result(existing)
         conn.execute(
             """
             INSERT INTO art_styles (
@@ -92,43 +221,49 @@ def save_generated_result(
         style_id = style_row["id"]
         final_path = generated_file_path(generated_root, style_id, request_id)
         final_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = final_path.with_name(f".{final_path.name}.{uuid.uuid4().hex}.tmp")
-        temporary_path.write_bytes(bytes(png_bytes))
+        staged_path = _staged_file_path(final_path)
+        staged_path.write_bytes(png_data)
         relative_path = final_path.relative_to(generated_root).as_posix()
 
-        cursor = conn.execute(
-            """
-            INSERT INTO generated_images (
-                request_id, style_id, image_path, base_prompt, negative_prompt,
-                character_prompts_json, combined_prompt, artist_prompt,
-                artists_json, seed, width, height, sampler, steps, scale,
-                cfg_rescale, model, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                request_id,
-                style_id,
-                relative_path,
-                base_prompt,
-                negative_prompt,
-                character_prompts_json,
-                combined_prompt,
-                artist_prompt,
-                artists_json,
-                int(seed),
-                int(width),
-                int(height),
-                sampler,
-                int(steps),
-                float(scale),
-                float(cfg_rescale),
-                model,
-                timestamp,
-            ),
-        )
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO generated_images (
+                    request_id, style_id, image_path, base_prompt, negative_prompt,
+                    character_prompts_json, combined_prompt, artist_prompt,
+                    artists_json, seed, width, height, sampler, steps, scale,
+                    cfg_rescale, model, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request_id,
+                    style_id,
+                    relative_path,
+                    base_prompt,
+                    negative_prompt,
+                    character_prompts_json,
+                    combined_prompt,
+                    artist_prompt,
+                    artists_json,
+                    int(seed),
+                    int(width),
+                    int(height),
+                    sampler,
+                    int(steps),
+                    float(scale),
+                    float(cfg_rescale),
+                    model,
+                    timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            staged_path.unlink(missing_ok=True)
+            existing = _find_request(conn, request_id)
+            if existing is not None:
+                return _stored_result(existing)
+            raise
         image_id = cursor.lastrowid
-        temporary_path.replace(final_path)
-        final_replaced = True
         conn.execute(
             """
             UPDATE art_styles
@@ -140,6 +275,8 @@ def save_generated_result(
             (relative_path, timestamp, style_id),
         )
         conn.commit()
+        committed = True
+        staged_path.replace(final_path)
         return {
             "style_id": style_id,
             "image_id": image_id,
@@ -148,14 +285,42 @@ def save_generated_result(
             "style_hash": identity_hash,
         }
     except Exception:
-        conn.rollback()
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-        if final_replaced and final_path is not None:
-            final_path.unlink(missing_ok=True)
+        if not committed:
+            conn.rollback()
+        elif image_id is not None and style_id is not None:
+            _compensate_failed_promotion(db_path, image_id, style_id, timestamp)
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
         raise
     finally:
         conn.close()
+
+
+def reconcile_generated_storage(db_path, generated_dir):
+    root = Path(generated_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    conn = connect_db(db_path)
+    try:
+        rows = conn.execute("SELECT image_path FROM generated_images").fetchall()
+    finally:
+        conn.close()
+
+    referenced = set()
+    for row in rows:
+        final_path = (root / row["image_path"]).resolve()
+        if root not in final_path.parents:
+            continue
+        referenced.add(final_path)
+        staged_path = _staged_file_path(final_path)
+        if not final_path.exists() and staged_path.is_file():
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_path.replace(final_path)
+
+    for temp_path in root.rglob("*.tmp"):
+        temp_path.unlink(missing_ok=True)
+    for png_path in root.rglob("*.png"):
+        if png_path.resolve() not in referenced:
+            png_path.unlink(missing_ok=True)
 
 
 def _parse_json_field(item, source_key, result_key):

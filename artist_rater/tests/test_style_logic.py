@@ -1,10 +1,31 @@
+import struct
 import tempfile
 import unittest
+import zlib
+from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 import app
 from style_logic import build_artist_prompt, normalize_style_artists, style_hash
-from style_store import get_style_detail, list_styles, save_generated_result
+from style_store import connect_db, get_style_detail, list_styles, save_generated_result
+
+
+def png_chunk(chunk_type, data):
+    checksum = zlib.crc32(chunk_type)
+    checksum = zlib.crc32(data, checksum) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
+
+
+def tiny_png(pixel=b"\x00\xff\x00\x00\xff"):
+    return b"".join(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)),
+            png_chunk(b"IDAT", zlib.compress(pixel)),
+            png_chunk(b"IEND", b""),
+        )
+    )
 
 
 class StyleIdentityTest(unittest.TestCase):
@@ -101,7 +122,7 @@ class StyleStoreIntegrationTest(unittest.TestCase):
             "db_path": self.db_path,
             "generated_dir": self.generated_dir,
             "artists": artists,
-            "png_bytes": b"\x89PNG\r\n\x1a\nfirst",
+            "png_bytes": tiny_png(),
             "base_prompt": "portrait",
             "negative_prompt": "lowres",
             "character_prompts": ["1girl"],
@@ -134,19 +155,142 @@ class StyleStoreIntegrationTest(unittest.TestCase):
         self.assertEqual(detail["images"][0]["character_prompts"], ["1girl"])
 
     def test_distinct_request_ids_cannot_overwrite_the_same_file(self):
+        first_png = tiny_png()
+        second_png = tiny_png(b"\x00\x00\xff\x00\xff")
         common = {
             "db_path": self.db_path,
             "generated_dir": self.generated_dir,
             "artists": [{"artist": "artist_a", "weight": 1}],
-            "png_bytes": b"\x89PNG\r\n\x1a\nimage",
         }
 
-        first = save_generated_result(request_id="same/name", **common)
-        second = save_generated_result(request_id="same?name", **common)
+        first = save_generated_result(request_id="foo/", png_bytes=first_png, **common)
+        second = save_generated_result(
+            request_id="foo-14fe48f0fbfb", png_bytes=second_png, **common
+        )
 
         self.assertNotEqual(first["image_path"], second["image_path"])
+        self.assertEqual((self.generated_dir / first["image_path"]).read_bytes(), first_png)
+        self.assertEqual((self.generated_dir / second["image_path"]).read_bytes(), second_png)
+
+    def test_rejects_truncated_and_corrupt_crc_png_before_writing(self):
+        valid_png = tiny_png()
+        corrupt_crc = bytearray(valid_png)
+        corrupt_crc[-5] ^= 0x01
+        common = {
+            "db_path": self.db_path,
+            "generated_dir": self.generated_dir,
+            "artists": [{"artist": "artist_a", "weight": 1}],
+        }
+
+        for request_id, invalid_png in (
+            ("truncated", valid_png[:-1]),
+            ("corrupt-crc", bytes(corrupt_crc)),
+        ):
+            with self.subTest(request_id=request_id), self.assertRaises(ValueError):
+                save_generated_result(
+                    request_id=request_id, png_bytes=invalid_png, **common
+                )
+
+        with closing(connect_db(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM art_styles").fetchone()[0], 0)
+        self.assertEqual(list(self.generated_dir.rglob("*")), [])
+
+    def test_request_id_retry_returns_existing_result_without_rewriting(self):
+        first_png = tiny_png()
+        common = {
+            "db_path": self.db_path,
+            "generated_dir": self.generated_dir,
+            "request_id": "retry-request",
+            "artists": [{"artist": "artist_a", "weight": 1}],
+        }
+
+        first = save_generated_result(png_bytes=first_png, **common)
+        second = save_generated_result(
+            png_bytes=tiny_png(b"\x00\x00\x00\xff\xff"), **common
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual((self.generated_dir / first["image_path"]).read_bytes(), first_png)
+        style = list_styles(self.db_path)[0]
+        self.assertEqual(style["image_count"], 1)
+
+    def test_replace_failure_compensates_committed_database_rows(self):
+        with patch("pathlib.Path.replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                save_generated_result(
+                    self.db_path,
+                    self.generated_dir,
+                    request_id="replace-failure",
+                    artists=[{"artist": "artist_a", "weight": 1}],
+                    png_bytes=tiny_png(),
+                )
+
+        with closing(connect_db(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM generated_images").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM art_styles").fetchone()[0], 0)
+        self.assertEqual(list(self.generated_dir.rglob("*.tmp")), [])
+        self.assertEqual(list(self.generated_dir.rglob("*.png")), [])
+
+    def test_replace_failure_restores_existing_style_summary(self):
+        artists = [{"artist": "artist_a", "weight": 1}]
+        first = save_generated_result(
+            self.db_path,
+            self.generated_dir,
+            request_id="first-image",
+            artists=artists,
+            png_bytes=tiny_png(),
+        )
+
+        with patch("pathlib.Path.replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                save_generated_result(
+                    self.db_path,
+                    self.generated_dir,
+                    request_id="failed-second-image",
+                    artists=artists,
+                    png_bytes=tiny_png(b"\x00\x00\xff\x00\xff"),
+                )
+
+        style = list_styles(self.db_path)[0]
+        self.assertEqual(style["image_count"], 1)
+        self.assertEqual(style["representative_image_path"], first["image_path"])
         self.assertTrue((self.generated_dir / first["image_path"]).is_file())
-        self.assertTrue((self.generated_dir / second["image_path"]).is_file())
+
+    def test_reconcile_removes_stale_temp_and_unreferenced_png(self):
+        saved = save_generated_result(
+            self.db_path,
+            self.generated_dir,
+            request_id="referenced",
+            artists=[{"artist": "artist_a", "weight": 1}],
+            png_bytes=tiny_png(),
+        )
+        stale_temp = self.generated_dir / "1" / ".stale.png.deadbeef.tmp"
+        orphan = self.generated_dir / "1" / "orphan.png"
+        stale_temp.write_bytes(b"stale")
+        orphan.write_bytes(tiny_png())
+
+        app.init_db()
+
+        self.assertFalse(stale_temp.exists())
+        self.assertFalse(orphan.exists())
+        self.assertTrue((self.generated_dir / saved["image_path"]).is_file())
+
+    def test_reconcile_promotes_committed_staged_file(self):
+        saved = save_generated_result(
+            self.db_path,
+            self.generated_dir,
+            request_id="crash-window",
+            artists=[{"artist": "artist_a", "weight": 1}],
+            png_bytes=tiny_png(),
+        )
+        final_path = self.generated_dir / saved["image_path"]
+        staged_path = final_path.with_name(f".{final_path.name}.staged.tmp")
+        final_path.replace(staged_path)
+
+        app.init_db()
+
+        self.assertTrue(final_path.is_file())
+        self.assertFalse(staged_path.exists())
 
 
 if __name__ == "__main__":
