@@ -93,10 +93,11 @@ def normalize_generation_data(data):
         if type(value) is not str:
             raise ValueError("character_prompts must be a list of strings.")
         value = value.strip()
+        if not value:
+            raise ValueError("Character prompts must not be empty.")
         if len(value) > MAX_CHARACTER_PROMPT_LENGTH:
             raise ValueError("A character prompt is too long.")
-        if value:
-            normalized_characters.append(value)
+        normalized_characters.append(value)
     if len(normalized_characters) > MAX_CHARACTER_PROMPTS:
         raise ValueError("Too many character prompts.")
 

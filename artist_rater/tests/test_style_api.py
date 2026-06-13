@@ -327,7 +327,7 @@ class NovelAIGenerationTest(unittest.TestCase):
             "sampler": "k_euler_ancestral",
             "base_prompt": "masterpiece",
             "negative_prompt": "lowres",
-            "character_prompts": ["hero", "  ", "villain"],
+            "character_prompts": [" hero ", " villain "],
         }
         data.update(overrides)
         return data
@@ -476,7 +476,7 @@ class GenerationApiTest(StyleApiTest):
             ],
             "base_prompt": "masterpiece",
             "negative_prompt": "lowres",
-            "character_prompts": [" hero ", "", "villain"],
+            "character_prompts": [" hero ", " villain "],
             "width": 832,
             "height": 1216,
             "sampler": "k_euler_ancestral",
@@ -577,6 +577,8 @@ class GenerationApiTest(StyleApiTest):
             {"json": self.request_payload(negative_prompt=[])},
             {"json": self.request_payload(character_prompts="hero")},
             {"json": self.request_payload(character_prompts=[1])},
+            {"json": self.request_payload(character_prompts=[""])},
+            {"json": self.request_payload(character_prompts=["hero", "   "])},
             {"json": self.request_payload(character_prompts=["x"] * 17)},
             {"json": self.request_payload(width=0)},
             {"json": self.request_payload(width=65)},
