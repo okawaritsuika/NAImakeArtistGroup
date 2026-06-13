@@ -69,7 +69,7 @@ def select_artists(pool, count, allowed_scores, rng_seed=None):
     return selected
 
 
-def random_weight(rng, low, high):
+def _cent_bounds(low, high):
     low = float(low)
     high = float(high)
     epsilon = 1e-9
@@ -77,6 +77,11 @@ def random_weight(rng, low, high):
     maximum_cent = math.floor(high * 100 + epsilon)
     if minimum_cent > maximum_cent:
         raise ValueError("범위 안에 유효한 양수 센트 가중치가 없습니다.")
+    return minimum_cent, maximum_cent
+
+
+def random_weight(rng, low, high):
+    minimum_cent, maximum_cent = _cent_bounds(low, high)
     return rng.randint(minimum_cent, maximum_cent) / 100
 
 
@@ -158,6 +163,7 @@ def validate_custom_ranges(ranges, artist_count, minimum, maximum):
             or isinstance(item.get("max_people"), bool)
         ):
             raise ValueError("사용자 구간을 확인하세요.")
+        _cent_bounds(low, high)
         validated.append(
             {"name": f"custom_{len(validated)}", "min": low, "max": high, "max_people": capacity}
         )

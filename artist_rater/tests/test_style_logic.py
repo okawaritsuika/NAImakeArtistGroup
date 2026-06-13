@@ -306,6 +306,21 @@ class WeightEngineTest(unittest.TestCase):
                     rng_seed=1,
                 )
 
+    def test_custom_mode_validates_unreached_range_has_representable_cent(self):
+        with self.assertRaisesRegex(ValueError, "센트"):
+            assign_weights(
+                self.artists[:1],
+                "custom",
+                0.001,
+                2.3,
+                False,
+                [
+                    {"min": 0.1, "max": 0.2, "max_people": 1},
+                    {"min": 0.006, "max": 0.006, "max_people": 1},
+                ],
+                rng_seed=1,
+            )
+
     def test_empty_custom_ranges_fall_back_to_seeded_random(self):
         first = assign_weights(
             self.artists[:3], "custom", 0.1, 2.3, False, [], rng_seed=2
@@ -635,6 +650,28 @@ class ArtistStyleEndpointTest(unittest.TestCase):
                     },
                 )
                 self.assertEqual(response.status_code, 200)
+
+    def test_endpoint_requires_ranges_to_be_json_array_when_supplied(self):
+        for ranges in ({}, False, "", 0, None):
+            with self.subTest(ranges=ranges):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json={"count": 1, "scores": [5], "ranges": ranges},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("구간", response.get_json()["error"])
+
+        for payload in (
+            {"count": 1, "scores": [5]},
+            {"count": 1, "scores": [5], "ranges": []},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    self.client.post(
+                        "/api/style-maker/artists", json=payload
+                    ).status_code,
+                    200,
+                )
 
 
 class StyleStoreIntegrationTest(unittest.TestCase):

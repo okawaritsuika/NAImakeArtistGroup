@@ -741,6 +741,9 @@ def api_style_maker_artists():
         ):
             raise ValueError("평점 우선 여부는 JSON 불리언이어야 합니다.")
         prefer_high_scores = payload.get("prefer_high_scores", False)
+        if "ranges" in payload and not isinstance(payload["ranges"], list):
+            raise ValueError("가중치 구간은 JSON 배열이어야 합니다.")
+        ranges = payload.get("ranges", [])
         supplied = payload.get("artists") if "artists" in payload else None
         if supplied is not None:
             artists = validate_supplied_style_artists(supplied)
@@ -768,7 +771,7 @@ def api_style_maker_artists():
             payload.get("min_weight", 0.1),
             payload.get("max_weight", 2.3),
             prefer_high_scores,
-            payload.get("ranges") or [],
+            ranges,
             rng_seed=rng_seed,
         )
         artist_prompt = build_artist_prompt(weighted)
