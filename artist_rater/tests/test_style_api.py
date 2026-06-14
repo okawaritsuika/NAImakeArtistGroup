@@ -517,7 +517,7 @@ class NovelAIGenerationTest(unittest.TestCase):
 class GenerationApiTest(StyleApiTest):
     def setUp(self):
         super().setUp()
-        with app.db() as conn:
+        with closing(app.db()) as conn, conn:
             conn.executemany(
                 "INSERT INTO ratings (artist_tag, score, mode, created_at, updated_at) VALUES (?, ?, 'random', ?, ?)",
                 [
@@ -673,6 +673,91 @@ class GenerationApiTest(StyleApiTest):
         self.assertEqual(first.status_code, 502)
         self.assertEqual(second.status_code, 200)
         self.assertEqual(generate.call_count, 2)
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_final_promotion_failure_cleans_database_and_allows_retry(self, generate):
+        self.save_key()
+
+        with patch("style_store.Path.replace", side_effect=OSError("replace failed")):
+            failed = self.client.post(
+                "/api/style-maker/generate", json=self.request_payload()
+            )
+
+        self.assertEqual(failed.status_code, 500)
+        with closing(app.db()) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM generation_requests").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM generated_images").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM art_styles").fetchone()[0], 0
+            )
+
+        retried = self.client.post(
+            "/api/style-maker/generate", json=self.request_payload()
+        )
+
+        self.assertEqual(retried.status_code, 200)
+        self.assertTrue((app.GENERATED_DIR / retried.get_json()["image_path"]).is_file())
+        self.assertEqual(generate.call_count, 2)
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_reconcile_missing_completed_image_removes_reservation_and_allows_retry(
+        self, generate
+    ):
+        self.save_key()
+        first = self.client.post(
+            "/api/style-maker/generate",
+            json=self.request_payload(request_id="kept-image"),
+        ).get_json()
+        missing = self.client.post(
+            "/api/style-maker/generate",
+            json=self.request_payload(request_id="missing-image"),
+        ).get_json()
+        (app.GENERATED_DIR / missing["image_path"]).unlink()
+
+        app.init_db()
+
+        with closing(app.db()) as conn:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM generation_requests WHERE request_id = ?",
+                    ("missing-image",),
+                ).fetchone()
+            )
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM generated_images WHERE request_id = ?",
+                    ("missing-image",),
+                ).fetchone()
+            )
+            style = conn.execute(
+                "SELECT image_count, representative_image_path FROM art_styles WHERE id = ?",
+                (first["style_id"],),
+            ).fetchone()
+            self.assertEqual(style["image_count"], 1)
+            self.assertEqual(style["representative_image_path"], first["image_path"])
+
+        retried = self.client.post(
+            "/api/style-maker/generate",
+            json=self.request_payload(request_id="missing-image"),
+        )
+
+        self.assertEqual(retried.status_code, 200)
+        self.assertTrue((app.GENERATED_DIR / retried.get_json()["image_path"]).is_file())
+        with closing(app.db()) as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT image_count FROM art_styles WHERE id = ?",
+                    (first["style_id"],),
+                ).fetchone()[0],
+                2,
+            )
+        self.assertEqual(generate.call_count, 3)
 
     @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
     def test_generation_rejects_unknown_or_mismatched_rating(self, generate):

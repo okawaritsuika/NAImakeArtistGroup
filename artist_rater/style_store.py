@@ -272,12 +272,28 @@ def _recompute_style(conn, style_id, timestamp):
     )
 
 
+def _delete_generated_images(conn, image_ids, style_ids, timestamp):
+    image_ids = list(image_ids)
+    if not image_ids:
+        return
+    placeholders = ",".join("?" for _ in image_ids)
+    conn.execute(
+        f"DELETE FROM generation_requests WHERE image_id IN ({placeholders})",
+        image_ids,
+    )
+    conn.execute(
+        f"DELETE FROM generated_images WHERE id IN ({placeholders})",
+        image_ids,
+    )
+    for style_id in set(style_ids):
+        _recompute_style(conn, style_id, timestamp)
+
+
 def _compensate_failed_promotion(db_path, image_id, style_id, timestamp):
     conn = connect_db(db_path)
     try:
         with conn:
-            conn.execute("DELETE FROM generated_images WHERE id = ?", (image_id,))
-            _recompute_style(conn, style_id, timestamp)
+            _delete_generated_images(conn, [image_id], [style_id], timestamp)
     finally:
         conn.close()
 
@@ -481,13 +497,12 @@ def reconcile_generated_storage(db_path, generated_dir):
         conn = connect_db(db_path)
         try:
             with conn:
-                placeholders = ",".join("?" for _ in missing_image_ids)
-                conn.execute(
-                    f"DELETE FROM generated_images WHERE id IN ({placeholders})",
+                _delete_generated_images(
+                    conn,
                     missing_image_ids,
+                    affected_style_ids,
+                    timestamp,
                 )
-                for style_id in affected_style_ids:
-                    _recompute_style(conn, style_id, timestamp)
         finally:
             conn.close()
 
