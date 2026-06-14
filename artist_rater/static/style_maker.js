@@ -62,16 +62,17 @@ function normalizeSelectedScores(scores) {
   return normalized;
 }
 
-function buildStyleRequestPayload(options, artists, { rerollArtists, rerollWeights }) {
-  const payload = {
-    ...options,
-    reroll_artists: rerollArtists,
-    reroll_weights: rerollWeights,
-  };
-  if (!rerollArtists) {
-    payload.artists = artists.map(({ artist, score }) => ({ artist, score }));
+function buildStyleRequestPayload(options, artists, reroll) {
+  const payload = { ...options, reroll };
+  if (reroll !== "all") {
+    payload.artists = artists.map(({ artist, score, weight }) => ({ artist, score, weight }));
   }
   return payload;
+}
+
+function applyStyleRerollResult(currentArtists, incomingArtists, reroll) {
+  if (reroll === "artists") return [...incomingArtists];
+  return sortArtistsByWeight(incomingArtists, "asc");
 }
 
 function sortArtistsByWeight(artists, direction) {
@@ -157,15 +158,15 @@ function readStyleOptions() {
   };
 }
 
-async function loadStyleArtists({ rerollArtists = true, rerollWeights = true } = {}) {
+async function loadStyleArtists(reroll = "all") {
   try {
     showStyleStatus("그림체를 구성하는 중입니다...");
-    const payload = buildStyleRequestPayload(readStyleOptions(), styleState.artists, { rerollArtists, rerollWeights });
+    const payload = buildStyleRequestPayload(readStyleOptions(), styleState.artists, reroll);
     const data = await apiFetch("/api/style-maker/artists", {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    styleState.artists = data.artists || [];
+    styleState.artists = applyStyleRerollResult(styleState.artists, data.artists || [], reroll);
     renderWeightGraph();
     showStyleStatus(`${styleState.artists.length}명의 작가를 불러왔습니다.`, "ok");
   } catch (error) {
@@ -444,9 +445,9 @@ function initializeStyleMaker() {
   });
   styleElement("addWeightRange")?.addEventListener("click", addWeightRange);
   styleElement("toggleStyleSettings")?.addEventListener("click", toggleStyleSettings);
-  styleElement("rerollStyleArtists")?.addEventListener("click", () => loadStyleArtists({ rerollArtists: true, rerollWeights: false }));
-  styleElement("rerollStyleWeights")?.addEventListener("click", () => loadStyleArtists({ rerollArtists: false, rerollWeights: true }));
-  styleElement("rerollStyleAll")?.addEventListener("click", () => loadStyleArtists({ rerollArtists: true, rerollWeights: true }));
+  styleElement("rerollStyleArtists")?.addEventListener("click", () => loadStyleArtists("artists"));
+  styleElement("rerollStyleWeights")?.addEventListener("click", () => loadStyleArtists("weights"));
+  styleElement("rerollStyleAll")?.addEventListener("click", () => loadStyleArtists("all"));
   styleElement("sortStyleAsc")?.addEventListener("click", () => sortStyleArtists("asc"));
   styleElement("sortStyleDesc")?.addEventListener("click", () => sortStyleArtists("desc"));
   styleElement("styleArtistSearch")?.addEventListener("input", renderRatedArtistSelect);
@@ -474,6 +475,7 @@ if (typeof document !== "undefined") {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     CUSTOM_RANGE_FIELDS,
+    applyStyleRerollResult,
     buildStyleRequestPayload,
     normalizeSelectedScores,
     reorderArtists,

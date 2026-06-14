@@ -780,9 +780,21 @@ def api_style_maker_artists():
         if "ranges" in payload and not isinstance(payload["ranges"], list):
             raise ValueError("가중치 구간은 JSON 배열이어야 합니다.")
         ranges = payload.get("ranges", [])
+        reroll = payload.get("reroll")
+        if reroll is None:
+            reroll = "weights" if "artists" in payload else "all"
+        if reroll not in {"all", "artists", "weights"}:
+            raise ValueError("Reroll mode must be all, artists, or weights.")
         supplied = payload.get("artists") if "artists" in payload else None
-        if supplied is not None:
-            artists = validate_supplied_style_artists(supplied)
+        current_artists = None
+        if reroll in {"artists", "weights"}:
+            current_artists = validate_supplied_style_artists(
+                supplied,
+                require_weights=reroll == "artists",
+            )
+
+        if reroll == "weights":
+            artists = current_artists
         else:
             scores = payload.get("scores", [1, 2, 3, 4, 5])
             if not isinstance(scores, list) or not scores:
@@ -794,22 +806,32 @@ def api_style_maker_artists():
                 {"artist": row["artist_tag"], "score": row["score"]}
                 for row in rows
             ]
+            if reroll == "artists":
+                current_names = {item["artist"] for item in current_artists}
+                pool = [item for item in pool if item["artist"] not in current_names]
             artists = select_artists(
                 pool,
-                payload.get("count", 12),
+                len(current_artists) if reroll == "artists" else payload.get("count", 12),
                 scores,
                 rng_seed=rng_seed,
             )
 
-        weighted = assign_weights(
-            artists,
-            payload.get("weight_mode", "balanced"),
-            payload.get("min_weight", 0.1),
-            payload.get("max_weight", 2.3),
-            prefer_high_scores,
-            ranges,
-            rng_seed=rng_seed,
-        )
+        if reroll == "artists":
+            weighted = [
+                item | {"weight": current_artists[index]["weight"]}
+                for index, item in enumerate(artists)
+            ]
+        else:
+            weighted = assign_weights(
+                artists,
+                payload.get("weight_mode", "balanced"),
+                payload.get("min_weight", 0.1),
+                payload.get("max_weight", 2.3),
+                prefer_high_scores,
+                ranges,
+                rng_seed=rng_seed,
+            )
+            weighted.sort(key=lambda item: item["weight"])
         artist_prompt = build_artist_prompt(weighted)
         return json_response(
             {
@@ -890,7 +912,7 @@ def api_test_novelai_settings():
     )
 
 
-def validate_supplied_style_artists(supplied):
+def validate_supplied_style_artists(supplied, require_weights=False):
     if not isinstance(supplied, list) or not supplied:
         raise ValueError("작가 목록을 하나 이상 입력하세요.")
 
@@ -908,7 +930,12 @@ def validate_supplied_style_artists(supplied):
             raise ValueError("작가 태그를 확인하세요.")
         if artist in seen:
             raise ValueError("중복된 작가는 사용할 수 없습니다.")
-        artists.append({"artist": artist, "score": score})
+        normalized = {"artist": artist, "score": score}
+        if "weight" in item:
+            normalized["weight"] = normalize_style_artists([item])[0]["weight"]
+        elif require_weights:
+            raise ValueError("Artist reroll requires the current positional weights.")
+        artists.append(normalized)
         seen.add(artist)
 
     placeholders = ", ".join("?" for _ in artists)

@@ -3,6 +3,7 @@ const test = require("node:test");
 
 const {
   CUSTOM_RANGE_FIELDS,
+  applyStyleRerollResult,
   buildStyleRequestPayload,
   normalizeSelectedScores,
   reorderArtists,
@@ -45,7 +46,7 @@ test("score selection requires valid scores and returns numeric order", () => {
   assert.throws(() => normalizeSelectedScores([1, 6]), /1부터 5/);
 });
 
-test("weight-only payload preserves the current artist order", () => {
+test("reroll payload uses one explicit mode without unused boolean flags", () => {
   const artists = [
     { artist: "third", score: 3, weight: 1.2 },
     { artist: "first", score: 5, weight: 0.8 },
@@ -54,16 +55,41 @@ test("weight-only payload preserves the current artist order", () => {
   const payload = buildStyleRequestPayload(
     { count: 3, scores: [3, 4, 5] },
     artists,
-    { rerollArtists: false, rerollWeights: true },
+    "weights",
   );
 
   assert.deepEqual(payload.artists, [
-    { artist: "third", score: 3 },
-    { artist: "first", score: 5 },
-    { artist: "second", score: 4 },
+    { artist: "third", score: 3, weight: 1.2 },
+    { artist: "first", score: 5, weight: 0.8 },
+    { artist: "second", score: 4, weight: 1.0 },
   ]);
-  assert.equal(payload.reroll_artists, false);
-  assert.equal(payload.reroll_weights, true);
+  assert.equal(payload.reroll, "weights");
+  assert.equal("reroll_artists" in payload, false);
+  assert.equal("reroll_weights" in payload, false);
+});
+
+test("reroll result ordering depends on the explicit action", () => {
+  const current = [
+    { artist: "old-a", score: 5, weight: 1.7 },
+    { artist: "old-b", score: 4, weight: 0.4 },
+  ];
+  const fresh = [
+    { artist: "new-a", score: 3, weight: 1.3 },
+    { artist: "new-b", score: 5, weight: 0.6 },
+  ];
+
+  assert.deepEqual(
+    applyStyleRerollResult(current, fresh, "all").map((item) => item.artist),
+    ["new-b", "new-a"],
+  );
+  assert.deepEqual(
+    applyStyleRerollResult(current, fresh, "weights").map((item) => item.artist),
+    ["new-b", "new-a"],
+  );
+  assert.deepEqual(
+    applyStyleRerollResult(current, fresh, "artists"),
+    fresh,
+  );
 });
 
 test("sort and reorder helpers return the requested artist order", () => {

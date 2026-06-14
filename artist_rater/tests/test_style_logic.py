@@ -565,6 +565,83 @@ class ArtistStyleEndpointTest(unittest.TestCase):
             ["gamma", "alpha"],
         )
 
+    def test_initial_and_all_reroll_results_are_sorted_by_weight_ascending(self):
+        for payload in (
+            {
+                "count": 3,
+                "scores": [2, 3, 4, 5],
+                "weight_mode": "random",
+                "rng_seed": 7,
+            },
+            {
+                "reroll": "all",
+                "count": 3,
+                "scores": [2, 3, 4, 5],
+                "weight_mode": "random",
+                "rng_seed": 7,
+            },
+        ):
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/style-maker/artists", json=payload)
+                weights = [item["weight"] for item in response.get_json()["artists"]]
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(weights, sorted(weights))
+
+    def test_weight_reroll_preserves_artists_and_sorts_new_weights_ascending(self):
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "reroll": "weights",
+                "artists": [
+                    {"artist": "gamma", "score": 2, "weight": 1.7},
+                    {"artist": "alpha", "score": 5, "weight": 0.4},
+                ],
+                "weight_mode": "random",
+                "rng_seed": 11,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual({item["artist"] for item in artists}, {"gamma", "alpha"})
+        self.assertEqual(
+            [item["weight"] for item in artists],
+            sorted(item["weight"] for item in artists),
+        )
+
+    def test_artist_reroll_selects_new_unique_artists_and_preserves_positional_weights(self):
+        with closing(app.db()) as conn, conn:
+            for artist, score in (("delta", 4), ("epsilon", 3)):
+                conn.execute(
+                    """
+                    INSERT INTO ratings (
+                        artist_tag, score, mode, created_at, updated_at
+                    ) VALUES (?, ?, 'manual', ?, ?)
+                    """,
+                    (artist, score, app.now_text(), app.now_text()),
+                )
+
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "reroll": "artists",
+                "artists": [
+                    {"artist": "alpha", "score": 5, "weight": 1.7},
+                    {"artist": "beta", "score": 4, "weight": 0.4},
+                ],
+                "count": 2,
+                "scores": [2, 3, 4, 5],
+                "rng_seed": 5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        names = [item["artist"] for item in artists]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(set(names).isdisjoint({"alpha", "beta"}))
+        self.assertEqual([item["weight"] for item in artists], [1.7, 0.4])
+
     def test_endpoint_returns_400_for_invalid_user_input(self):
         invalid_payloads = (
             {"count": 4, "scores": [5]},
