@@ -74,17 +74,17 @@ test("reroll result ordering depends on the explicit action", () => {
     { artist: "old-b", score: 4, weight: 0.4 },
   ];
   const fresh = [
-    { artist: "new-a", score: 3, weight: 1.3 },
-    { artist: "new-b", score: 5, weight: 0.6 },
+    { artist: "old-a", score: 5, weight: 1.3 },
+    { artist: "old-b", score: 4, weight: 0.6 },
   ];
 
   assert.deepEqual(
     applyStyleRerollResult(current, fresh, "all").map((item) => item.artist),
-    ["new-b", "new-a"],
+    ["old-b", "old-a"],
   );
   assert.deepEqual(
-    applyStyleRerollResult(current, fresh, "weights").map((item) => item.artist),
-    ["new-b", "new-a"],
+    applyStyleRerollResult(current, fresh, "weights"),
+    fresh,
   );
   assert.deepEqual(
     applyStyleRerollResult(current, fresh, "artists"),

@@ -831,7 +831,8 @@ def api_style_maker_artists():
                 ranges,
                 rng_seed=rng_seed,
             )
-            weighted.sort(key=lambda item: item["weight"])
+            if reroll != "weights":
+                weighted.sort(key=lambda item: item["weight"])
         artist_prompt = build_artist_prompt(weighted)
         return json_response(
             {

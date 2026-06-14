@@ -587,7 +587,8 @@ class ArtistStyleEndpointTest(unittest.TestCase):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(weights, sorted(weights))
 
-    def test_weight_reroll_preserves_artists_and_sorts_new_weights_ascending(self):
+    def test_weight_reroll_preserves_artist_order_and_changes_only_weights(self):
+        original_weights = [1.7, 0.4]
         response = self.client.post(
             "/api/style-maker/artists",
             json={
@@ -603,11 +604,11 @@ class ArtistStyleEndpointTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         artists = response.get_json()["artists"]
-        self.assertEqual({item["artist"] for item in artists}, {"gamma", "alpha"})
         self.assertEqual(
-            [item["weight"] for item in artists],
-            sorted(item["weight"] for item in artists),
+            [item["artist"] for item in artists],
+            ["gamma", "alpha"],
         )
+        self.assertNotEqual([item["weight"] for item in artists], original_weights)
 
     def test_artist_reroll_selects_new_unique_artists_and_preserves_positional_weights(self):
         with closing(app.db()) as conn, conn:

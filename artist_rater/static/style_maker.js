@@ -71,7 +71,7 @@ function buildStyleRequestPayload(options, artists, reroll) {
 }
 
 function applyStyleRerollResult(currentArtists, incomingArtists, reroll) {
-  if (reroll === "artists") return [...incomingArtists];
+  if (reroll !== "all") return [...incomingArtists];
   return sortArtistsByWeight(incomingArtists, "asc");
 }
 
