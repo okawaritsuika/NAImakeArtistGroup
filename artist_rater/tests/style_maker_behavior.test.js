@@ -11,7 +11,13 @@ const {
   sortArtistsByWeight,
   validateCustomRangeValues,
   interpolateWeightProfile,
+  formatArtistPromptTag,
 } = require("../static/style_maker.js");
+
+test("artist prompt tags replace underscores and separate numeric endings", () => {
+  assert.equal(formatArtistPromptTag("some_artist"), "some artist");
+  assert.equal(formatArtistPromptTag("artist_123"), "artist 123 ");
+});
 
 test("weight profile interpolates prompt positions between control points", () => {
   const profile = [

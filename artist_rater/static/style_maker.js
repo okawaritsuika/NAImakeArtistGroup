@@ -163,6 +163,11 @@ function formatStyleWeight(value) {
   return Number(value).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+function formatArtistPromptTag(artist) {
+  const normalized = String(artist || "").replaceAll("_", " ");
+  return /\d$/.test(normalized) ? `${normalized} ` : normalized;
+}
+
 function interpolateWeightProfile(profile, position) {
   const points = [...profile].sort((a, b) => a.position - b.position);
   for (let index = 0; index < points.length - 1; index += 1) {
@@ -272,7 +277,7 @@ function updateArtistPrompt() {
   const preview = styleElement("artistPromptPreview");
   if (!preview) return;
   preview.value = styleState.artists
-    .map((item) => `${formatStyleWeight(item.weight)}::artist:${item.artist.replaceAll("_", " ")}::`)
+    .map((item) => `${formatStyleWeight(item.weight)}::artist:${formatArtistPromptTag(item.artist)}::`)
     .join(", ");
 }
 
@@ -1097,6 +1102,7 @@ if (typeof module !== "undefined" && module.exports) {
     sortArtistsByWeight,
     validateCustomRangeValues,
     interpolateWeightProfile,
+    formatArtistPromptTag,
     reachedGenerationLimit,
   };
 }

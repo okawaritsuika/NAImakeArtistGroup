@@ -350,10 +350,13 @@ def format_weight(value):
 
 
 def build_artist_prompt(artists):
-    return ", ".join(
-        f'{format_weight(item["weight"])}::artist:{item["artist"].replace("_", " ")}::'
-        for item in normalize_style_artists(artists)
-    )
+    prompts = []
+    for item in normalize_style_artists(artists):
+        artist = item["artist"].replace("_", " ")
+        if artist[-1:].isdigit():
+            artist += " "
+        prompts.append(f'{format_weight(item["weight"])}::artist:{artist}::')
+    return ", ".join(prompts)
 
 
 def style_hash(artists):

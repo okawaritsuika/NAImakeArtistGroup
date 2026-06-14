@@ -3,6 +3,6 @@ cd /d "%~dp0"
 python -m pip install -r requirements.txt
 echo.
 echo Danbooru Artist Rater
-echo Open http://127.0.0.1:5000
+echo Open http://127.0.0.1:5001
 echo.
 python app.py

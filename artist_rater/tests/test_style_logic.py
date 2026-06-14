@@ -87,6 +87,12 @@ class StyleIdentityTest(unittest.TestCase):
             "1.25::artist:some artist name::",
         )
 
+    def test_prompt_adds_space_before_closing_marker_when_artist_ends_in_number(self):
+        self.assertEqual(
+            build_artist_prompt([{"artist": "artist_name_123", "weight": 1.25}]),
+            "1.25::artist:artist name 123 ::",
+        )
+
     def test_hash_changes_when_order_changes(self):
         artists = [
             {"artist": "artist_a", "weight": 1.0},
