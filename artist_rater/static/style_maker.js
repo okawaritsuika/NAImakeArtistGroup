@@ -15,6 +15,10 @@ const styleState = {
   managerDirty: true,
   managerImages: [],
   managerImageIndex: 0,
+  weightProfile: [
+    { position: 0, weight: 0.1 },
+    { position: 1, weight: 2.3 },
+  ],
 };
 
 const STYLE_REQUEST_CONTROL_IDS = [
@@ -98,8 +102,8 @@ function buildStyleRequestPayload(options, artists, reroll) {
   return payload;
 }
 
-function applyStyleRerollResult(currentArtists, incomingArtists, reroll) {
-  if (reroll !== "all") return [...incomingArtists];
+function applyStyleRerollResult(currentArtists, incomingArtists, reroll, preserveOrder = false) {
+  if (reroll !== "all" || preserveOrder) return [...incomingArtists];
   return sortArtistsByWeight(incomingArtists, "asc");
 }
 
@@ -159,6 +163,19 @@ function formatStyleWeight(value) {
   return Number(value).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+function interpolateWeightProfile(profile, position) {
+  const points = [...profile].sort((a, b) => a.position - b.position);
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const left = points[index];
+    const right = points[index + 1];
+    if (position <= right.position) {
+      const ratio = (position - left.position) / (right.position - left.position);
+      return Number((left.weight + ((right.weight - left.weight) * ratio)).toFixed(4));
+    }
+  }
+  return points.at(-1)?.weight ?? 0;
+}
+
 function showStyleStatus(message, type = "") {
   const target = styleElement("styleMakerStatus");
   if (!target) return;
@@ -209,14 +226,16 @@ function readStyleOptions() {
     throw new Error("전체 가중치 범위를 확인하세요.");
   }
 
+  const mode = styleElement("weightMode")?.value || "balanced";
   return {
     count,
     scores: normalizeSelectedScores(styleState.allowedScores),
-    weight_mode: styleElement("weightMode")?.value || "balanced",
+    weight_mode: mode,
     min_weight: minWeight,
     max_weight: maxWeight,
     prefer_high_scores: Boolean(styleElement("preferHighScores")?.checked),
     ranges: validateCustomRanges(),
+    weight_profile: mode === "profile" ? styleState.weightProfile : undefined,
   };
 }
 
@@ -237,7 +256,8 @@ async function loadStyleArtists(reroll = "all") {
     }), {
       onPending: setStyleRequestPending,
       onSuccess: (data) => {
-        styleState.artists = applyStyleRerollResult(styleState.artists, data.artists || [], reroll);
+        const preserveOrder = styleElement("weightMode")?.value === "profile";
+        styleState.artists = applyStyleRerollResult(styleState.artists, data.artists || [], reroll, preserveOrder);
         renderWeightGraph();
         showStyleStatus(`${styleState.artists.length}명의 작가를 불러왔습니다.`, "ok");
       },
@@ -252,8 +272,124 @@ function updateArtistPrompt() {
   const preview = styleElement("artistPromptPreview");
   if (!preview) return;
   preview.value = styleState.artists
-    .map((item) => `${formatStyleWeight(item.weight)}::${item.artist}::`)
+    .map((item) => `${formatStyleWeight(item.weight)}::artist:${item.artist}::`)
     .join(", ");
+}
+
+function renderWeightProfileGraph(graph) {
+  const ns = "http://www.w3.org/2000/svg";
+  const width = 900;
+  const height = 430;
+  const pad = { left: 58, right: 24, top: 24, bottom: 44 };
+  const plotWidth = width - pad.left - pad.right;
+  const plotHeight = height - pad.top - pad.bottom;
+  const min = styleNumber("styleMinWeight", 0.1);
+  const max = styleNumber("styleMaxWeight", 2.3);
+  styleState.weightProfile = styleState.weightProfile.map((point) => ({
+    position: point.position,
+    weight: Math.min(max, Math.max(min, point.weight)),
+  }));
+  const x = (position) => pad.left + (position * plotWidth);
+  const y = (weight) => pad.top + ((max - weight) / Math.max(0.01, max - min)) * plotHeight;
+  const svg = document.createElementNS(ns, "svg");
+  svg.classList.add("weight-profile-svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("aria-label", "자리 순서별 가중치 그래프");
+
+  for (let index = 0; index <= 10; index += 1) {
+    const line = document.createElementNS(ns, "line");
+    const lineY = pad.top + (plotHeight * index / 10);
+    line.setAttribute("x1", pad.left);
+    line.setAttribute("x2", width - pad.right);
+    line.setAttribute("y1", lineY);
+    line.setAttribute("y2", lineY);
+    line.classList.add("profile-grid-line");
+    svg.append(line);
+    if (index % 2 === 0) {
+      const label = document.createElementNS(ns, "text");
+      label.setAttribute("x", pad.left - 10);
+      label.setAttribute("y", lineY + 4);
+      label.setAttribute("text-anchor", "end");
+      label.classList.add("profile-axis-label");
+      label.textContent = (max - ((max - min) * index / 10)).toFixed(1);
+      svg.append(label);
+    }
+  }
+  const count = Math.max(2, Math.trunc(styleNumber("styleArtistCount", 12)));
+  for (let index = 0; index < count; index += 1) {
+    const line = document.createElementNS(ns, "line");
+    const lineX = x(index / (count - 1));
+    line.setAttribute("x1", lineX);
+    line.setAttribute("x2", lineX);
+    line.setAttribute("y1", pad.top);
+    line.setAttribute("y2", height - pad.bottom);
+    line.classList.add("profile-grid-line", "profile-slot-line");
+    svg.append(line);
+    const label = document.createElementNS(ns, "text");
+    label.setAttribute("x", lineX);
+    label.setAttribute("y", height - 17);
+    label.setAttribute("text-anchor", "middle");
+    label.classList.add("profile-axis-label");
+    label.textContent = String(index + 1);
+    svg.append(label);
+  }
+  const polyline = document.createElementNS(ns, "polyline");
+  polyline.setAttribute("points", styleState.weightProfile.map((point) => `${x(point.position)},${y(point.weight)}`).join(" "));
+  polyline.classList.add("profile-line");
+  svg.append(polyline);
+
+  const pointFromEvent = (event) => {
+    const rect = svg.getBoundingClientRect();
+    const svgX = ((event.clientX - rect.left) / rect.width) * width;
+    const svgY = ((event.clientY - rect.top) / rect.height) * height;
+    return {
+      position: Math.min(0.99, Math.max(0.01, (svgX - pad.left) / plotWidth)),
+      weight: Math.min(max, Math.max(min, max - ((svgY - pad.top) / plotHeight) * (max - min))),
+    };
+  };
+  styleState.weightProfile.forEach((point) => {
+    const circle = document.createElementNS(ns, "circle");
+    circle.setAttribute("cx", x(point.position));
+    circle.setAttribute("cy", y(point.weight));
+    circle.setAttribute("r", 8);
+    circle.classList.add("profile-point");
+    circle.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+      circle.setPointerCapture(event.pointerId);
+      const move = (moveEvent) => {
+        const next = pointFromEvent(moveEvent);
+        if (point.position !== 0 && point.position !== 1) point.position = Number(next.position.toFixed(3));
+        point.weight = Number(next.weight.toFixed(2));
+        styleState.weightProfile.sort((a, b) => a.position - b.position);
+        circle.setAttribute("cx", x(point.position));
+        circle.setAttribute("cy", y(point.weight));
+        polyline.setAttribute("points", styleState.weightProfile.map((item) => `${x(item.position)},${y(item.weight)}`).join(" "));
+      };
+      circle.addEventListener("pointermove", move);
+      circle.addEventListener("pointerup", () => {
+        circle.removeEventListener("pointermove", move);
+        renderWeightGraph();
+      }, { once: true });
+    });
+    circle.addEventListener("dblclick", (event) => {
+      event.stopPropagation();
+      if (point.position === 0 || point.position === 1) return;
+      styleState.weightProfile = styleState.weightProfile.filter((item) => item !== point);
+      renderWeightGraph();
+    });
+    svg.append(circle);
+  });
+  svg.addEventListener("click", (event) => {
+    if (event.target !== svg && !event.target.classList.contains("profile-grid-line") && event.target !== polyline) return;
+    const point = pointFromEvent(event);
+    styleState.weightProfile.push({ position: Number(point.position.toFixed(3)), weight: Number(point.weight.toFixed(2)) });
+    styleState.weightProfile.sort((a, b) => a.position - b.position);
+    renderWeightGraph();
+  });
+  const hint = document.createElement("p");
+  hint.className = "profile-hint";
+  hint.textContent = "가로는 자리 순서, 세로는 가중치입니다. 클릭해 점을 추가하고 끌어서 흐름을 만드세요. 점을 두 번 누르면 삭제됩니다.";
+  graph.append(svg, hint);
 }
 
 function removeStyleArtist(index) {
@@ -279,6 +415,13 @@ function renderWeightGraph() {
   const graph = styleElement("weightGraph");
   if (!graph) return;
   graph.replaceChildren();
+  const profileMode = styleElement("weightMode")?.value === "profile";
+  graph.classList.toggle("profile-mode", profileMode);
+  if (profileMode) {
+    renderWeightProfileGraph(graph);
+    updateArtistPrompt();
+    return;
+  }
   const min = styleNumber("styleMinWeight", 0.1);
   const max = styleNumber("styleMaxWeight", 2.3);
 
@@ -833,6 +976,7 @@ function initializeStyleMaker() {
   });
   styleElement("weightMode")?.addEventListener("change", (event) => {
     styleElement("customRangeSection")?.classList.toggle("hidden", event.target.value !== "custom");
+    renderWeightGraph();
   });
   styleElement("addWeightRange")?.addEventListener("click", addWeightRange);
   styleElement("toggleStyleSettings")?.addEventListener("click", toggleStyleSettings);
@@ -908,6 +1052,7 @@ if (typeof module !== "undefined" && module.exports) {
     runLatestStyleRequest,
     sortArtistsByWeight,
     validateCustomRangeValues,
+    interpolateWeightProfile,
     reachedGenerationLimit,
   };
 }

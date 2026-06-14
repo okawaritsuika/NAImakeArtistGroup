@@ -931,6 +931,19 @@ class NovelAISubscriptionTest(unittest.TestCase):
             )
         self.assertEqual(raised.exception.status, 502)
 
+    def test_subscription_reports_windows_socket_permission_block(self):
+        from novelai import NovelAIError, test_novelai_subscription
+
+        blocked = PermissionError(13, "socket access denied", None, 10013, None)
+        with self.assertRaises(NovelAIError) as raised:
+            test_novelai_subscription(
+                SECRET_KEY,
+                opener=Mock(side_effect=urllib.error.URLError(blocked)),
+            )
+
+        self.assertIn("Windows", raised.exception.public_message)
+        self.assertIn("10013", raised.exception.public_message)
+
     def test_cross_host_redirect_is_rejected_without_resending_key(self):
         from novelai import NovelAIError, test_novelai_subscription
 

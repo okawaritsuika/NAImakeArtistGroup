@@ -12,8 +12,8 @@ from png_validator import validate_png
 
 SUBSCRIPTION_URL = "https://api.novelai.net/user/subscription"
 GENERATION_URL = "https://image.novelai.net/ai/generate-image"
-REQUEST_TIMEOUT = 12
-USER_AGENT = "DanbooruArtistRater/1.0 (local personal tool)"
+REQUEST_TIMEOUT = 30
+USER_AGENT = "Mozilla/5.0"
 MAX_SUBSCRIPTION_BYTES = 1024 * 1024
 MAX_ZIP_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -44,6 +44,13 @@ def _default_open(request, timeout):
     return urllib.request.build_opener(NoRedirectHandler()).open(
         request, timeout=timeout
     )
+
+
+def _connection_error_message(exc):
+    reason = getattr(exc, "reason", exc)
+    if getattr(reason, "winerror", None) == 10013:
+        return "Windows 네트워크 권한이 NovelAI 연결을 차단했습니다. (WinError 10013) 앱을 직접 실행하거나 방화벽 허용 상태를 확인하세요."
+    return "Could not connect to the NovelAI server."
 
 
 def combine_base_prompt(base_prompt, artist_prompt):
@@ -255,8 +262,8 @@ def generate_novelai_png(app_key, data, artist_prompt, opener=None):
             raise NovelAIError(502, f"NovelAI generation failed. (HTTP {exc.code})") from None
         finally:
             exc.close()
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise NovelAIError(502, "Could not connect to the NovelAI server.") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise NovelAIError(502, _connection_error_message(exc)) from None
     except (zipfile.BadZipFile, RuntimeError, ValueError, KeyError):
         raise NovelAIError(502, "Could not parse the NovelAI generation response.") from None
     return png, normalized["seed"]
@@ -300,8 +307,8 @@ def test_novelai_subscription(app_key, opener=None):
             ) from None
         finally:
             exc.close()
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise NovelAIError(502, "Could not connect to the NovelAI server.") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise NovelAIError(502, _connection_error_message(exc)) from None
     except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
         raise NovelAIError(502, "Could not parse the NovelAI response.") from None
     return {"anlas": anlas}

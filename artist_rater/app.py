@@ -830,8 +830,9 @@ def api_style_maker_artists():
                 prefer_high_scores,
                 ranges,
                 rng_seed=rng_seed,
+                profile=payload.get("weight_profile"),
             )
-            if reroll != "weights":
+            if reroll != "weights" and payload.get("weight_mode") != "profile":
                 weighted.sort(key=lambda item: item["weight"])
         artist_prompt = build_artist_prompt(weighted)
         return json_response(

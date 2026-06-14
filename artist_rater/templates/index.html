@@ -238,7 +238,7 @@
                 <select id="weightMode">
                   <option value="random">랜덤</option>
                   <option value="balanced" selected>균형</option>
-                  <option value="custom">사용자 구간</option>
+                  <option value="profile">사용자 그래프</option>
                 </select>
               </label>
               <div class="compact-fields">
@@ -252,14 +252,6 @@
                 </label>
               </div>
               <label class="check-row"><input id="preferHighScores" type="checkbox"> 높은 평점 우선</label>
-              <div id="customRangeSection" class="custom-range-section hidden">
-                <div class="style-subhead">
-                  <h3>사용자 구간</h3>
-                  <button id="addWeightRange" class="icon-button" type="button" title="가중치 구간 추가" aria-label="가중치 구간 추가">＋</button>
-                </div>
-                <div class="range-head" aria-hidden="true"><span>최소 가중치</span><span>최대 가중치</span><span>최대 인원</span><span></span></div>
-                <div id="customRangeList" class="custom-range-list"></div>
-              </div>
               <div id="styleSettingsError" class="status" role="alert"></div>
             </div>
           </aside>

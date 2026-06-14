@@ -10,7 +10,20 @@ const {
   runLatestStyleRequest,
   sortArtistsByWeight,
   validateCustomRangeValues,
+  interpolateWeightProfile,
 } = require("../static/style_maker.js");
+
+test("weight profile interpolates prompt positions between control points", () => {
+  const profile = [
+    { position: 0, weight: 0.2 },
+    { position: 0.5, weight: 2.0 },
+    { position: 1, weight: 0.6 },
+  ];
+  assert.deepEqual(
+    [0, 0.25, 0.5, 0.75, 1].map((position) => interpolateWeightProfile(profile, position)),
+    [0.2, 1.1, 2, 1.3, 0.6],
+  );
+});
 
 function deferred() {
   let resolve;
@@ -99,6 +112,10 @@ test("reroll result ordering depends on the explicit action", () => {
   );
   assert.deepEqual(
     applyStyleRerollResult(current, fresh, "artists"),
+    fresh,
+  );
+  assert.deepEqual(
+    applyStyleRerollResult(current, fresh, "all", true),
     fresh,
   );
 });

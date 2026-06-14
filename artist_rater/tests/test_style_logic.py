@@ -78,7 +78,7 @@ class StyleIdentityTest(unittest.TestCase):
 
         self.assertEqual(
             build_artist_prompt(artists),
-            "0.5::artist_b::, 2.1::artist_a::",
+            "0.5::artist:artist_b::, 2.1::artist:artist_a::",
         )
 
     def test_hash_changes_when_order_changes(self):
@@ -377,6 +377,41 @@ class WeightEngineTest(unittest.TestCase):
         self.assertEqual(weighted[0]["weight"], 0.1)
         self.assertEqual(weighted[1]["weight"], 1.5)
 
+    def test_profile_mode_interpolates_weights_by_prompt_position(self):
+        weighted = assign_weights(
+            self.artists[:5],
+            "profile",
+            0.1,
+            2.3,
+            False,
+            [],
+            rng_seed=7,
+            profile=[
+                {"position": 0, "weight": 0.2},
+                {"position": 0.5, "weight": 2.0},
+                {"position": 1, "weight": 0.6},
+            ],
+        )
+
+        self.assertEqual([item["artist"] for item in weighted], [item["artist"] for item in self.artists[:5]])
+        self.assertLess(weighted[0]["weight"], weighted[2]["weight"])
+        self.assertGreater(weighted[2]["weight"], weighted[4]["weight"])
+        self.assertTrue(all(0.1 <= item["weight"] <= 2.3 for item in weighted))
+
+    def test_profile_mode_rejects_invalid_control_points(self):
+        invalid_profiles = (
+            [],
+            [{"position": 0, "weight": 1}],
+            [{"position": 0, "weight": 1}, {"position": 0, "weight": 2}],
+            [{"position": -0.1, "weight": 1}, {"position": 1, "weight": 2}],
+            [{"position": 0, "weight": 0}, {"position": 1, "weight": 2}],
+        )
+        for profile in invalid_profiles:
+            with self.subTest(profile=profile), self.assertRaises(ValueError):
+                assign_weights(
+                    self.artists[:3], "profile", 0.1, 2.3, False, [], rng_seed=1, profile=profile
+                )
+
     def test_score_priority_uses_exact_four_point_jitter(self):
         class ControlledRng:
             def __init__(self, values):
@@ -564,6 +599,34 @@ class ArtistStyleEndpointTest(unittest.TestCase):
             [item["artist"] for item in response.get_json()["artists"]],
             ["gamma", "alpha"],
         )
+
+    def test_profile_mode_preserves_prompt_positions(self):
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "artists": [
+                    {"artist": "gamma", "score": 2},
+                    {"artist": "alpha", "score": 5},
+                    {"artist": "beta", "score": 4},
+                ],
+                "reroll": "weights",
+                "weight_mode": "profile",
+                "min_weight": 0.1,
+                "max_weight": 2.3,
+                "weight_profile": [
+                    {"position": 0, "weight": 0.2},
+                    {"position": 0.5, "weight": 2.1},
+                    {"position": 1, "weight": 0.4},
+                ],
+                "rng_seed": 5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual([item["artist"] for item in artists], ["gamma", "alpha", "beta"])
+        self.assertGreater(artists[1]["weight"], artists[0]["weight"])
+        self.assertGreater(artists[1]["weight"], artists[2]["weight"])
 
     def test_initial_and_all_reroll_results_are_sorted_by_weight_ascending(self):
         for payload in (
@@ -816,7 +879,7 @@ class StyleStoreIntegrationTest(unittest.TestCase):
             "base_prompt": "portrait",
             "negative_prompt": "lowres",
             "character_prompts": ["1girl"],
-            "combined_prompt": "portrait, 1.25::artist_a::",
+            "combined_prompt": "portrait, 1.25::artist:artist_a::",
             "seed": 123,
             "width": 832,
             "height": 1216,

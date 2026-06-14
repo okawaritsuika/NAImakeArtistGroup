@@ -66,14 +66,12 @@ class StyleFrontendContractTest(unittest.TestCase):
             'id="weightMode"',
             'value="random"',
             'value="balanced"',
-            'value="custom"',
+            'value="profile"',
             'id="styleMinWeight"',
             'value="0.1"',
             'id="styleMaxWeight"',
             'value="2.3"',
             'id="preferHighScores"',
-            'id="customRangeList"',
-            'id="addWeightRange"',
             'id="toggleStyleSettings"',
         ):
             with self.subTest(marker=marker):

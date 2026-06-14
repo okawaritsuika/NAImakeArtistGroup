@@ -204,6 +204,7 @@ def assign_weights(
     prefer_high_scores,
     ranges,
     rng_seed=None,
+    profile=None,
 ):
     try:
         minimum = float(minimum)
@@ -217,7 +218,7 @@ def assign_weights(
         or maximum < minimum
     ):
         raise ValueError("가중치 범위를 확인하세요.")
-    if mode not in {"random", "balanced", "custom"}:
+    if mode not in {"random", "balanced", "custom", "profile"}:
         raise ValueError("가중치 모드를 확인하세요.")
 
     rng = random.Random(rng_seed)
@@ -227,6 +228,19 @@ def assign_weights(
         normalized["score"] = exact_score(item.get("score"))
         normalized["_index"] = index
         items.append(normalized)
+    if mode == "profile":
+        points = validate_weight_profile(profile, minimum, maximum)
+        spread = (maximum - minimum) * 0.04
+        last_index = max(1, len(items) - 1)
+        result = []
+        for index, item in enumerate(items):
+            target = interpolate_weight_profile(points, index / last_index)
+            jittered = min(maximum, max(minimum, target + rng.uniform(-spread, spread)))
+            result.append(
+                {key: value for key, value in item.items() if key != "_index"}
+                | {"weight": round(jittered, 2)}
+            )
+        return result
     if mode == "random" or (mode == "custom" and not ranges):
         return [
             {key: value for key, value in item.items() if key != "_index"}
@@ -259,6 +273,42 @@ def assign_weights(
         | {"weight": weights_by_index[item["_index"]]}
         for item in items
     ]
+
+
+def validate_weight_profile(profile, minimum, maximum):
+    if not isinstance(profile, list) or len(profile) < 2:
+        raise ValueError("가중치 그래프에는 두 개 이상의 점이 필요합니다.")
+    points = []
+    for item in profile:
+        if not isinstance(item, dict):
+            raise ValueError("가중치 그래프 점을 확인하세요.")
+        try:
+            position = float(item.get("position"))
+            weight = float(item.get("weight"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("가중치 그래프 점을 확인하세요.") from exc
+        if (
+            not math.isfinite(position)
+            or not math.isfinite(weight)
+            or not 0 <= position <= 1
+            or not minimum <= weight <= maximum
+        ):
+            raise ValueError("가중치 그래프 점을 확인하세요.")
+        points.append({"position": position, "weight": weight})
+    points.sort(key=lambda item: item["position"])
+    if points[0]["position"] != 0 or points[-1]["position"] != 1:
+        raise ValueError("가중치 그래프는 첫 자리와 마지막 자리를 포함해야 합니다.")
+    if any(left["position"] >= right["position"] for left, right in zip(points, points[1:])):
+        raise ValueError("가중치 그래프의 점 위치가 겹칩니다.")
+    return points
+
+
+def interpolate_weight_profile(points, position):
+    for left, right in zip(points, points[1:]):
+        if position <= right["position"]:
+            ratio = (position - left["position"]) / (right["position"] - left["position"])
+            return left["weight"] + (right["weight"] - left["weight"]) * ratio
+    return points[-1]["weight"]
 
 
 def normalize_style_artists(artists):
@@ -301,7 +351,7 @@ def format_weight(value):
 
 def build_artist_prompt(artists):
     return ", ".join(
-        f'{format_weight(item["weight"])}::{item["artist"]}::'
+        f'{format_weight(item["weight"])}::artist:{item["artist"]}::'
         for item in normalize_style_artists(artists)
     )
 
