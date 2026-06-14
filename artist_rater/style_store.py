@@ -2,16 +2,18 @@ import hashlib
 import json
 import os
 import sqlite3
-import struct
 import tempfile
-import zlib
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from png_validator import validate_png
 from style_logic import build_artist_prompt, normalize_style_artists, style_hash
 
 
 MAX_APP_KEY_LENGTH = 8192
+ORPHAN_CLEANUP_AGE_SECONDS = 60 * 60
 
 
 class SettingsError(Exception):
@@ -148,98 +150,11 @@ def generated_file_path(generated_dir, style_id, request_id):
 
 
 def _staged_file_path(final_path):
-    return final_path.with_name(f".{final_path.name}.staged.tmp")
+    return final_path.with_name(f".{final_path.name}.{uuid.uuid4().hex}.tmp")
 
 
-def _validate_png(png_bytes):
-    if not isinstance(png_bytes, (bytes, bytearray)):
-        raise ValueError("png_bytes must contain a PNG image.")
-    data = bytes(png_bytes)
-    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise ValueError("png_bytes must contain a PNG image.")
-
-    offset = 8
-    chunk_index = 0
-    saw_idat = False
-    saw_iend = False
-    idat_parts = []
-    image_header = None
-    while offset < len(data):
-        if len(data) - offset < 12:
-            raise ValueError("PNG chunk is truncated.")
-        length = struct.unpack(">I", data[offset : offset + 4])[0]
-        chunk_type = data[offset + 4 : offset + 8]
-        chunk_end = offset + 12 + length
-        if chunk_end > len(data):
-            raise ValueError("PNG chunk is truncated.")
-        chunk_data = data[offset + 8 : offset + 8 + length]
-        expected_crc = struct.unpack(">I", data[offset + 8 + length : chunk_end])[0]
-        actual_crc = zlib.crc32(chunk_type)
-        actual_crc = zlib.crc32(chunk_data, actual_crc) & 0xFFFFFFFF
-        if actual_crc != expected_crc:
-            raise ValueError("PNG chunk CRC is invalid.")
-
-        if chunk_index == 0:
-            if chunk_type != b"IHDR" or length != 13:
-                raise ValueError("PNG must start with a valid IHDR chunk.")
-            width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
-                ">IIBBBBB", chunk_data
-            )
-            valid_depths = {
-                0: {1, 2, 4, 8, 16},
-                2: {8, 16},
-                3: {1, 2, 4, 8},
-                4: {8, 16},
-                6: {8, 16},
-            }
-            if (
-                width == 0
-                or height == 0
-                or bit_depth not in valid_depths.get(color_type, set())
-                or compression != 0
-                or filtering != 0
-            ):
-                raise ValueError("PNG IHDR fields are invalid.")
-            if interlace != 0:
-                raise ValueError("Interlaced PNG images are not supported.")
-            image_header = (width, height, bit_depth, color_type)
-        elif chunk_type == b"IHDR":
-            raise ValueError("PNG contains multiple IHDR chunks.")
-
-        if chunk_type == b"IDAT":
-            saw_idat = True
-            idat_parts.append(chunk_data)
-        if chunk_type == b"IEND":
-            if length != 0 or not saw_idat:
-                raise ValueError("PNG IEND or IDAT structure is invalid.")
-            saw_iend = True
-            if chunk_end != len(data):
-                raise ValueError("PNG contains data after IEND.")
-            break
-        offset = chunk_end
-        chunk_index += 1
-
-    if not saw_iend:
-        raise ValueError("PNG is missing IEND.")
-    try:
-        decompressor = zlib.decompressobj()
-        scanlines = decompressor.decompress(b"".join(idat_parts))
-        scanlines += decompressor.flush()
-    except zlib.error as exc:
-        raise ValueError("PNG IDAT data is not valid zlib data.") from exc
-    if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
-        raise ValueError("PNG IDAT data is not a complete zlib stream.")
-
-    width, height, bit_depth, color_type = image_header
-    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
-    row_bytes = (width * channels * bit_depth + 7) // 8
-    expected_length = height * (1 + row_bytes)
-    if len(scanlines) != expected_length:
-        raise ValueError("PNG scanline data has an invalid length.")
-    for row in range(height):
-        if scanlines[row * (1 + row_bytes)] not in range(5):
-            raise ValueError("PNG scanline has an invalid filter type.")
-    return data
+def _staged_file_candidates(final_path):
+    return final_path.parent.glob(f".{final_path.name}.*.tmp")
 
 
 def _stored_result(row):
@@ -275,6 +190,65 @@ def get_generated_result(db_path, request_id):
     finally:
         conn.close()
     return _stored_result(row) if row is not None else None
+
+
+def reserve_generation_request(db_path, request_id, payload_hash):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    conn = connect_db(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT payload_hash, status, image_id FROM generation_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO generation_requests (
+                    request_id, payload_hash, status, image_id, created_at, updated_at
+                ) VALUES (?, ?, 'processing', NULL, ?, ?)
+                """,
+                (request_id, payload_hash, timestamp, timestamp),
+            )
+            conn.commit()
+            return "reserved", None
+        if row["payload_hash"] != payload_hash:
+            conn.commit()
+            return "mismatch", None
+        if row["status"] == "complete" and row["image_id"] is not None:
+            result_row = conn.execute(
+                """
+                SELECT generated_images.id AS image_id, generated_images.style_id,
+                       generated_images.image_path, generated_images.artist_prompt,
+                       generated_images.seed, art_styles.style_hash
+                FROM generated_images
+                JOIN art_styles ON art_styles.id = generated_images.style_id
+                WHERE generated_images.id = ?
+                """,
+                (row["image_id"],),
+            ).fetchone()
+            if result_row is not None:
+                conn.commit()
+                return "complete", _stored_result(result_row)
+        conn.commit()
+        return "processing", None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def release_generation_request(db_path, request_id):
+    conn = connect_db(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "DELETE FROM generation_requests WHERE request_id = ?",
+                (request_id,),
+            )
+    finally:
+        conn.close()
 
 
 def _recompute_style(conn, style_id, timestamp):
@@ -331,7 +305,11 @@ def save_generated_result(
     request_id = str(request_id or "")
     if not request_id.strip():
         raise ValueError("request_id is required.")
-    png_data = _validate_png(png_bytes)
+    png_data = validate_png(
+        png_bytes,
+        expected_width=width if width else None,
+        expected_height=height if height else None,
+    )
 
     normalized_artists = normalize_style_artists(artists)
     artists_json = json.dumps(normalized_artists, ensure_ascii=False, separators=(",", ":"))
@@ -354,6 +332,14 @@ def save_generated_result(
         conn.execute("BEGIN IMMEDIATE")
         existing = _find_request(conn, request_id)
         if existing is not None:
+            conn.execute(
+                """
+                UPDATE generation_requests
+                SET status = 'complete', image_id = ?, updated_at = ?
+                WHERE request_id = ?
+                """,
+                (existing["image_id"], timestamp, request_id),
+            )
             conn.commit()
             return _stored_result(existing)
         conn.execute(
@@ -427,6 +413,14 @@ def save_generated_result(
             """,
             (relative_path, timestamp, style_id),
         )
+        conn.execute(
+            """
+            UPDATE generation_requests
+            SET status = 'complete', image_id = ?, updated_at = ?
+            WHERE request_id = ?
+            """,
+            (image_id, timestamp, request_id),
+        )
         conn.commit()
         committed = True
         staged_path.replace(final_path)
@@ -468,10 +462,14 @@ def reconcile_generated_storage(db_path, generated_dir):
             missing_image_ids.append(row["id"])
             affected_style_ids.add(row["style_id"])
             continue
-        staged_path = _staged_file_path(final_path)
-        if not final_path.exists() and staged_path.is_file():
+        staged_paths = sorted(
+            (path for path in _staged_file_candidates(final_path) if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if not final_path.exists() and staged_paths:
             final_path.parent.mkdir(parents=True, exist_ok=True)
-            staged_path.replace(final_path)
+            staged_paths[0].replace(final_path)
         if final_path.is_file():
             referenced.add(final_path)
         else:
@@ -493,10 +491,15 @@ def reconcile_generated_storage(db_path, generated_dir):
         finally:
             conn.close()
 
+    stale_before = time.time() - ORPHAN_CLEANUP_AGE_SECONDS
     for temp_path in root.rglob("*.tmp"):
-        temp_path.unlink(missing_ok=True)
+        if temp_path.stat().st_mtime < stale_before:
+            temp_path.unlink(missing_ok=True)
     for png_path in root.rglob("*.png"):
-        if png_path.resolve() not in referenced:
+        if (
+            png_path.resolve() not in referenced
+            and png_path.stat().st_mtime < stale_before
+        ):
             png_path.unlink(missing_ok=True)
 
 

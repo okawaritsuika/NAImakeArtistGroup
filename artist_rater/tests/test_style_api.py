@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import warnings
 import zipfile
 import zlib
 from contextlib import closing
@@ -20,26 +21,29 @@ import style_store
 SECRET_KEY = "secret-key-value"
 
 
-def valid_png():
+def valid_png(width=832, height=1216):
     def chunk(kind, payload):
         checksum = zlib.crc32(kind)
         checksum = zlib.crc32(payload, checksum) & 0xFFFFFFFF
         return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
 
-    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    scanlines = (b"\x00" + (b"\x00" * (width * 4))) * height
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\xff"))
+        + chunk(b"IDAT", zlib.compress(scanlines))
         + chunk(b"IEND", b"")
     )
 
 
 def zip_response(entries):
     payload = io.BytesIO()
-    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name, value in entries:
-            archive.writestr(name, value)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, value in entries:
+                archive.writestr(name, value)
     response = Mock()
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
@@ -438,6 +442,61 @@ class NovelAIGenerationTest(unittest.TestCase):
             self.assertEqual(raised.exception.status_code, 502)
             self.assertNotIn(SECRET_KEY, str(raised.exception))
 
+    def test_generation_rejects_png_dimension_mismatch(self):
+        from novelai import NovelAIError, generate_novelai_png
+
+        opener = Mock(return_value=zip_response([("image.png", valid_png(64, 64))]))
+        with self.assertRaises(NovelAIError) as raised:
+            generate_novelai_png(
+                SECRET_KEY, self.generation_data(seed=1), "artist", opener=opener
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+
+    def test_generation_rejects_duplicate_normalized_zip_names(self):
+        from novelai import NovelAIError, generate_novelai_png
+
+        opener = Mock(
+            return_value=zip_response(
+                [("folder\\image.png", valid_png()), ("folder/image.png", valid_png())]
+            )
+        )
+        with self.assertRaises(NovelAIError) as raised:
+            generate_novelai_png(
+                SECRET_KEY, self.generation_data(seed=1), "artist", opener=opener
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+
+    def test_generation_rejects_zip_entry_count_and_total_size(self):
+        from novelai import MAX_ZIP_ENTRIES, NovelAIError, generate_novelai_png
+
+        cases = (
+            [(f"note-{index}.txt", b"x") for index in range(MAX_ZIP_ENTRIES + 1)],
+            [("large.txt", b"x" * 2048), ("image.png", valid_png())],
+        )
+        patches = (patch("novelai.MAX_ZIP_UNCOMPRESSED_BYTES", 1024 * 1024), patch("novelai.MAX_ZIP_UNCOMPRESSED_BYTES", 1024))
+        for entries, size_patch in zip(cases, patches):
+            with self.subTest(entries=len(entries)), size_patch:
+                with self.assertRaises(NovelAIError):
+                    generate_novelai_png(
+                        SECRET_KEY,
+                        self.generation_data(seed=1),
+                        "artist",
+                        opener=Mock(return_value=zip_response(entries)),
+                    )
+
+    def test_generation_rejects_suspicious_zip_compression_ratio(self):
+        from novelai import NovelAIError, generate_novelai_png
+
+        entries = [("bomb.txt", b"A" * 1000000), ("image.png", valid_png())]
+        with self.assertRaises(NovelAIError) as raised:
+            generate_novelai_png(
+                SECRET_KEY,
+                self.generation_data(seed=1),
+                "artist",
+                opener=Mock(return_value=zip_response(entries)),
+            )
+        self.assertEqual(raised.exception.status_code, 502)
+
     def test_generation_closes_and_sanitizes_http_error(self):
         from novelai import NovelAIError, generate_novelai_png
 
@@ -530,6 +589,110 @@ class GenerationApiTest(StyleApiTest):
         second = self.client.post("/api/style-maker/generate", json=self.request_payload()).get_json()
         self.assertEqual(first, second)
         generate.assert_called_once()
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_duplicate_request_without_client_seed_does_not_pay_twice(self, generate):
+        self.save_key()
+        payload = self.request_payload()
+        payload.pop("seed")
+
+        first = self.client.post("/api/style-maker/generate", json=payload)
+        second = self.client.post("/api/style-maker/generate", json=payload)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.get_json(), first.get_json())
+        generate.assert_called_once()
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_completed_request_id_rejects_different_payload(self, generate):
+        self.save_key()
+        first = self.client.post(
+            "/api/style-maker/generate", json=self.request_payload()
+        )
+        second = self.client.post(
+            "/api/style-maker/generate",
+            json=self.request_payload(base_prompt="different"),
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("different payload", second.get_json()["error"])
+        generate.assert_called_once()
+
+    def test_processing_request_is_reserved_across_independent_clients(self):
+        self.save_key()
+        entered = threading.Event()
+        release = threading.Event()
+        responses = []
+
+        def generate(*args):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return valid_png(), 123456
+
+        def post_generation():
+            with app.app.test_client() as client:
+                responses.append(
+                    client.post(
+                        "/api/style-maker/generate", json=self.request_payload()
+                    )
+                )
+
+        with patch("app.generate_novelai_png", side_effect=generate) as generator:
+            worker = threading.Thread(target=post_generation)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            with app.app.test_client() as second_client:
+                second = second_client.post(
+                    "/api/style-maker/generate", json=self.request_payload()
+                )
+            release.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("processing", second.get_json()["error"])
+        self.assertEqual(responses[0].status_code, 200)
+        generator.assert_called_once()
+
+    @patch("app.generate_novelai_png")
+    def test_failed_generation_releases_reservation_for_retry(self, generate):
+        self.save_key()
+        generate.side_effect = [
+            app.NovelAIError(502, "NovelAI generation failed."),
+            (valid_png(), 123456),
+        ]
+
+        first = self.client.post(
+            "/api/style-maker/generate", json=self.request_payload()
+        )
+        second = self.client.post(
+            "/api/style-maker/generate", json=self.request_payload()
+        )
+
+        self.assertEqual(first.status_code, 502)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(generate.call_count, 2)
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_generation_rejects_unknown_or_mismatched_rating(self, generate):
+        self.save_key()
+        cases = (
+            self.request_payload(
+                request_id="unknown-artist",
+                artists=[{"artist": "missing", "score": 5, "weight": 1.0}],
+            ),
+            self.request_payload(
+                request_id="wrong-score",
+                artists=[{"artist": "artist_a", "score": 1, "weight": 1.0}],
+            ),
+        )
+
+        for payload in cases:
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/style-maker/generate", json=payload)
+                self.assertEqual(response.status_code, 400)
+        generate.assert_not_called()
 
     @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
     def test_style_identity_ignores_base_prompt_but_tracks_artist_order_and_weight(self, generate):

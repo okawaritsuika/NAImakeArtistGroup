@@ -1,10 +1,10 @@
+import hashlib
 import json
 import math
 import os
 import random
 import re
 import sqlite3
-import threading
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,10 +24,11 @@ from novelai import (
 from style_store import (
     SettingsError,
     delete_app_key,
-    get_generated_result,
     get_style_detail,
     list_styles,
     load_app_key,
+    release_generation_request,
+    reserve_generation_request,
     save_app_key,
     save_generated_result,
 )
@@ -56,7 +57,6 @@ USER_AGENT = "DanbooruArtistRater/1.0 (local personal tool)"
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
-GENERATION_LOCK = threading.Lock()
 SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
@@ -151,6 +151,19 @@ def init_db():
                 model TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(style_id) REFERENCES art_styles(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS generation_requests (
+                request_id TEXT PRIMARY KEY,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('processing', 'complete')),
+                image_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(image_id) REFERENCES generated_images(id)
             )
             """
         )
@@ -933,8 +946,45 @@ def _validate_generation_request(payload):
         raise ValueError("request_id must be a nonempty safe string up to 128 characters.")
     normalized = normalize_generation_data(payload)
     normalized["request_id"] = request_id
-    normalized["artists"] = normalize_style_artists(payload.get("artists"))
+    normalized["seed_provided"] = "seed" in payload
+    normalized_artists = normalize_style_artists(payload.get("artists"))
+    placeholders = ", ".join("?" for _ in normalized_artists)
+    with closing(db()) as conn:
+        rows = conn.execute(
+            f"SELECT artist_tag, score FROM ratings WHERE artist_tag IN ({placeholders})",
+            [item["artist"] for item in normalized_artists],
+        ).fetchall()
+    ratings = {row["artist_tag"]: int(row["score"]) for row in rows}
+    for item in normalized_artists:
+        stored_score = ratings.get(item["artist"])
+        if stored_score is None:
+            raise ValueError(f"Artist is not present in ratings: {item['artist']}")
+        if item["score"] != stored_score:
+            raise ValueError(f"Artist score does not match ratings: {item['artist']}")
+        item["score"] = stored_score
+    normalized["artists"] = normalized_artists
     return normalized
+
+
+def _generation_payload_hash(data):
+    canonical = {
+        "artists": data["artists"],
+        "base_prompt": data["base_prompt"],
+        "negative_prompt": data["negative_prompt"],
+        "character_prompts": data["character_prompts"],
+        "width": data["width"],
+        "height": data["height"],
+        "sampler": data["sampler"],
+        "steps": data["steps"],
+        "scale": data["scale"],
+        "cfg_rescale": data["cfg_rescale"],
+        "seed": data["seed"] if data["seed_provided"] else None,
+        "model": MODEL,
+    }
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @app.route("/api/style-maker/generate", methods=["POST"])
@@ -947,11 +997,24 @@ def api_style_maker_generate():
         return json_response({"error": str(exc)}, 400)
 
     request_id = data["request_id"]
-    with GENERATION_LOCK:
-        existing = get_generated_result(DB_PATH, request_id)
-        if existing is not None:
-            return json_response(_generation_response(existing))
+    payload_hash = _generation_payload_hash(data)
+    try:
+        reservation, existing = reserve_generation_request(
+            DB_PATH, request_id, payload_hash
+        )
+    except sqlite3.Error:
+        return json_response({"error": "Could not reserve the generation request."}, 500)
+    if reservation == "mismatch":
+        return json_response(
+            {"error": "request_id was already used with a different payload."}, 409
+        )
+    if reservation == "complete":
+        return json_response(_generation_response(existing))
+    if reservation == "processing":
+        return json_response({"error": "Generation request is already processing."}, 409)
 
+    completed = False
+    try:
         try:
             app_key = load_app_key(SETTINGS_JSON_PATH, DATA_DIR)
         except SettingsError:
@@ -961,33 +1024,36 @@ def api_style_maker_generate():
 
         artist_prompt = build_artist_prompt(data["artists"])
         combined_prompt = combine_base_prompt(data["base_prompt"], artist_prompt)
-        try:
-            png_bytes, actual_seed = generate_novelai_png(app_key, data, artist_prompt)
-            result = save_generated_result(
-                DB_PATH,
-                GENERATED_DIR,
-                request_id=request_id,
-                artists=data["artists"],
-                png_bytes=png_bytes,
-                base_prompt=data["base_prompt"],
-                negative_prompt=data["negative_prompt"],
-                character_prompts=data["character_prompts"],
-                combined_prompt=combined_prompt,
-                seed=actual_seed,
-                width=data["width"],
-                height=data["height"],
-                sampler=data["sampler"],
-                steps=data["steps"],
-                scale=data["scale"],
-                cfg_rescale=data["cfg_rescale"],
-                model=MODEL,
-            )
-        except NovelAIError as exc:
-            return json_response({"error": exc.public_message}, exc.status_code)
-        except (OSError, sqlite3.Error, ValueError):
-            return json_response({"error": "Could not store the generated image."}, 500)
+        png_bytes, actual_seed = generate_novelai_png(app_key, data, artist_prompt)
+        result = save_generated_result(
+            DB_PATH,
+            GENERATED_DIR,
+            request_id=request_id,
+            artists=data["artists"],
+            png_bytes=png_bytes,
+            base_prompt=data["base_prompt"],
+            negative_prompt=data["negative_prompt"],
+            character_prompts=data["character_prompts"],
+            combined_prompt=combined_prompt,
+            seed=actual_seed,
+            width=data["width"],
+            height=data["height"],
+            sampler=data["sampler"],
+            steps=data["steps"],
+            scale=data["scale"],
+            cfg_rescale=data["cfg_rescale"],
+            model=MODEL,
+        )
         result["seed"] = actual_seed
+        completed = True
         return json_response(_generation_response(result))
+    except NovelAIError as exc:
+        return json_response({"error": exc.public_message}, exc.status_code)
+    except (OSError, sqlite3.Error, ValueError):
+        return json_response({"error": "Could not store the generated image."}, 500)
+    finally:
+        if not completed:
+            release_generation_request(DB_PATH, request_id)
 
 
 def _add_generated_urls(item):

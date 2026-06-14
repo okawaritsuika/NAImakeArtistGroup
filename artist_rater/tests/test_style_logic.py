@@ -1,5 +1,7 @@
+import os
 import struct
 import tempfile
+import time
 import unittest
 import zlib
 from contextlib import closing
@@ -15,7 +17,14 @@ from style_logic import (
     select_artists,
     style_hash,
 )
-from style_store import connect_db, get_style_detail, list_styles, save_generated_result
+from style_store import (
+    _staged_file_path,
+    connect_db,
+    get_style_detail,
+    list_styles,
+    save_generated_result,
+)
+from png_validator import validate_png
 
 
 def png_chunk(chunk_type, data):
@@ -47,6 +56,17 @@ def png_with_idat(idat_payload):
             png_chunk(b"IEND", b""),
         )
     )
+
+
+class PngValidatorTest(unittest.TestCase):
+    def test_rejects_expected_dimension_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "dimensions"):
+            validate_png(tiny_png(), expected_width=2, expected_height=1)
+
+    def test_rejects_scanline_output_beyond_exact_cap(self):
+        oversized = png_with_idat(zlib.compress(b"\x00" * 1000000))
+        with self.assertRaisesRegex(ValueError, "scanline"):
+            validate_png(oversized, expected_width=1, expected_height=1)
 
 
 class StyleIdentityTest(unittest.TestCase):
@@ -710,7 +730,11 @@ class StyleStoreIntegrationTest(unittest.TestCase):
             "db_path": self.db_path,
             "generated_dir": self.generated_dir,
             "artists": artists,
-            "png_bytes": tiny_png(),
+            "png_bytes": tiny_png(
+                (b"\x00" + (b"\x00" * (832 * 4))) * 1216,
+                width=832,
+                height=1216,
+            ),
             "base_prompt": "portrait",
             "negative_prompt": "lowres",
             "character_prompts": ["1girl"],
@@ -760,6 +784,10 @@ class StyleStoreIntegrationTest(unittest.TestCase):
         self.assertEqual((self.generated_dir / first["image_path"]).read_bytes(), first_png)
         self.assertEqual((self.generated_dir / second["image_path"]).read_bytes(), second_png)
 
+    def test_staged_file_names_are_unique(self):
+        final_path = self.generated_dir / "1" / "image.png"
+        self.assertNotEqual(_staged_file_path(final_path), _staged_file_path(final_path))
+
     def test_rejects_truncated_and_corrupt_crc_png_before_writing(self):
         valid_png = tiny_png()
         corrupt_crc = bytearray(valid_png)
@@ -800,6 +828,18 @@ class StyleStoreIntegrationTest(unittest.TestCase):
                     artists=[{"artist": "artist_a", "weight": 1}],
                     png_bytes=invalid_png,
                 )
+
+    def test_storage_rejects_unexpected_png_dimensions(self):
+        with self.assertRaisesRegex(ValueError, "dimensions"):
+            save_generated_result(
+                self.db_path,
+                self.generated_dir,
+                request_id="wrong-dimensions",
+                artists=[{"artist": "artist_a", "weight": 1}],
+                png_bytes=tiny_png(),
+                width=2,
+                height=1,
+            )
 
     def test_request_id_retry_returns_existing_result_without_rewriting(self):
         first_png = tiny_png()
@@ -874,12 +914,27 @@ class StyleStoreIntegrationTest(unittest.TestCase):
         orphan = self.generated_dir / "1" / "orphan.png"
         stale_temp.write_bytes(b"stale")
         orphan.write_bytes(tiny_png())
+        stale_time = time.time() - 7200
+        for path in (stale_temp, orphan):
+            os.utime(path, (stale_time, stale_time))
 
         app.init_db()
 
         self.assertFalse(stale_temp.exists())
         self.assertFalse(orphan.exists())
         self.assertTrue((self.generated_dir / saved["image_path"]).is_file())
+
+    def test_reconcile_keeps_fresh_unreferenced_files(self):
+        fresh_temp = self.generated_dir / "1" / ".fresh.png.token.tmp"
+        fresh_orphan = self.generated_dir / "1" / "fresh-orphan.png"
+        fresh_temp.parent.mkdir(parents=True)
+        fresh_temp.write_bytes(b"fresh")
+        fresh_orphan.write_bytes(tiny_png())
+
+        app.init_db()
+
+        self.assertTrue(fresh_temp.is_file())
+        self.assertTrue(fresh_orphan.is_file())
 
     def test_reconcile_promotes_committed_staged_file(self):
         saved = save_generated_result(
@@ -890,7 +945,7 @@ class StyleStoreIntegrationTest(unittest.TestCase):
             png_bytes=tiny_png(),
         )
         final_path = self.generated_dir / saved["image_path"]
-        staged_path = final_path.with_name(f".{final_path.name}.staged.tmp")
+        staged_path = final_path.with_name(f".{final_path.name}.crash-token.tmp")
         final_path.replace(staged_path)
 
         app.init_db()

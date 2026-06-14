@@ -8,6 +8,7 @@ from pathlib import PurePosixPath
 import urllib.error
 import urllib.request
 
+from png_validator import validate_png
 
 SUBSCRIPTION_URL = "https://api.novelai.net/user/subscription"
 GENERATION_URL = "https://image.novelai.net/ai/generate-image"
@@ -17,6 +18,8 @@ MAX_SUBSCRIPTION_BYTES = 1024 * 1024
 MAX_ZIP_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_ZIP_ENTRIES = 100
+MAX_ZIP_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 100
 MODEL = "nai-diffusion-4-5-full"
 MAX_PROMPT_LENGTH = 8192
 MAX_CHARACTER_PROMPTS = 16
@@ -185,9 +188,24 @@ def _safe_png_info(archive):
     infos = archive.infolist()
     if len(infos) > MAX_ZIP_ENTRIES:
         raise ValueError("ZIP contains too many entries.")
+    normalized_names = set()
+    total_size = 0
+    png_info = None
     for info in infos:
         normalized_name = info.filename.replace("\\", "/")
         path = PurePosixPath(normalized_name)
+        canonical_name = path.as_posix().casefold()
+        if canonical_name in normalized_names:
+            raise ValueError("ZIP contains duplicate normalized names.")
+        normalized_names.add(canonical_name)
+        total_size += info.file_size
+        if total_size > MAX_ZIP_UNCOMPRESSED_BYTES:
+            raise ValueError("ZIP uncompressed contents are too large.")
+        if info.file_size and (
+            info.compress_size == 0
+            or info.file_size / info.compress_size > MAX_ZIP_COMPRESSION_RATIO
+        ):
+            raise ValueError("ZIP compression ratio is suspicious.")
         if path.is_absolute() or ".." in path.parts or info.is_dir():
             if path.suffix.lower() == ".png":
                 raise ValueError("PNG path is unsafe.")
@@ -195,8 +213,11 @@ def _safe_png_info(archive):
         if path.suffix.lower() == ".png":
             if info.file_size > MAX_IMAGE_BYTES:
                 raise ValueError("PNG is too large.")
-            return info
-    raise ValueError("ZIP does not contain a PNG image.")
+            if png_info is None:
+                png_info = info
+    if png_info is None:
+        raise ValueError("ZIP does not contain a PNG image.")
+    return png_info
 
 
 def generate_novelai_png(app_key, data, artist_prompt, opener=None):
@@ -220,8 +241,13 @@ def generate_novelai_png(app_key, data, artist_prompt, opener=None):
             info = _safe_png_info(archive)
             with archive.open(info) as image_file:
                 png = image_file.read(MAX_IMAGE_BYTES + 1)
-        if len(png) > MAX_IMAGE_BYTES or not png.startswith(b"\x89PNG\r\n\x1a\n"):
+        if len(png) > MAX_IMAGE_BYTES:
             raise ValueError("Generation response did not contain a valid PNG.")
+        png = validate_png(
+            png,
+            expected_width=normalized["width"],
+            expected_height=normalized["height"],
+        )
     except urllib.error.HTTPError as exc:
         try:
             if exc.code in (401, 403):
