@@ -12,7 +12,13 @@ const {
   validateCustomRangeValues,
   interpolateWeightProfile,
   formatArtistPromptTag,
+  hasProfileDragMoved,
 } = require("../static/style_maker.js");
+
+test("profile point interaction distinguishes a click from a drag", () => {
+  assert.equal(hasProfileDragMoved(100, 100, 101, 102), false);
+  assert.equal(hasProfileDragMoved(100, 100, 104, 100), true);
+});
 
 test("artist prompt tags replace underscores and separate numeric endings", () => {
   assert.equal(formatArtistPromptTag("some_artist"), "some artist");

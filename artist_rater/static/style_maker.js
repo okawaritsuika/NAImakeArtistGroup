@@ -168,6 +168,10 @@ function formatArtistPromptTag(artist) {
   return /\d$/.test(normalized) ? `${normalized} ` : normalized;
 }
 
+function hasProfileDragMoved(startX, startY, currentX, currentY) {
+  return Math.hypot(currentX - startX, currentY - startY) >= 3;
+}
+
 function interpolateWeightProfile(profile, position) {
   const points = [...profile].sort((a, b) => a.position - b.position);
   for (let index = 0; index < points.length - 1; index += 1) {
@@ -399,7 +403,12 @@ function renderWeightProfileGraph(graph) {
     circle.addEventListener("pointerdown", (event) => {
       event.stopPropagation();
       circle.setPointerCapture(event.pointerId);
+      const startX = event.clientX;
+      const startY = event.clientY;
+      let moved = false;
       const move = (moveEvent) => {
+        if (!hasProfileDragMoved(startX, startY, moveEvent.clientX, moveEvent.clientY)) return;
+        moved = true;
         const next = pointFromEvent(moveEvent);
         if (point.position !== 0 && point.position !== 1) point.position = Number(next.position.toFixed(3));
         point.weight = Number(next.weight.toFixed(2));
@@ -411,7 +420,7 @@ function renderWeightProfileGraph(graph) {
       circle.addEventListener("pointermove", move);
       circle.addEventListener("pointerup", () => {
         circle.removeEventListener("pointermove", move);
-        renderWeightGraph();
+        if (moved) renderWeightGraph();
       }, { once: true });
     });
     circle.addEventListener("dblclick", (event) => {
@@ -1103,6 +1112,7 @@ if (typeof module !== "undefined" && module.exports) {
     validateCustomRangeValues,
     interpolateWeightProfile,
     formatArtistPromptTag,
+    hasProfileDragMoved,
     reachedGenerationLimit,
   };
 }
