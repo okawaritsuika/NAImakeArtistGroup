@@ -616,7 +616,17 @@ textarea {
   text-align: center;
 }
 
-.custom-range-row input {
+.custom-range-field {
+  display: grid;
+  gap: 3px;
+}
+
+.custom-range-field span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.custom-range-field input {
   min-width: 0;
   padding: 7px 5px;
 }

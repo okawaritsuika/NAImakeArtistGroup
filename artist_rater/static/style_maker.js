@@ -7,6 +7,88 @@ const styleState = {
   draggingIndex: null,
 };
 
+const CUSTOM_RANGE_FIELDS = [
+  { key: "min", label: "최소 가중치", ariaLabel: "최소 가중치", step: 0.01 },
+  { key: "max", label: "최대 가중치", ariaLabel: "최대 가중치", step: 0.01 },
+  { key: "max_people", label: "최대 인원", ariaLabel: "최대 인원", step: 1 },
+];
+
+function validateCustomRangeValues(ranges, { globalMin, globalMax, artistCount }) {
+  let capacity = 0;
+  const normalized = ranges.map((range, index) => {
+    const min = Number(range.min);
+    const max = Number(range.max);
+    const maxPeople = Number(range.max_people);
+    if (![min, max, maxPeople].every(Number.isFinite)) {
+      throw new Error(`${index + 1}번 구간은 숫자로 입력하세요.`);
+    }
+    if (min <= 0 || max <= 0 || min > max) {
+      throw new Error(`${index + 1}번 구간의 최소값과 최대값을 확인하세요.`);
+    }
+    if (min < globalMin || max > globalMax) {
+      throw new Error(`${index + 1}번 구간은 전체 가중치 범위 안에 있어야 합니다.`);
+    }
+    if (!Number.isInteger(maxPeople) || maxPeople < 1) {
+      throw new Error(`${index + 1}번 구간의 최대 인원은 1 이상의 정수여야 합니다.`);
+    }
+    capacity += maxPeople;
+    return { min, max, max_people: maxPeople };
+  });
+
+  for (let left = 0; left < normalized.length; left += 1) {
+    for (let right = left + 1; right < normalized.length; right += 1) {
+      const leftMin = Math.round(normalized[left].min * 100);
+      const leftMax = Math.round(normalized[left].max * 100);
+      const rightMin = Math.round(normalized[right].min * 100);
+      const rightMax = Math.round(normalized[right].max * 100);
+      if (leftMin <= rightMax && rightMin <= leftMax) {
+        throw new Error(`${left + 1}번과 ${right + 1}번 가중치 구간이 서로 겹칩니다.`);
+      }
+    }
+  }
+
+  if (capacity < artistCount) {
+    throw new Error(`구간의 총 인원(${capacity})이 작가 수(${artistCount})보다 적습니다.`);
+  }
+  return normalized;
+}
+
+function normalizeSelectedScores(scores) {
+  const normalized = Array.from(new Set(scores)).map(Number).sort((a, b) => a - b);
+  if (normalized.length === 0) throw new Error("허용 평점을 하나 이상 선택하세요.");
+  if (!normalized.every((score) => Number.isInteger(score) && score >= 1 && score <= 5)) {
+    throw new Error("허용 평점은 1부터 5 사이의 정수여야 합니다.");
+  }
+  return normalized;
+}
+
+function buildStyleRequestPayload(options, artists, { rerollArtists, rerollWeights }) {
+  const payload = {
+    ...options,
+    reroll_artists: rerollArtists,
+    reroll_weights: rerollWeights,
+  };
+  if (!rerollArtists) {
+    payload.artists = artists.map(({ artist, score }) => ({ artist, score }));
+  }
+  return payload;
+}
+
+function sortArtistsByWeight(artists, direction) {
+  const factor = direction === "asc" ? 1 : -1;
+  return [...artists].sort((a, b) => factor * (Number(a.weight) - Number(b.weight)));
+}
+
+function reorderArtists(artists, source, target) {
+  if (!Number.isInteger(source) || !Number.isInteger(target) || !artists[source] || !artists[target]) {
+    return [...artists];
+  }
+  const reordered = [...artists];
+  const [moved] = reordered.splice(source, 1);
+  reordered.splice(target, 0, moved);
+  return reordered;
+}
+
 function styleElement(id) {
   return document.getElementById(id);
 }
@@ -50,31 +132,7 @@ function validateCustomRanges() {
   const globalMin = styleNumber("styleMinWeight", 0.1);
   const globalMax = styleNumber("styleMaxWeight", 2.3);
   const artistCount = Math.max(1, Math.trunc(styleNumber("styleArtistCount", 12)));
-  let capacity = 0;
-
-  const ranges = styleState.customRanges.map((range, index) => {
-    const min = Number(range.min);
-    const max = Number(range.max);
-    const maxPeople = Number(range.max_people);
-    if (![min, max, maxPeople].every(Number.isFinite)) {
-      throw new Error(`${index + 1}번 구간은 숫자로 입력하세요.`);
-    }
-    if (min <= 0 || max <= 0 || min > max) {
-      throw new Error(`${index + 1}번 구간의 최소값과 최대값을 확인하세요.`);
-    }
-    if (min < globalMin || max > globalMax) {
-      throw new Error(`${index + 1}번 구간은 전체 가중치 범위 안에 있어야 합니다.`);
-    }
-    if (!Number.isInteger(maxPeople) || maxPeople < 1) {
-      throw new Error(`${index + 1}번 구간의 최대 인원은 1 이상의 정수여야 합니다.`);
-    }
-    capacity += maxPeople;
-    return { min, max, max_people: maxPeople };
-  });
-
-  if (capacity < artistCount) {
-    throw new Error(`구간의 총 인원(${capacity})이 작가 수(${artistCount})보다 적습니다.`);
-  }
+  const ranges = validateCustomRangeValues(styleState.customRanges, { globalMin, globalMax, artistCount });
   showStyleError();
   return ranges;
 }
@@ -87,11 +145,10 @@ function readStyleOptions() {
   if (![minWeight, maxWeight].every(Number.isFinite) || minWeight <= 0 || minWeight > maxWeight) {
     throw new Error("전체 가중치 범위를 확인하세요.");
   }
-  if (styleState.allowedScores.size === 0) throw new Error("허용 평점을 하나 이상 선택하세요.");
 
   return {
     count,
-    scores: Array.from(styleState.allowedScores).sort((a, b) => a - b),
+    scores: normalizeSelectedScores(styleState.allowedScores),
     weight_mode: styleElement("weightMode")?.value || "balanced",
     min_weight: minWeight,
     max_weight: maxWeight,
@@ -103,11 +160,10 @@ function readStyleOptions() {
 async function loadStyleArtists({ rerollArtists = true, rerollWeights = true } = {}) {
   try {
     showStyleStatus("그림체를 구성하는 중입니다...");
-    const payload = readStyleOptions();
-    if (!rerollArtists) payload.artists = styleState.artists.map(({ artist, score }) => ({ artist, score }));
+    const payload = buildStyleRequestPayload(readStyleOptions(), styleState.artists, { rerollArtists, rerollWeights });
     const data = await apiFetch("/api/style-maker/artists", {
       method: "POST",
-      body: JSON.stringify({ ...payload, reroll_artists: rerollArtists, reroll_weights: rerollWeights }),
+      body: JSON.stringify(payload),
     });
     styleState.artists = data.artists || [];
     renderWeightGraph();
@@ -141,8 +197,7 @@ function swapStyleArtists(a, b) {
 }
 
 function sortStyleArtists(direction) {
-  const factor = direction === "asc" ? 1 : -1;
-  styleState.artists.sort((a, b) => factor * (Number(a.weight) - Number(b.weight)));
+  styleState.artists = sortArtistsByWeight(styleState.artists, direction);
   renderWeightGraph();
 }
 
@@ -239,8 +294,7 @@ function renderWeightGraph() {
       event.preventDefault();
       const source = Number(event.dataTransfer.getData("text/plain"));
       if (!Number.isInteger(source) || source === index) return;
-      const [moved] = styleState.artists.splice(source, 1);
-      styleState.artists.splice(index, 0, moved);
+      styleState.artists = reorderArtists(styleState.artists, source, index);
       renderWeightGraph();
     });
 
@@ -295,18 +349,23 @@ function renderCustomRanges() {
   styleState.customRanges.forEach((range, index) => {
     const row = document.createElement("div");
     row.className = "custom-range-row";
-    [["min", 0.01], ["max", 0.01], ["max_people", 1]].forEach(([key, step]) => {
+    CUSTOM_RANGE_FIELDS.forEach(({ key, label, ariaLabel, step }) => {
+      const field = document.createElement("label");
+      field.className = "custom-range-field";
+      const fieldLabel = document.createElement("span");
+      fieldLabel.textContent = label;
       const input = document.createElement("input");
       input.type = "number";
       input.step = String(step);
       input.min = key === "max_people" ? "1" : "0.01";
       input.value = String(range[key]);
-      input.setAttribute("aria-label", `${index + 1}번 구간 ${key}`);
+      input.setAttribute("aria-label", `${index + 1}번 구간 ${ariaLabel}`);
       input.addEventListener("input", () => {
         range[key] = Number(input.value);
         try { validateCustomRanges(); } catch (error) { showStyleError(error.message); }
       });
-      row.append(input);
+      field.append(fieldLabel, input);
+      row.append(field);
     });
     const remove = document.createElement("button");
     remove.type = "button";
@@ -402,10 +461,23 @@ function initializeStyleMaker() {
   loadStyleArtists();
 }
 
-document.querySelectorAll(".tab").forEach((button) => {
-  button.addEventListener("click", () => {
-    const isStyleMaker = button.dataset.tab === "style-maker";
-    document.body.classList.toggle("style-maker-active", isStyleMaker);
-    if (isStyleMaker) initializeStyleMaker();
+if (typeof document !== "undefined") {
+  document.querySelectorAll(".tab").forEach((button) => {
+    button.addEventListener("click", () => {
+      const isStyleMaker = button.dataset.tab === "style-maker";
+      document.body.classList.toggle("style-maker-active", isStyleMaker);
+      if (isStyleMaker) initializeStyleMaker();
+    });
   });
-});
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    CUSTOM_RANGE_FIELDS,
+    buildStyleRequestPayload,
+    normalizeSelectedScores,
+    reorderArtists,
+    sortArtistsByWeight,
+    validateCustomRangeValues,
+  };
+}

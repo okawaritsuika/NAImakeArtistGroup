@@ -1,12 +1,14 @@
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
 HTML_PATH = ROOT / "templates" / "index.html"
 JS_PATH = ROOT / "static" / "style_maker.js"
 CSS_PATH = ROOT / "static" / "style.css"
+BEHAVIOR_TEST_PATH = ROOT / "tests" / "style_maker_behavior.test.js"
 
 
 class NestedWorkspacePanelParser(HTMLParser):
@@ -113,7 +115,7 @@ class StyleFrontendContractTest(unittest.TestCase):
             "customRanges: []",
             "async function loadStyleArtists",
             'apiFetch("/api/style-maker/artists"',
-            "payload.artists = styleState.artists.map",
+            "function buildStyleRequestPayload",
             "function renderWeightGraph",
             "function sortStyleArtists",
             "function swapStyleArtists",
@@ -144,6 +146,17 @@ class StyleFrontendContractTest(unittest.TestCase):
         parser = NestedWorkspacePanelParser()
         parser.feed(self.html)
         self.assertEqual([], parser.nested_panels)
+
+    def test_style_editor_behavior_with_node(self):
+        result = subprocess.run(
+            ["node", "--test", str(BEHAVIOR_TEST_PATH)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
