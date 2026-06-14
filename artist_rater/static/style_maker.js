@@ -5,7 +5,27 @@ const styleState = {
   ratedArtists: [],
   initialized: false,
   draggingIndex: null,
+  requestToken: 0,
+  pending: false,
 };
+
+const STYLE_REQUEST_CONTROL_IDS = [
+  "rerollStyleArtists",
+  "rerollStyleWeights",
+  "rerollStyleAll",
+  "sortStyleAsc",
+  "sortStyleDesc",
+  "styleArtistCount",
+  "styleScoreAll",
+  "weightMode",
+  "styleMinWeight",
+  "styleMaxWeight",
+  "preferHighScores",
+  "addWeightRange",
+  "styleArtistSearch",
+  "styleArtistSelect",
+  "addStyleArtist",
+];
 
 const CUSTOM_RANGE_FIELDS = [
   { key: "min", label: "최소 가중치", ariaLabel: "최소 가중치", step: 0.01 },
@@ -90,8 +110,29 @@ function reorderArtists(artists, source, target) {
   return reordered;
 }
 
+async function runLatestStyleRequest(requestState, request, handlers = {}) {
+  const token = requestState.requestToken + 1;
+  requestState.requestToken = token;
+  requestState.pending = true;
+  handlers.onPending?.(true);
+  try {
+    const result = await request();
+    if (token !== requestState.requestToken) return false;
+    handlers.onSuccess?.(result);
+    return true;
+  } catch (error) {
+    if (token === requestState.requestToken) handlers.onError?.(error);
+    return false;
+  } finally {
+    if (token === requestState.requestToken) {
+      requestState.pending = false;
+      handlers.onPending?.(false);
+    }
+  }
+}
+
 function styleElement(id) {
-  return document.getElementById(id);
+  return typeof document === "undefined" ? null : document.getElementById(id);
 }
 
 function styleNumber(id, fallback) {
@@ -122,6 +163,19 @@ function showStyleError(message = "") {
   if (!target) return;
   target.textContent = message;
   target.className = `status ${message ? "error" : ""}`;
+}
+
+function setStyleRequestPending(pending) {
+  styleState.pending = pending;
+  STYLE_REQUEST_CONTROL_IDS.forEach((id) => {
+    const control = styleElement(id);
+    if (control) control.disabled = pending;
+  });
+  if (typeof document === "undefined") return;
+  document.querySelectorAll("#styleScoreButtons [data-score], #customRangeList input, #customRangeList button, #weightGraph input, #weightGraph select, #weightGraph button")
+    .forEach((control) => { control.disabled = pending; });
+  document.querySelectorAll("#weightGraph .weight-column")
+    .forEach((column) => { column.draggable = !pending; });
 }
 
 function validateCustomRanges() {
@@ -159,20 +213,31 @@ function readStyleOptions() {
 }
 
 async function loadStyleArtists(reroll = "all") {
+  let payload;
   try {
     showStyleStatus("그림체를 구성하는 중입니다...");
-    const payload = buildStyleRequestPayload(readStyleOptions(), styleState.artists, reroll);
-    const data = await apiFetch("/api/style-maker/artists", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    styleState.artists = applyStyleRerollResult(styleState.artists, data.artists || [], reroll);
-    renderWeightGraph();
-    showStyleStatus(`${styleState.artists.length}명의 작가를 불러왔습니다.`, "ok");
+    payload = buildStyleRequestPayload(readStyleOptions(), styleState.artists, reroll);
   } catch (error) {
     showStyleError(error.message);
     showStyleStatus(error.message, "error");
+    return false;
   }
+
+  return runLatestStyleRequest(styleState, () => apiFetch("/api/style-maker/artists", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }), {
+      onPending: setStyleRequestPending,
+      onSuccess: (data) => {
+        styleState.artists = applyStyleRerollResult(styleState.artists, data.artists || [], reroll);
+        renderWeightGraph();
+        showStyleStatus(`${styleState.artists.length}명의 작가를 불러왔습니다.`, "ok");
+      },
+      onError: (error) => {
+        showStyleError(error.message);
+        showStyleStatus(error.message, "error");
+      },
+    });
 }
 
 function updateArtistPrompt() {
@@ -213,14 +278,13 @@ function renderWeightGraph() {
     item.weight = clampStyleWeight(item.weight);
     const column = document.createElement("article");
     column.className = "weight-column";
-    column.draggable = true;
+    column.draggable = !styleState.pending;
     column.dataset.index = String(index);
 
-    const drag = document.createElement("button");
-    drag.type = "button";
+    const drag = document.createElement("span");
     drag.className = "drag-handle icon-button ghost";
     drag.title = "끌어서 순서 변경";
-    drag.setAttribute("aria-label", `${item.artist} 순서 변경`);
+    drag.setAttribute("aria-hidden", "true");
     drag.textContent = "⋮⋮";
 
     const slider = document.createElement("input");
@@ -278,6 +342,10 @@ function renderWeightGraph() {
     remove.addEventListener("click", () => removeStyleArtist(index));
 
     column.addEventListener("dragstart", (event) => {
+      if (styleState.pending) {
+        event.preventDefault();
+        return;
+      }
       styleState.draggingIndex = index;
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", String(index));
@@ -293,6 +361,7 @@ function renderWeightGraph() {
     });
     column.addEventListener("drop", (event) => {
       event.preventDefault();
+      if (styleState.pending) return;
       const source = Number(event.dataTransfer.getData("text/plain"));
       if (!Number.isInteger(source) || source === index) return;
       styleState.artists = reorderArtists(styleState.artists, source, index);
@@ -410,6 +479,7 @@ function addCharacterPrompt(value = "") {
 function toggleStyleSettings() {
   const layout = styleElement("styleMakerLayout");
   const button = styleElement("toggleStyleSettings");
+  if (!layout || !button) return;
   const collapsed = layout.classList.toggle("settings-collapsed");
   button.textContent = collapsed ? "›" : "‹";
   button.title = collapsed ? "설정 패널 열기" : "설정 패널 닫기";
@@ -418,14 +488,19 @@ function toggleStyleSettings() {
 
 function syncScoreControls() {
   document.querySelectorAll("#styleScoreButtons [data-score]").forEach((button) => {
-    button.classList.toggle("active", styleState.allowedScores.has(Number(button.dataset.score)));
+    const selected = styleState.allowedScores.has(Number(button.dataset.score));
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
   });
   const all = styleElement("styleScoreAll");
-  if (all) all.checked = styleState.allowedScores.size === 5;
+  if (all) {
+    all.checked = styleState.allowedScores.size === 5;
+    all.indeterminate = styleState.allowedScores.size > 0 && styleState.allowedScores.size < 5;
+  }
 }
 
 function initializeStyleMaker() {
-  if (styleState.initialized) return;
+  if (styleState.initialized || !styleElement("styleMakerLayout")) return;
   styleState.initialized = true;
 
   document.querySelectorAll("#styleScoreButtons [data-score]").forEach((button) => {
@@ -458,6 +533,7 @@ function initializeStyleMaker() {
 
   addCharacterPrompt();
   addWeightRange();
+  syncScoreControls();
   loadRatedStyleArtists();
   loadStyleArtists();
 }
@@ -479,6 +555,7 @@ if (typeof module !== "undefined" && module.exports) {
     buildStyleRequestPayload,
     normalizeSelectedScores,
     reorderArtists,
+    runLatestStyleRequest,
     sortArtistsByWeight,
     validateCustomRangeValues,
   };

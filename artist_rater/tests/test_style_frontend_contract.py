@@ -132,15 +132,43 @@ class StyleFrontendContractTest(unittest.TestCase):
     def test_workspace_uses_internal_scroll_and_responsive_grid(self):
         for marker in (
             ".style-maker-layout",
-            "minmax(220px, 300px)",
-            "minmax(420px, 1fr)",
-            "minmax(300px, 380px)",
+            "minmax(210px, 280px)",
+            "minmax(0, 1fr)",
+            "minmax(280px, 340px)",
             "overflow: auto",
             ".weight-column",
             "grid-template-columns: 1fr",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.css)
+
+    def test_workspace_switches_before_the_981_to_1008_pixel_clipping_range(self):
+        self.assertIn("@media (max-width: 1040px)", self.css)
+        self.assertIn("grid-template-columns: minmax(210px, 280px) minmax(0, 1fr) minmax(280px, 340px)", self.css)
+        self.assertIn("overflow-x: auto", self.css)
+
+    def test_score_and_drag_controls_expose_accessible_state(self):
+        source = JS_PATH.read_text(encoding="utf-8")
+        self.assertIn('button.setAttribute("aria-pressed"', source)
+        self.assertIn("all.indeterminate =", source)
+        self.assertIn('document.createElement("span")', source)
+        self.assertNotIn('drag = document.createElement("button")', source)
+
+    def test_pending_requests_disable_conflicting_style_controls(self):
+        source = JS_PATH.read_text(encoding="utf-8")
+        self.assertIn("requestToken: 0", source)
+        self.assertIn("pending: false", source)
+        self.assertIn("function setStyleRequestPending", source)
+        for control_id in (
+            "rerollStyleArtists",
+            "rerollStyleWeights",
+            "rerollStyleAll",
+            "styleArtistCount",
+            "styleScoreAll",
+            "weightMode",
+        ):
+            with self.subTest(control_id=control_id):
+                self.assertIn(f'"{control_id}"', source)
 
     def test_workspace_does_not_nest_panels_or_cards(self):
         parser = NestedWorkspacePanelParser()

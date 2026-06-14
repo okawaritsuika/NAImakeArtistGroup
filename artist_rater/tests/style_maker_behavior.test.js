@@ -7,9 +7,20 @@ const {
   buildStyleRequestPayload,
   normalizeSelectedScores,
   reorderArtists,
+  runLatestStyleRequest,
   sortArtistsByWeight,
   validateCustomRangeValues,
 } = require("../static/style_maker.js");
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  return { promise, resolve, reject };
+}
 
 test("custom ranges reject inclusive endpoint overlap", () => {
   assert.throws(
@@ -114,4 +125,29 @@ test("custom range fields expose only Korean visible and accessible labels", () 
       ["최대 인원", "최대 인원"],
     ],
   );
+});
+
+test("only the latest style request can mutate state or clear pending controls", async () => {
+  const requestState = { requestToken: 0, pending: false };
+  const first = deferred();
+  const second = deferred();
+  const applied = [];
+  const pending = [];
+  const handlers = {
+    onPending: (value) => pending.push(value),
+    onSuccess: (value) => applied.push(value),
+    onError: (error) => applied.push(error.message),
+  };
+
+  const firstRun = runLatestStyleRequest(requestState, () => first.promise, handlers);
+  const secondRun = runLatestStyleRequest(requestState, () => second.promise, handlers);
+  second.resolve("latest");
+  await secondRun;
+  first.reject(new Error("stale"));
+  await firstRun;
+
+  assert.deepEqual(applied, ["latest"]);
+  assert.deepEqual(pending, [true, true, false]);
+  assert.equal(requestState.requestToken, 2);
+  assert.equal(requestState.pending, false);
 });

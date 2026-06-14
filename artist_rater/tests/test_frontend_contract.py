@@ -1,9 +1,11 @@
 import unittest
 from pathlib import Path
+import subprocess
 
 
 APP_JS = Path(__file__).resolve().parents[1] / "static" / "app.js"
 INDEX_HTML = Path(__file__).resolve().parents[1] / "templates" / "index.html"
+APP_BEHAVIOR_TEST = Path(__file__).resolve().parent / "app_behavior.test.js"
 
 
 class FrontendContractTest(unittest.TestCase):
@@ -24,6 +26,17 @@ class FrontendContractTest(unittest.TestCase):
         self.assertIn('id="manualPreviewModal"', html)
         self.assertIn('async function openManualPreview()', source)
         self.assertIn('apiFetch("/api/artist_samples"', source)
+
+    def test_rating_card_behavior_with_node(self):
+        result = subprocess.run(
+            ["node", "--test", str(APP_BEHAVIOR_TEST)],
+            cwd=APP_JS.parent.parent,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

@@ -544,36 +544,87 @@ function scoreText(score) {
   return "★".repeat(score) + "☆".repeat(5 - score);
 }
 
+function validatedImageUrl(value) {
+  if (!value) return "";
+  try {
+    const base = typeof window !== "undefined" && window.location?.origin
+      ? window.location.origin
+      : "http://localhost";
+    const parsed = new URL(String(value), base);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? String(value) : "";
+  } catch {
+    return "";
+  }
+}
+
 function renderRatingCard(item) {
   const card = document.createElement("article");
   card.className = "card";
-  const thumb = item.thumbnail_url || item.representative_preview_url || "";
-  card.innerHTML = `
-    ${thumb ? `<img class="thumb" src="${thumb}" alt="${item.artist_tag}" loading="lazy">` : ""}
-    <div class="card-body">
-      <h3>${item.artist_tag}</h3>
-      <strong>${scoreText(item.score)} (${item.score})</strong>
-      <p class="memo-preview">${item.memo || ""}</p>
-      <div class="card-meta">
-        <span>${item.mode}</span>
-        <span>query: ${(item.query_tags || []).join(", ") || "전체"}</span>
-        <span>artist posts: ${item.artist_post_count} · matched: ${item.matched_post_count}</span>
-        <span>${item.created_at}</span>
-      </div>
-      <div class="card-actions">
-        <button data-action="copy">프롬프트 복사</button>
-        <button data-action="edit">수정</button>
-        <button data-action="delete">삭제</button>
-      </div>
-      <div class="inline-edit hidden">
-        <select data-edit="score">
-          ${[1, 2, 3, 4, 5].map((score) => `<option value="${score}" ${score === item.score ? "selected" : ""}>${score}</option>`).join("")}
-        </select>
-        <textarea data-edit="memo">${item.memo || ""}</textarea>
-        <button data-action="apply">적용</button>
-      </div>
-    </div>
-  `;
+  const thumb = validatedImageUrl(item.thumbnail_url || item.representative_preview_url || "");
+  if (thumb) {
+    const image = document.createElement("img");
+    image.className = "thumb";
+    image.src = thumb;
+    image.alt = String(item.artist_tag || "");
+    image.loading = "lazy";
+    card.append(image);
+  }
+
+  const body = document.createElement("div");
+  body.className = "card-body";
+  const heading = document.createElement("h3");
+  heading.textContent = String(item.artist_tag || "");
+  const score = document.createElement("strong");
+  score.textContent = `${scoreText(item.score)} (${item.score})`;
+  const memoPreview = document.createElement("p");
+  memoPreview.className = "memo-preview";
+  memoPreview.textContent = String(item.memo || "");
+
+  const meta = document.createElement("div");
+  meta.className = "card-meta";
+  [
+    String(item.mode || ""),
+    `query: ${(item.query_tags || []).join(", ") || "전체"}`,
+    `artist posts: ${item.artist_post_count} · matched: ${item.matched_post_count}`,
+    String(item.created_at || ""),
+  ].forEach((text) => {
+    const line = document.createElement("span");
+    line.textContent = text;
+    meta.append(line);
+  });
+
+  const actions = document.createElement("div");
+  actions.className = "card-actions";
+  [["copy", "프롬프트 복사"], ["edit", "수정"], ["delete", "삭제"]].forEach(([action, label]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.action = action;
+    button.textContent = label;
+    actions.append(button);
+  });
+
+  const editor = document.createElement("div");
+  editor.className = "inline-edit hidden";
+  const scoreSelect = document.createElement("select");
+  scoreSelect.dataset.edit = "score";
+  [1, 2, 3, 4, 5].forEach((value) => {
+    const option = document.createElement("option");
+    option.value = String(value);
+    option.textContent = String(value);
+    option.selected = value === Number(item.score);
+    scoreSelect.append(option);
+  });
+  const memoInput = document.createElement("textarea");
+  memoInput.dataset.edit = "memo";
+  memoInput.value = String(item.memo || "");
+  const apply = document.createElement("button");
+  apply.type = "button";
+  apply.dataset.action = "apply";
+  apply.textContent = "적용";
+  editor.append(scoreSelect, memoInput, apply);
+  body.append(heading, score, memoPreview, meta, actions, editor);
+  card.append(body);
+
   card.querySelector('[data-action="copy"]').addEventListener("click", () => copyText(item.prompt_text));
   card.querySelector('[data-action="edit"]').addEventListener("click", () => card.querySelector(".inline-edit").classList.toggle("hidden"));
   card.querySelector('[data-action="delete"]').addEventListener("click", () => deleteRating(item.id));
@@ -618,6 +669,7 @@ async function deleteRating(id) {
   }
 }
 
+if (typeof document !== "undefined" && !(typeof module !== "undefined" && module.exports)) {
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll(".tab, .view").forEach((item) => item.classList.remove("active"));
@@ -708,3 +760,8 @@ bindClick("openConditions", () => {
 
 updatePoolStatus();
 loadRatings();
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { renderRatingCard, validatedImageUrl };
+}
