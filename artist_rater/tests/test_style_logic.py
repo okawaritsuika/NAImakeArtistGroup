@@ -78,7 +78,13 @@ class StyleIdentityTest(unittest.TestCase):
 
         self.assertEqual(
             build_artist_prompt(artists),
-            "0.5::artist:artist_b::, 2.1::artist:artist_a::",
+            "0.5::artist:artist b::, 2.1::artist:artist a::",
+        )
+
+    def test_prompt_replaces_artist_tag_underscores_with_spaces(self):
+        self.assertEqual(
+            build_artist_prompt([{"artist": "some_artist_name", "weight": 1.25}]),
+            "1.25::artist:some artist name::",
         )
 
     def test_hash_changes_when_order_changes(self):

@@ -252,6 +252,10 @@
                 </label>
               </div>
               <label class="check-row"><input id="preferHighScores" type="checkbox"> 높은 평점 우선</label>
+              <button id="openWeightGraph" class="weight-graph-preview-button" type="button" title="가중치 그래프 편집">
+                <span>자리별 가중치 그래프</span>
+                <svg id="weightGraphPreview" viewBox="0 0 240 100" aria-hidden="true"></svg>
+              </button>
               <div id="styleSettingsError" class="status" role="alert"></div>
             </div>
           </aside>
@@ -267,7 +271,9 @@
               </div>
               <div id="styleMakerStatus" class="status" role="status"></div>
             </div>
-            <div id="weightGraph" class="weight-graph" aria-label="작가 가중치 편집기"></div>
+            <section id="latestStyleResult" class="latest-style-result" aria-live="polite">
+              <div class="latest-result-placeholder">최근 생성 결과가 여기에 표시됩니다.</div>
+            </section>
             <div class="artist-add-row">
               <label class="field style-artist-search-field">
                 <span>평가한 작가 검색</span>
@@ -327,9 +333,6 @@
                 <button id="stopContinuous" class="ghost" type="button" disabled>중지</button>
               </div>
               <div id="generationStatus" class="status" role="status"></div>
-              <section id="latestStyleResult" class="latest-style-result" aria-live="polite">
-                <div class="latest-result-placeholder">최근 생성 결과가 여기에 표시됩니다.</div>
-              </section>
             </div>
           </aside>
         </div>
@@ -358,6 +361,17 @@
           <button id="deleteNovelAiKey" class="ghost" type="button">키 삭제</button>
           <button id="saveNovelAiKey" class="primary" type="button">저장</button>
         </div>
+      </section>
+    </div>
+
+    <div id="weightGraphModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="weightGraphTitle">
+      <div class="modal-backdrop" data-close-weight-graph></div>
+      <section class="modal-dialog weight-graph-dialog">
+        <div class="modal-head">
+          <div><h2 id="weightGraphTitle">자리별 가중치 그래프</h2><p>가로는 프롬프트 자리 순서, 세로는 가중치입니다.</p></div>
+          <button id="closeWeightGraph" class="ghost" type="button">닫기</button>
+        </div>
+        <div id="weightGraph" class="weight-graph profile-mode" aria-label="자리별 가중치 편집기"></div>
       </section>
     </div>
 

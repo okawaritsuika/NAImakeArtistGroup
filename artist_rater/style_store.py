@@ -165,6 +165,13 @@ def _stored_result(row):
         "artist_prompt": row["artist_prompt"],
         "style_hash": row["style_hash"],
         "seed": row["seed"],
+        "width": row["width"],
+        "height": row["height"],
+        "sampler": row["sampler"],
+        "steps": row["steps"],
+        "scale": row["scale"],
+        "cfg_rescale": row["cfg_rescale"],
+        "model": row["model"],
     }
 
 
@@ -173,7 +180,10 @@ def _find_request(conn, request_id):
         """
         SELECT generated_images.id AS image_id, generated_images.style_id,
                generated_images.image_path, generated_images.artist_prompt,
-               generated_images.seed,
+               generated_images.seed, generated_images.width,
+               generated_images.height, generated_images.sampler,
+               generated_images.steps, generated_images.scale,
+               generated_images.cfg_rescale, generated_images.model,
                art_styles.style_hash
         FROM generated_images
         JOIN art_styles ON art_styles.id = generated_images.style_id
@@ -220,7 +230,11 @@ def reserve_generation_request(db_path, request_id, payload_hash):
                 """
                 SELECT generated_images.id AS image_id, generated_images.style_id,
                        generated_images.image_path, generated_images.artist_prompt,
-                       generated_images.seed, art_styles.style_hash
+                       generated_images.seed, generated_images.width,
+                       generated_images.height, generated_images.sampler,
+                       generated_images.steps, generated_images.scale,
+                       generated_images.cfg_rescale, generated_images.model,
+                       art_styles.style_hash
                 FROM generated_images
                 JOIN art_styles ON art_styles.id = generated_images.style_id
                 WHERE generated_images.id = ?
@@ -447,6 +461,13 @@ def save_generated_result(
             "artist_prompt": artist_prompt,
             "style_hash": identity_hash,
             "seed": int(seed),
+            "width": int(width),
+            "height": int(height),
+            "sampler": sampler,
+            "steps": int(steps),
+            "scale": float(scale),
+            "cfg_rescale": float(cfg_rescale),
+            "model": model,
         }
     except Exception:
         if not committed:

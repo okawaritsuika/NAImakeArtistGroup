@@ -105,6 +105,30 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
 
+    def test_weight_profile_uses_left_preview_and_editor_modal(self):
+        for marker in (
+            'id="weightGraphPreview"',
+            'id="openWeightGraph"',
+            'id="weightGraphModal"',
+            'id="weightGraph"',
+            'id="closeWeightGraph"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        settings_start = self.html.index('id="styleMakerSettings"')
+        editor_start = self.html.index('id="styleMakerEditor"')
+        preview_index = self.html.index('id="weightGraphPreview"')
+        result_index = self.html.index('id="latestStyleResult"')
+        self.assertLess(settings_start, preview_index)
+        self.assertLess(preview_index, editor_start)
+        self.assertGreater(result_index, editor_start)
+
+    def test_generation_result_metadata_includes_saved_parameters(self):
+        script = JS_PATH.read_text(encoding="utf-8")
+        for marker in ("result.sampler", "result.steps", "result.scale", "result.cfg_rescale"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, script)
+
     def test_editor_script_exposes_state_and_required_operations(self):
         source = JS_PATH.read_text(encoding="utf-8")
         for marker in (

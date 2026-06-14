@@ -963,6 +963,13 @@ def _generation_response(result):
         "image_url": f'/generated/{result["image_path"]}',
         "artist_prompt": result["artist_prompt"],
         "seed": result["seed"],
+        "width": result["width"],
+        "height": result["height"],
+        "sampler": result["sampler"],
+        "steps": result["steps"],
+        "scale": result["scale"],
+        "cfg_rescale": result["cfg_rescale"],
+        "model": result["model"],
     }
     return payload
 

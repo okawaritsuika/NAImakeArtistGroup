@@ -557,7 +557,17 @@ class GenerationApiTest(StyleApiTest):
         response = self.client.post("/api/style-maker/generate", json=self.request_payload())
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
-        self.assertEqual(set(data), {"style_id", "image_id", "image_url", "image_path", "artist_prompt", "seed"})
+        self.assertEqual(
+            set(data),
+            {
+                "style_id", "image_id", "image_url", "image_path", "artist_prompt", "seed",
+                "width", "height", "sampler", "steps", "scale", "cfg_rescale", "model",
+            },
+        )
+        self.assertEqual(data["sampler"], "k_euler_ancestral")
+        self.assertEqual(data["steps"], 28)
+        self.assertEqual(data["scale"], 5.0)
+        self.assertEqual(data["cfg_rescale"], 0.4)
         self.assertEqual(data["image_url"], f'/generated/{data["image_path"]}')
         self.assertTrue((app.GENERATED_DIR / data["image_path"]).is_file())
         generate.assert_called_once()

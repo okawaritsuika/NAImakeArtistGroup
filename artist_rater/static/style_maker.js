@@ -272,8 +272,46 @@ function updateArtistPrompt() {
   const preview = styleElement("artistPromptPreview");
   if (!preview) return;
   preview.value = styleState.artists
-    .map((item) => `${formatStyleWeight(item.weight)}::artist:${item.artist}::`)
+    .map((item) => `${formatStyleWeight(item.weight)}::artist:${item.artist.replaceAll("_", " ")}::`)
     .join(", ");
+}
+
+function renderWeightProfilePreview() {
+  const preview = styleElement("weightGraphPreview");
+  if (!preview) return;
+  const ns = "http://www.w3.org/2000/svg";
+  preview.replaceChildren();
+  for (let index = 1; index < 4; index += 1) {
+    const line = document.createElementNS(ns, "line");
+    line.setAttribute("x1", "8");
+    line.setAttribute("x2", "232");
+    line.setAttribute("y1", String(index * 25));
+    line.setAttribute("y2", String(index * 25));
+    line.classList.add("preview-grid-line");
+    preview.append(line);
+  }
+  const min = styleNumber("styleMinWeight", 0.1);
+  const max = styleNumber("styleMaxWeight", 2.3);
+  const points = styleState.weightProfile.map((point) => {
+    const x = 8 + point.position * 224;
+    const y = 8 + ((max - point.weight) / Math.max(0.01, max - min)) * 84;
+    return `${x},${y}`;
+  });
+  const polyline = document.createElementNS(ns, "polyline");
+  polyline.setAttribute("points", points.join(" "));
+  polyline.classList.add("preview-profile-line");
+  preview.append(polyline);
+}
+
+function openWeightGraphModal() {
+  const mode = styleElement("weightMode");
+  if (mode) mode.value = "profile";
+  styleElement("weightGraphModal")?.classList.remove("hidden");
+  renderWeightGraph();
+}
+
+function closeWeightGraphModal() {
+  styleElement("weightGraphModal")?.classList.add("hidden");
 }
 
 function renderWeightProfileGraph(graph) {
@@ -419,6 +457,7 @@ function renderWeightGraph() {
   graph.classList.toggle("profile-mode", profileMode);
   if (profileMode) {
     renderWeightProfileGraph(graph);
+    renderWeightProfilePreview();
     updateArtistPrompt();
     return;
   }
@@ -688,7 +727,7 @@ function renderGenerationResult(result) {
   image.alt = `그림체 ${result.style_id} 생성 결과`;
   const meta = document.createElement("div");
   meta.className = "latest-result-meta";
-  meta.textContent = `그림체 #${result.style_id} · Seed ${result.seed}`;
+  meta.textContent = `그림체 #${result.style_id} · ${result.width}×${result.height} · ${result.sampler} · ${result.steps} steps · Scale ${result.scale} · CFG Rescale ${result.cfg_rescale} · Seed ${result.seed}`;
   target.append(image, meta);
 }
 
@@ -977,6 +1016,7 @@ function initializeStyleMaker() {
   styleElement("weightMode")?.addEventListener("change", (event) => {
     styleElement("customRangeSection")?.classList.toggle("hidden", event.target.value !== "custom");
     renderWeightGraph();
+    renderWeightProfilePreview();
   });
   styleElement("addWeightRange")?.addEventListener("click", addWeightRange);
   styleElement("toggleStyleSettings")?.addEventListener("click", toggleStyleSettings);
@@ -1004,10 +1044,14 @@ function initializeStyleMaker() {
     if (count) count.disabled = event.target.value === "unlimited";
   });
   ["styleMinWeight", "styleMaxWeight"].forEach((id) => styleElement(id)?.addEventListener("change", renderWeightGraph));
+  styleElement("openWeightGraph")?.addEventListener("click", openWeightGraphModal);
+  styleElement("closeWeightGraph")?.addEventListener("click", closeWeightGraphModal);
+  document.querySelectorAll("[data-close-weight-graph]").forEach((item) => item.addEventListener("click", closeWeightGraphModal));
 
   addCharacterPrompt();
   addWeightRange();
   syncScoreControls();
+  renderWeightProfilePreview();
   loadRatedStyleArtists();
   loadStyleArtists();
 }

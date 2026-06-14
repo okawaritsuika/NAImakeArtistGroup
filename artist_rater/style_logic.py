@@ -351,7 +351,7 @@ def format_weight(value):
 
 def build_artist_prompt(artists):
     return ", ".join(
-        f'{format_weight(item["weight"])}::artist:{item["artist"]}::'
+        f'{format_weight(item["weight"])}::artist:{item["artist"].replace("_", " ")}::'
         for item in normalize_style_artists(artists)
     )
 
