@@ -15,6 +15,7 @@
       <nav class="tabs">
         <button class="tab active" data-tab="pick">작가 뽑기</button>
         <button class="tab" data-tab="ratings">평가 관리</button>
+        <button class="tab" data-tab="style-maker">그림체 제작</button>
       </nav>
     </header>
 
@@ -206,6 +207,122 @@
         <div id="ratingsStatus" class="status"></div>
         <section id="ratingsList" class="cards"></section>
       </section>
+
+      <section id="style-maker-tab" class="view">
+        <div id="styleMakerLayout" class="style-maker-layout">
+          <aside id="styleMakerSettings" class="style-maker-pane style-maker-settings">
+            <div class="style-pane-head">
+              <h2>그림체 설정</h2>
+              <button id="toggleStyleSettings" class="icon-button ghost" type="button" title="설정 패널 닫기" aria-label="설정 패널 닫기">‹</button>
+            </div>
+            <div class="style-settings-body">
+              <label class="field">
+                <span>작가 수</span>
+                <input id="styleArtistCount" type="number" min="1" value="12">
+              </label>
+              <fieldset class="style-fieldset">
+                <legend>허용 평점</legend>
+                <div id="styleScoreButtons" class="segmented" aria-label="허용 평점 다중 선택">
+                  <button class="active" type="button" data-score="1">1</button>
+                  <button class="active" type="button" data-score="2">2</button>
+                  <button class="active" type="button" data-score="3">3</button>
+                  <button class="active" type="button" data-score="4">4</button>
+                  <button class="active" type="button" data-score="5">5</button>
+                </div>
+                <label class="check-row"><input id="styleScoreAll" type="checkbox" checked> 전체 선택</label>
+              </fieldset>
+              <label class="field">
+                <span>가중치 방식</span>
+                <select id="weightMode">
+                  <option value="random">랜덤</option>
+                  <option value="balanced" selected>균형</option>
+                  <option value="custom">사용자 구간</option>
+                </select>
+              </label>
+              <div class="compact-fields">
+                <label class="field">
+                  <span>최소</span>
+                  <input id="styleMinWeight" type="number" min="0.1" max="2.3" step="0.1" value="0.1">
+                </label>
+                <label class="field">
+                  <span>최대</span>
+                  <input id="styleMaxWeight" type="number" min="0.1" max="2.3" step="0.1" value="2.3">
+                </label>
+              </div>
+              <label class="check-row"><input id="preferHighScores" type="checkbox"> 높은 평점 우선</label>
+              <div id="customRangeSection" class="custom-range-section hidden">
+                <div class="style-subhead">
+                  <h3>사용자 구간</h3>
+                  <button id="addWeightRange" class="icon-button" type="button" title="가중치 구간 추가" aria-label="가중치 구간 추가">＋</button>
+                </div>
+                <div class="range-head" aria-hidden="true"><span>최소</span><span>최대</span><span>인원</span><span></span></div>
+                <div id="customRangeList" class="custom-range-list"></div>
+              </div>
+              <div id="styleSettingsError" class="status" role="alert"></div>
+            </div>
+          </aside>
+
+          <section id="styleMakerEditor" class="style-maker-pane style-maker-editor">
+            <div class="style-editor-head">
+              <div class="toolbar style-toolbar">
+                <button id="rerollStyleArtists" type="button" title="작가 다시 뽑기">작가 ↻</button>
+                <button id="rerollStyleWeights" type="button" title="가중치만 다시 뽑기">가중치 ↻</button>
+                <button id="rerollStyleAll" class="primary" type="button" title="작가와 가중치 다시 뽑기">전체 ↻</button>
+                <button id="sortStyleAsc" class="icon-button" type="button" title="가중치 오름차순" aria-label="가중치 오름차순">↑</button>
+                <button id="sortStyleDesc" class="icon-button" type="button" title="가중치 내림차순" aria-label="가중치 내림차순">↓</button>
+              </div>
+              <div id="styleMakerStatus" class="status" role="status"></div>
+            </div>
+            <div id="weightGraph" class="weight-graph" aria-label="작가 가중치 편집기"></div>
+            <div class="artist-add-row">
+              <label class="field style-artist-search-field">
+                <span>평가한 작가 검색</span>
+                <input id="styleArtistSearch" type="search" placeholder="작가 이름">
+              </label>
+              <label class="field style-artist-select-field">
+                <span>작가 선택</span>
+                <select id="styleArtistSelect"></select>
+              </label>
+              <button id="addStyleArtist" class="icon-button primary" type="button" title="작가 추가" aria-label="작가 추가">＋</button>
+            </div>
+            <label class="field artist-prompt-field">
+              <span>작가 프롬프트 미리보기</span>
+              <textarea id="artistPromptPreview" readonly></textarea>
+            </label>
+          </section>
+
+          <aside id="styleMakerGeneration" class="style-maker-pane style-maker-generation">
+            <div class="style-pane-head"><h2>프롬프트와 생성</h2></div>
+            <div class="generation-scroll">
+              <label class="field">
+                <span>기본 프롬프트</span>
+                <textarea id="basePrompt" placeholder="masterpiece, best quality"></textarea>
+              </label>
+              <label class="field">
+                <span>네거티브 프롬프트</span>
+                <textarea id="negativePrompt"></textarea>
+              </label>
+              <div class="style-subhead">
+                <h3>캐릭터 프롬프트</h3>
+                <button id="addCharacterPrompt" class="icon-button" type="button" title="캐릭터 프롬프트 추가" aria-label="캐릭터 프롬프트 추가">＋</button>
+              </div>
+              <div id="characterPromptList" class="character-prompt-list"></div>
+              <div class="generation-grid">
+                <label class="field"><span>너비</span><input id="generationWidth" type="number" min="64" step="64" value="832"></label>
+                <label class="field"><span>높이</span><input id="generationHeight" type="number" min="64" step="64" value="1216"></label>
+                <label class="field generation-wide"><span>샘플러</span><select id="generationSampler"><option value="k_euler_ancestral">Euler Ancestral</option><option value="k_dpmpp_2m">DPM++ 2M</option><option value="k_dpmpp_sde">DPM++ SDE</option></select></label>
+                <label class="field"><span>스텝</span><input id="generationSteps" type="number" min="1" max="50" value="28"></label>
+                <label class="field"><span>스케일</span><input id="generationScale" type="number" min="0" step="0.1" value="5"></label>
+                <label class="field generation-wide"><span>CFG Rescale</span><input id="generationCfgRescale" type="number" min="0" max="1" step="0.01" value="0"></label>
+              </div>
+              <button id="generateOne" class="primary generation-button" type="button">1장 생성</button>
+              <section id="latestStyleResult" class="latest-style-result" aria-live="polite">
+                <div class="latest-result-placeholder">최근 생성 결과가 여기에 표시됩니다.</div>
+              </section>
+            </div>
+          </aside>
+        </div>
+      </section>
     </main>
 
     <div id="manualPreviewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="manualPreviewTitle">
@@ -234,5 +351,6 @@
     </div>
 
     <script src="{{ url_for('static', filename='app.js') }}"></script>
+    <script src="{{ url_for('static', filename='style_maker.js') }}"></script>
   </body>
 </html>

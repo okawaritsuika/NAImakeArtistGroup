@@ -468,9 +468,342 @@ textarea {
   gap: 8px;
 }
 
+.style-maker-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(420px, 1fr) minmax(300px, 380px);
+  gap: 10px;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.style-maker-pane {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.style-maker-settings,
+.style-maker-generation {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.style-pane-head,
+.style-editor-head,
+.style-subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.style-pane-head,
+.style-editor-head {
+  min-height: 48px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.style-pane-head h2 {
+  font-size: 17px;
+}
+
+.style-subhead h3 {
+  font-size: 14px;
+}
+
+.style-settings-body,
+.generation-scroll {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-height: 0;
+  padding: 12px;
+  overflow: auto;
+}
+
+.style-fieldset {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.style-fieldset legend {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+}
+
+.segmented button {
+  min-width: 0;
+  border-radius: 0;
+  padding: 7px 4px;
+}
+
+.segmented button:first-child {
+  border-radius: 6px 0 0 6px;
+}
+
+.segmented button:last-child {
+  border-radius: 0 6px 6px 0;
+}
+
+.segmented button + button {
+  margin-left: -1px;
+}
+
+.segmented button.active {
+  position: relative;
+  z-index: 1;
+  border-color: var(--accent-strong);
+  color: var(--accent-strong);
+  background: #17312f;
+}
+
+.compact-fields,
+.generation-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.generation-wide {
+  grid-column: 1 / -1;
+}
+
+.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  padding: 0;
+  line-height: 1;
+}
+
+.danger-button {
+  color: var(--danger);
+}
+
+.custom-range-section,
+.custom-range-list {
+  display: grid;
+  gap: 7px;
+}
+
+.range-head,
+.custom-range-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr 36px;
+  gap: 6px;
+  align-items: center;
+}
+
+.range-head {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.custom-range-row input {
+  min-width: 0;
+  padding: 7px 5px;
+}
+
+.style-maker-editor {
+  display: grid;
+  grid-template-rows: auto minmax(260px, 1fr) auto auto;
+}
+
+.style-editor-head {
+  align-items: flex-start;
+  flex-direction: column;
+}
+
+.style-editor-head .status {
+  min-height: 0;
+  padding: 0;
+}
+
+.style-toolbar {
+  width: 100%;
+}
+
+.weight-graph {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  padding: 10px;
+  overflow: auto;
+  background: #11161d;
+}
+
+.weight-column {
+  display: grid;
+  grid-template-rows: 28px minmax(150px, 1fr) 34px auto auto 32px 32px;
+  gap: 6px;
+  flex: 0 0 86px;
+  width: 86px;
+  min-height: 310px;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  text-align: center;
+}
+
+.weight-column.dragging {
+  opacity: 0.45;
+}
+
+.drag-handle {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  cursor: grab;
+}
+
+.vertical-weight {
+  width: 28px;
+  height: 100%;
+  min-height: 150px;
+  margin: 0 auto;
+  padding: 0;
+  writing-mode: vertical-lr;
+  direction: rtl;
+}
+
+.weight-number,
+.weight-swap {
+  min-width: 0;
+  padding: 5px 3px;
+  text-align: center;
+}
+
+.weight-artist-label {
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.weight-score {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.weight-column .danger-button {
+  width: 100%;
+}
+
+.artist-add-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(180px, 1fr) 36px;
+  gap: 8px;
+  align-items: end;
+  padding: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.artist-prompt-field {
+  padding: 0 10px 10px;
+}
+
+.artist-prompt-field textarea {
+  min-height: 62px;
+  max-height: 92px;
+  resize: vertical;
+}
+
+.character-prompt-list {
+  display: grid;
+  gap: 8px;
+}
+
+.character-prompt-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 7px;
+  align-items: start;
+}
+
+.character-prompt-row textarea {
+  min-height: 62px;
+}
+
+.generation-button {
+  width: 100%;
+}
+
+.latest-style-result {
+  display: grid;
+  place-items: center;
+  min-height: 220px;
+  overflow: hidden;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  background: #0d1117;
+}
+
+.latest-result-placeholder {
+  padding: 18px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.style-maker-layout.settings-collapsed {
+  grid-template-columns: 50px minmax(420px, 1fr) minmax(300px, 380px);
+}
+
+.settings-collapsed .style-maker-settings .style-pane-head {
+  justify-content: center;
+  padding-inline: 6px;
+}
+
+.settings-collapsed .style-maker-settings h2,
+.settings-collapsed .style-settings-body {
+  display: none;
+}
+
 @media (max-width: 980px) {
   body {
     overflow: auto;
+  }
+
+  .topbar {
+    align-items: stretch;
+    flex-direction: column;
+    height: auto;
+    padding: 10px 14px;
+  }
+
+  .topbar h1 {
+    font-size: 21px;
+  }
+
+  .tabs {
+    flex-wrap: nowrap;
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .tab {
+    flex: 0 0 auto;
+    padding-block: 7px;
   }
 
   main {
@@ -492,5 +825,48 @@ textarea {
 
   .viewer {
     grid-template-columns: 42px 1fr 42px;
+  }
+
+  body.style-maker-active {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  body.style-maker-active main {
+    height: auto;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .style-maker-layout,
+  .style-maker-layout.settings-collapsed {
+    grid-template-columns: 1fr;
+    height: 100%;
+    overflow: auto;
+  }
+
+  .style-maker-pane {
+    min-height: 520px;
+    overflow: visible;
+  }
+
+  .style-maker-settings,
+  .style-maker-generation {
+    grid-template-rows: auto auto;
+  }
+
+  .style-settings-body,
+  .generation-scroll {
+    overflow: visible;
+  }
+
+  .settings-collapsed .style-maker-settings {
+    min-height: 50px;
+  }
+
+  .artist-add-row {
+    grid-template-columns: 1fr 1fr 36px;
   }
 }
