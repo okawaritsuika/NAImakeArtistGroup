@@ -170,6 +170,22 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(control_id=control_id):
                 self.assertIn(f'"{control_id}"', source)
 
+    def test_settings_continuous_generation_and_manager_controls_exist(self):
+        source = JS_PATH.read_text(encoding="utf-8")
+        for marker in (
+            'id="settingsModal"', 'id="novelAiAppKey"', 'id="testNovelAiKey"',
+            'id="generationLimitMode"', 'id="generationCount"', 'id="styleChangeMode"',
+            'id="startContinuous"', 'id="pauseContinuous"', 'id="stopContinuous"',
+            'data-tab="style-manager"', 'id="styleManagerList"', 'id="styleManagerDetail"',
+            'id="generatedImageModal"', 'id="generatedImagePrev"', 'id="generatedImageNext"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        self.assertIn("async function runContinuousGeneration()", source)
+        self.assertIn("await generateCurrentStyle()", source)
+        self.assertIn("async function loadStyleManager()", source)
+        self.assertIn("function renderGeneratedImageModal()", source)
+
     def test_workspace_does_not_nest_panels_or_cards(self):
         parser = NestedWorkspacePanelParser()
         parser.feed(self.html)

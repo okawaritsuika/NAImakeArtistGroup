@@ -7,6 +7,14 @@ const styleState = {
   draggingIndex: null,
   requestToken: 0,
   pending: false,
+  generating: false,
+  running: false,
+  paused: false,
+  stopRequested: false,
+  completed: 0,
+  managerDirty: true,
+  managerImages: [],
+  managerImageIndex: 0,
 };
 
 const STYLE_REQUEST_CONTROL_IDS = [
@@ -476,6 +484,314 @@ function addCharacterPrompt(value = "") {
   list.append(row);
 }
 
+function createRequestId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `style-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function generationNumber(id, fallback) {
+  const value = Number(styleElement(id)?.value);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function readCharacterPrompts() {
+  if (typeof document === "undefined") return [];
+  return [...document.querySelectorAll("#characterPromptList textarea")]
+    .map((input) => input.value.trim())
+    .filter(Boolean);
+}
+
+function buildGenerationRequest(requestId = createRequestId()) {
+  if (!styleState.artists.length) throw new Error("먼저 그림체 작가를 구성하세요.");
+  const width = generationNumber("generationWidth", 832);
+  const height = generationNumber("generationHeight", 1216);
+  const steps = generationNumber("generationSteps", 28);
+  const scale = generationNumber("generationScale", 5);
+  const cfgRescale = generationNumber("generationCfgRescale", 0);
+  if (![width, height].every((value) => Number.isInteger(value) && value > 0 && value % 64 === 0)) {
+    throw new Error("너비와 높이는 64 단위의 양수여야 합니다.");
+  }
+  if (!Number.isInteger(steps) || steps < 1 || steps > 50) throw new Error("스텝은 1~50이어야 합니다.");
+  if (scale < 0 || scale > 10 || cfgRescale < 0 || cfgRescale > 1) throw new Error("생성 수치 범위를 확인하세요.");
+  return {
+    request_id: requestId,
+    artists: styleState.artists.map(({ artist, score, weight }) => ({ artist, score, weight })),
+    base_prompt: styleElement("basePrompt")?.value.trim() || "",
+    negative_prompt: styleElement("negativePrompt")?.value.trim() || "",
+    character_prompts: readCharacterPrompts(),
+    width,
+    height,
+    sampler: styleElement("generationSampler")?.value || "k_euler_ancestral",
+    steps,
+    scale,
+    cfg_rescale: cfgRescale,
+  };
+}
+
+function setGenerationBusy(busy) {
+  styleState.generating = busy;
+  ["generateOne", "startContinuous"].forEach((id) => {
+    const button = styleElement(id);
+    if (button) button.disabled = busy || styleState.running;
+  });
+}
+
+function renderGenerationResult(result) {
+  const target = styleElement("latestStyleResult");
+  if (!target) return;
+  target.replaceChildren();
+  const image = document.createElement("img");
+  image.src = result.image_url;
+  image.alt = `그림체 ${result.style_id} 생성 결과`;
+  const meta = document.createElement("div");
+  meta.className = "latest-result-meta";
+  meta.textContent = `그림체 #${result.style_id} · Seed ${result.seed}`;
+  target.append(image, meta);
+}
+
+async function generateCurrentStyle() {
+  if (styleState.generating) throw new Error("이미 생성 중입니다.");
+  let payload;
+  try {
+    payload = buildGenerationRequest();
+  } catch (error) {
+    showStyleStatus(error.message, "error");
+    throw error;
+  }
+  setGenerationBusy(true);
+  showStyleStatus("NovelAI에서 이미지를 생성하는 중입니다...");
+  try {
+    const result = await apiFetch("/api/style-maker/generate", { method: "POST", body: JSON.stringify(payload) });
+    renderGenerationResult(result);
+    styleState.managerDirty = true;
+    showStyleStatus("이미지를 생성하고 자동 저장했습니다.", "ok");
+    return result;
+  } catch (error) {
+    showStyleStatus(error.message, "error");
+    throw error;
+  } finally {
+    setGenerationBusy(false);
+  }
+}
+
+function reachedGenerationLimit() {
+  if (styleElement("generationLimitMode")?.value === "unlimited") return false;
+  return styleState.completed >= Math.max(1, Math.trunc(generationNumber("generationCount", 1)));
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function renderQueueState() {
+  const status = styleElement("generationStatus");
+  const pause = styleElement("pauseContinuous");
+  const stop = styleElement("stopContinuous");
+  if (status) status.textContent = styleState.running
+    ? `${styleState.completed}장 완료${styleState.paused ? " · 일시정지" : ""}`
+    : styleState.completed ? `${styleState.completed}장 생성 완료` : "";
+  if (pause) {
+    pause.disabled = !styleState.running;
+    pause.textContent = styleState.paused ? "계속" : "일시정지";
+  }
+  if (stop) stop.disabled = !styleState.running;
+  const start = styleElement("startContinuous");
+  if (start) start.disabled = styleState.running || styleState.generating;
+}
+
+async function runContinuousGeneration() {
+  if (styleState.running || styleState.generating) return;
+  styleState.running = true;
+  styleState.paused = false;
+  styleState.stopRequested = false;
+  styleState.completed = 0;
+  renderQueueState();
+  try {
+    while (!styleState.stopRequested && !reachedGenerationLimit()) {
+      while (styleState.paused && !styleState.stopRequested) await wait(150);
+      if (styleState.stopRequested) break;
+      const changeMode = styleElement("styleChangeMode")?.value || "weights";
+      const rerolled = await loadStyleArtists(changeMode === "artists_and_weights" ? "all" : "weights");
+      if (!rerolled) throw new Error("그림체를 다시 구성하지 못했습니다.");
+      await generateCurrentStyle();
+      styleState.completed += 1;
+      renderQueueState();
+    }
+  } catch (error) {
+    styleState.paused = true;
+    showStyleStatus(error.message, "error");
+  } finally {
+    styleState.running = false;
+    renderQueueState();
+  }
+}
+
+async function openSettingsModal() {
+  styleElement("settingsModal")?.classList.remove("hidden");
+  const status = styleElement("novelAiSettingsStatus");
+  try {
+    const data = await apiFetch("/api/settings/novelai");
+    if (status) status.textContent = data.configured ? "저장된 키가 있습니다." : "저장된 키가 없습니다.";
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
+function closeSettingsModal() {
+  styleElement("settingsModal")?.classList.add("hidden");
+  const input = styleElement("novelAiAppKey");
+  if (input) input.value = "";
+}
+
+async function saveNovelAiKey() {
+  const key = styleElement("novelAiAppKey")?.value || "";
+  const status = styleElement("novelAiSettingsStatus");
+  try {
+    await apiFetch("/api/settings/novelai", { method: "PUT", body: JSON.stringify({ app_key: key }) });
+    if (styleElement("novelAiAppKey")) styleElement("novelAiAppKey").value = "";
+    if (status) status.textContent = "App Key를 저장했습니다.";
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
+async function testNovelAiKey() {
+  const status = styleElement("novelAiSettingsStatus");
+  try {
+    const data = await apiFetch("/api/settings/novelai/test", { method: "POST" });
+    if (status) status.textContent = `연결 성공 · Anlas ${data.anlas}`;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
+async function deleteNovelAiKey() {
+  if (!confirm("저장된 NovelAI App Key를 삭제할까요?")) return;
+  const status = styleElement("novelAiSettingsStatus");
+  try {
+    await apiFetch("/api/settings/novelai", { method: "DELETE" });
+    if (status) status.textContent = "저장된 키를 삭제했습니다.";
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
+function renderStyleManagerList(styles) {
+  const list = styleElement("styleManagerList");
+  if (!list) return;
+  list.replaceChildren();
+  styles.forEach((style) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "style-manager-item";
+    if (style.representative_image_url) {
+      const image = document.createElement("img");
+      image.src = style.representative_image_url;
+      image.alt = "그림체 대표 이미지";
+      image.loading = "lazy";
+      button.append(image);
+    }
+    const body = document.createElement("span");
+    body.className = "style-manager-item-body";
+    const title = document.createElement("strong");
+    title.textContent = `그림체 #${style.id}`;
+    const info = document.createElement("span");
+    info.textContent = `작가 ${style.artists.length}명 · 이미지 ${style.image_count}장`;
+    body.append(title, info);
+    button.append(body);
+    button.addEventListener("click", () => loadStyleDetail(style.id));
+    list.append(button);
+  });
+}
+
+async function loadStyleManager() {
+  const status = styleElement("styleManagerStatus");
+  try {
+    const styles = await apiFetch("/api/art-styles");
+    renderStyleManagerList(styles);
+    styleState.managerDirty = false;
+    if (status) status.textContent = styles.length ? `${styles.length}개 그림체` : "저장된 그림체가 없습니다.";
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
+function appendMetaRow(parent, label, value) {
+  const row = document.createElement("div");
+  const term = document.createElement("strong");
+  term.textContent = label;
+  const text = document.createElement("span");
+  text.textContent = value || "없음";
+  row.append(term, text);
+  parent.append(row);
+}
+
+async function loadStyleDetail(styleId) {
+  const detail = await apiFetch(`/api/art-styles/${styleId}`);
+  const target = styleElement("styleManagerDetail");
+  if (!target) return;
+  target.replaceChildren();
+  const heading = document.createElement("h2");
+  heading.textContent = `그림체 #${detail.id}`;
+  const prompt = document.createElement("textarea");
+  prompt.readOnly = true;
+  prompt.value = detail.artist_prompt;
+  prompt.className = "manager-prompt";
+  const artists = document.createElement("div");
+  artists.className = "manager-artists";
+  detail.artists.forEach((item, index) => {
+    const row = document.createElement("span");
+    row.textContent = `${index + 1}. ${item.artist} · ${formatStyleWeight(item.weight)}`;
+    artists.append(row);
+  });
+  const gallery = document.createElement("div");
+  gallery.className = "manager-gallery";
+  detail.images.forEach((item, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    const image = document.createElement("img");
+    image.src = item.image_url;
+    image.alt = `생성 이미지 ${index + 1}`;
+    image.loading = "lazy";
+    button.append(image);
+    button.addEventListener("click", () => openGeneratedImage(detail.images, index));
+    gallery.append(button);
+  });
+  target.append(heading, artists, prompt, gallery);
+}
+
+function openGeneratedImage(images, index) {
+  styleState.managerImages = images;
+  styleState.managerImageIndex = index;
+  styleElement("generatedImageModal")?.classList.remove("hidden");
+  renderGeneratedImageModal();
+}
+
+function closeGeneratedImage() {
+  styleElement("generatedImageModal")?.classList.add("hidden");
+}
+
+function moveGeneratedImage(delta) {
+  const length = styleState.managerImages.length;
+  if (!length) return;
+  styleState.managerImageIndex = (styleState.managerImageIndex + delta + length) % length;
+  renderGeneratedImageModal();
+}
+
+function renderGeneratedImageModal() {
+  const item = styleState.managerImages[styleState.managerImageIndex];
+  if (!item) return;
+  const image = styleElement("generatedImageFull");
+  if (image) image.src = item.image_url;
+  const meta = styleElement("generatedImageMeta");
+  if (!meta) return;
+  meta.replaceChildren();
+  appendMetaRow(meta, "기본 프롬프트", item.base_prompt);
+  appendMetaRow(meta, "네거티브", item.negative_prompt);
+  appendMetaRow(meta, "캐릭터", (item.character_prompts || []).join(" / "));
+  appendMetaRow(meta, "생성 설정", `${item.width}×${item.height} · ${item.sampler} · ${item.steps} steps · CFG ${item.scale} · Seed ${item.seed}`);
+}
+
 function toggleStyleSettings() {
   const layout = styleElement("styleMakerLayout");
   const button = styleElement("toggleStyleSettings");
@@ -528,7 +844,21 @@ function initializeStyleMaker() {
   styleElement("styleArtistSearch")?.addEventListener("input", renderRatedArtistSelect);
   styleElement("addStyleArtist")?.addEventListener("click", addStyleArtist);
   styleElement("addCharacterPrompt")?.addEventListener("click", () => addCharacterPrompt());
-  styleElement("generateOne")?.addEventListener("click", () => showStyleStatus("이미지 생성 연결은 다음 작업에서 활성화됩니다."));
+  styleElement("generateOne")?.addEventListener("click", () => generateCurrentStyle().catch(() => {}));
+  styleElement("startContinuous")?.addEventListener("click", runContinuousGeneration);
+  styleElement("pauseContinuous")?.addEventListener("click", () => {
+    styleState.paused = !styleState.paused;
+    renderQueueState();
+  });
+  styleElement("stopContinuous")?.addEventListener("click", () => {
+    styleState.stopRequested = true;
+    styleState.paused = false;
+    renderQueueState();
+  });
+  styleElement("generationLimitMode")?.addEventListener("change", (event) => {
+    const count = styleElement("generationCount");
+    if (count) count.disabled = event.target.value === "unlimited";
+  });
   ["styleMinWeight", "styleMaxWeight"].forEach((id) => styleElement(id)?.addEventListener("change", renderWeightGraph));
 
   addCharacterPrompt();
@@ -544,7 +874,27 @@ if (typeof document !== "undefined") {
       const isStyleMaker = button.dataset.tab === "style-maker";
       document.body.classList.toggle("style-maker-active", isStyleMaker);
       if (isStyleMaker) initializeStyleMaker();
+      if (button.dataset.tab === "style-manager" && styleState.managerDirty) loadStyleManager();
     });
+  });
+
+  styleElement("openSettings")?.addEventListener("click", openSettingsModal);
+  styleElement("closeSettings")?.addEventListener("click", closeSettingsModal);
+  document.querySelectorAll("[data-close-settings]").forEach((item) => item.addEventListener("click", closeSettingsModal));
+  styleElement("saveNovelAiKey")?.addEventListener("click", saveNovelAiKey);
+  styleElement("testNovelAiKey")?.addEventListener("click", testNovelAiKey);
+  styleElement("deleteNovelAiKey")?.addEventListener("click", deleteNovelAiKey);
+  styleElement("refreshStyleManager")?.addEventListener("click", loadStyleManager);
+  styleElement("generatedImageClose")?.addEventListener("click", closeGeneratedImage);
+  document.querySelectorAll("[data-close-generated-image]").forEach((item) => item.addEventListener("click", closeGeneratedImage));
+  styleElement("generatedImagePrev")?.addEventListener("click", () => moveGeneratedImage(-1));
+  styleElement("generatedImageNext")?.addEventListener("click", () => moveGeneratedImage(1));
+  document.addEventListener("keydown", (event) => {
+    const modal = styleElement("generatedImageModal");
+    if (!modal || modal.classList.contains("hidden")) return;
+    if (event.key === "Escape") closeGeneratedImage();
+    if (event.key === "ArrowLeft") moveGeneratedImage(-1);
+    if (event.key === "ArrowRight") moveGeneratedImage(1);
   });
 }
 
@@ -558,5 +908,6 @@ if (typeof module !== "undefined" && module.exports) {
     runLatestStyleRequest,
     sortArtistsByWeight,
     validateCustomRangeValues,
+    reachedGenerationLimit,
   };
 }

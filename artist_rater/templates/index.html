@@ -16,6 +16,8 @@
         <button class="tab active" data-tab="pick">작가 뽑기</button>
         <button class="tab" data-tab="ratings">평가 관리</button>
         <button class="tab" data-tab="style-maker">그림체 제작</button>
+        <button class="tab" data-tab="style-manager">그림체 관리</button>
+        <button id="openSettings" class="icon-button" type="button" title="NovelAI 설정" aria-label="NovelAI 설정">⚙</button>
       </nav>
     </header>
 
@@ -315,7 +317,24 @@
                 <label class="field"><span>스케일</span><input id="generationScale" type="number" min="0" step="0.1" value="5"></label>
                 <label class="field generation-wide"><span>CFG Rescale</span><input id="generationCfgRescale" type="number" min="0" max="1" step="0.01" value="0"></label>
               </div>
-              <button id="generateOne" class="primary generation-button" type="button">1장 생성</button>
+              <div class="continuous-controls">
+                <label class="field">
+                  <span>실행 방식</span>
+                  <select id="generationLimitMode"><option value="count">지정 장수</option><option value="unlimited">중지할 때까지</option></select>
+                </label>
+                <label class="field"><span>생성 장수</span><input id="generationCount" type="number" min="1" max="1000" value="10"></label>
+                <label class="field generation-wide">
+                  <span>매 장 그림체 변경</span>
+                  <select id="styleChangeMode"><option value="weights">가중치만 변경</option><option value="artists_and_weights">작가·가중치 모두 변경</option></select>
+                </label>
+              </div>
+              <div class="generation-actions">
+                <button id="generateOne" class="primary" type="button">1장 생성</button>
+                <button id="startContinuous" class="primary" type="button">연속 생성</button>
+                <button id="pauseContinuous" type="button" disabled>일시정지</button>
+                <button id="stopContinuous" class="ghost" type="button" disabled>중지</button>
+              </div>
+              <div id="generationStatus" class="status" role="status"></div>
               <section id="latestStyleResult" class="latest-style-result" aria-live="polite">
                 <div class="latest-result-placeholder">최근 생성 결과가 여기에 표시됩니다.</div>
               </section>
@@ -323,7 +342,45 @@
           </aside>
         </div>
       </section>
+
+      <section id="style-manager-tab" class="view style-manager-view">
+        <aside class="style-manager-list-pane">
+          <div class="style-pane-head"><h2>그림체 목록</h2><button id="refreshStyleManager" type="button">새로고침</button></div>
+          <div id="styleManagerStatus" class="status"></div>
+          <div id="styleManagerList" class="style-manager-list"></div>
+        </aside>
+        <section id="styleManagerDetail" class="style-manager-detail">
+          <div class="latest-result-placeholder">확인할 그림체를 선택하세요.</div>
+        </section>
+      </section>
     </main>
+
+    <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-backdrop" data-close-settings></div>
+      <section class="modal-dialog compact-modal">
+        <div class="modal-head"><h2 id="settingsTitle">NovelAI 설정</h2><button id="closeSettings" class="ghost" type="button">닫기</button></div>
+        <label class="field"><span>App Key</span><input id="novelAiAppKey" type="password" autocomplete="off" placeholder="저장된 키는 다시 표시하지 않습니다"></label>
+        <div id="novelAiSettingsStatus" class="status" role="status"></div>
+        <div class="modal-actions">
+          <button id="testNovelAiKey" type="button">연결 테스트</button>
+          <button id="deleteNovelAiKey" class="ghost" type="button">키 삭제</button>
+          <button id="saveNovelAiKey" class="primary" type="button">저장</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="generatedImageModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="generatedImageTitle">
+      <div class="modal-backdrop" data-close-generated-image></div>
+      <section class="modal-dialog generated-image-dialog">
+        <div class="modal-head"><h2 id="generatedImageTitle">생성 이미지</h2><button id="generatedImageClose" class="ghost" type="button">닫기</button></div>
+        <div class="generated-image-viewer">
+          <button id="generatedImagePrev" class="arrow" type="button" aria-label="이전 이미지">‹</button>
+          <img id="generatedImageFull" alt="generated image">
+          <button id="generatedImageNext" class="arrow" type="button" aria-label="다음 이미지">›</button>
+        </div>
+        <div id="generatedImageMeta" class="generated-image-meta"></div>
+      </section>
+    </div>
 
     <div id="manualPreviewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="manualPreviewTitle">
       <div class="modal-backdrop" data-close-manual-preview></div>

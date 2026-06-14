@@ -780,6 +780,137 @@ textarea {
   text-align: center;
 }
 
+.continuous-controls {
+  display: grid;
+  grid-template-columns: 1fr 110px;
+  gap: 8px;
+}
+
+.continuous-controls .generation-wide {
+  grid-column: 1 / -1;
+}
+
+.generation-actions,
+.modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.latest-style-result img {
+  width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+}
+
+.latest-result-meta {
+  padding: 8px;
+  color: var(--muted);
+}
+
+.compact-modal {
+  width: min(520px, 94vw);
+  height: auto;
+  grid-template-rows: auto auto auto auto;
+  gap: 14px;
+}
+
+.style-manager-view.active {
+  display: grid;
+  grid-template-columns: minmax(250px, 330px) minmax(0, 1fr);
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
+.style-manager-list-pane,
+.style-manager-detail {
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.style-manager-list,
+.style-manager-item-body,
+.manager-artists {
+  display: grid;
+  gap: 8px;
+}
+
+.style-manager-item {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  padding: 8px;
+  text-align: left;
+}
+
+.style-manager-item img {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+}
+
+.manager-prompt {
+  width: 100%;
+  min-height: 84px;
+  margin: 12px 0;
+}
+
+.manager-gallery {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.manager-gallery button {
+  padding: 0;
+  overflow: hidden;
+  aspect-ratio: 3 / 4;
+}
+
+.manager-gallery img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.generated-image-dialog {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.generated-image-viewer {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  gap: 8px;
+  align-items: center;
+  min-height: 0;
+}
+
+.generated-image-viewer img {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  object-fit: contain;
+  background: #0b0d11;
+}
+
+.generated-image-meta {
+  display: grid;
+  gap: 6px;
+  max-height: 180px;
+  overflow: auto;
+  padding-top: 10px;
+}
+
+.generated-image-meta > div {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 8px;
+}
+
 .style-maker-layout.settings-collapsed {
   grid-template-columns: 50px minmax(0, 1fr) minmax(280px, 340px);
 }
@@ -883,5 +1014,10 @@ textarea {
 
   .artist-add-row {
     grid-template-columns: 1fr 1fr 36px;
+  }
+
+  .style-manager-view.active {
+    grid-template-columns: 1fr;
+    height: auto;
   }
 }
