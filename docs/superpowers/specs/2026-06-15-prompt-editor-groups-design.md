@@ -14,6 +14,8 @@ Make the style-generation workspace wider and replace the narrow raw prompt fiel
 ## Prompt Editors
 
 - Base, negative, and each character prompt use a token surface inspired by the inpainting NovelAI modal in `NAI_Image_Manager_1.0/static/canvas.*`.
+- Base and negative prompts share one full-width editor area with tabs above it. The base tab is selected initially, and switching tabs changes only which editor is visible.
+- Tab switching never changes prompt text, token groups, or saved state.
 - Commas delimit tokens. Existing NovelAI grouping and weight syntax inside a token is preserved as text.
 - Each surface provides a compact text input for adding or editing prompt text and renders parsed tokens as draggable chips.
 - Token order remains stable unless the user explicitly reorders it.
@@ -58,4 +60,3 @@ Make the style-generation workspace wider and replace the narrow raw prompt fiel
 - Unit tests cover parsing/joining, disabled-group filtering, duplicate prevention, stale-reference cleanup, and legacy localStorage migration.
 - Frontend contract tests cover required prompt surfaces and group controls.
 - Browser verification checks the desktop layout for no horizontal pane scroll, drag/drop behavior, group ON/OFF filtering, persistence after reload, and responsive fallback.
-
