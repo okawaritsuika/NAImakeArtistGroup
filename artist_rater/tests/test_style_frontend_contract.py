@@ -129,6 +129,17 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, script)
 
+    def test_style_manager_supports_whole_style_deletion(self):
+        script = JS_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "그림체 삭제",
+            "생성 이미지도 함께 삭제됩니다",
+            'method: "DELETE"',
+            "function deleteManagedStyle",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, script)
+
     def test_compact_generation_parameter_panel_and_prompt_persistence_exist(self):
         for marker in (
             'id="generationParameters"',

@@ -1278,6 +1278,32 @@ function appendMetaRow(parent, label, value) {
   parent.append(row);
 }
 
+function resetStyleManagerDetail() {
+  const target = styleElement("styleManagerDetail");
+  if (!target) return;
+  target.replaceChildren();
+  const placeholder = document.createElement("div");
+  placeholder.className = "latest-result-placeholder";
+  placeholder.textContent = "확인할 그림체를 선택하세요.";
+  target.append(placeholder);
+  styleState.managerImages = [];
+  styleState.managerImageIndex = 0;
+  closeGeneratedImage();
+}
+
+async function deleteManagedStyle(styleId) {
+  if (!confirm("그림체를 삭제할까요? 생성 이미지도 함께 삭제됩니다.")) return;
+  const status = styleElement("styleManagerStatus");
+  try {
+    await apiFetch(`/api/art-styles/${styleId}`, { method: "DELETE" });
+    resetStyleManagerDetail();
+    await loadStyleManager();
+    if (status) status.textContent = "그림체와 생성 이미지를 삭제했습니다.";
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
 async function loadStyleDetail(styleId) {
   const detail = await apiFetch(`/api/art-styles/${styleId}`);
   const target = styleElement("styleManagerDetail");
@@ -1285,6 +1311,11 @@ async function loadStyleDetail(styleId) {
   target.replaceChildren();
   const heading = document.createElement("h2");
   heading.textContent = `그림체 #${detail.id}`;
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "danger-button";
+  deleteButton.textContent = "그림체 삭제";
+  deleteButton.addEventListener("click", () => deleteManagedStyle(detail.id));
   const prompt = document.createElement("textarea");
   prompt.readOnly = true;
   prompt.value = detail.artist_prompt;
@@ -1309,7 +1340,7 @@ async function loadStyleDetail(styleId) {
     button.addEventListener("click", () => openGeneratedImage(detail.images, index));
     gallery.append(button);
   });
-  target.append(heading, artists, prompt, gallery);
+  target.append(heading, deleteButton, artists, prompt, gallery);
 }
 
 function openGeneratedImage(images, index) {
