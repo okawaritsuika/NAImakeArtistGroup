@@ -47,6 +47,7 @@ from novelai import (
 from style_store import (
     SettingsError,
     delete_app_key,
+    delete_style,
     get_style_detail,
     list_styles,
     load_app_key,
@@ -1167,8 +1168,13 @@ def api_art_styles():
     return json_response([_add_generated_urls(item) for item in list_styles(DB_PATH)])
 
 
-@app.route("/api/art-styles/<int:style_id>", methods=["GET"])
+@app.route("/api/art-styles/<int:style_id>", methods=["GET", "DELETE"])
 def api_art_style_detail(style_id):
+    if request.method == "DELETE":
+        deleted = delete_style(DB_PATH, GENERATED_DIR, style_id)
+        if deleted is None:
+            return json_response({"error": "Art style not found."}, 404)
+        return json_response(deleted)
     detail = get_style_detail(DB_PATH, style_id)
     if detail is None:
         return json_response({"error": "Art style not found."}, 404)

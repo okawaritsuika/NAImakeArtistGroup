@@ -949,9 +949,32 @@ class GenerationApiTest(StyleApiTest):
             style_store.delete_style(app.DB_PATH, app.GENERATED_DIR, 999999)
         )
 
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_delete_art_style_api_removes_style_and_image(self, generate):
+        self.save_key()
+        result = self.client.post(
+            "/api/style-maker/generate", json=self.request_payload()
+        ).get_json()
+        image_path = app.GENERATED_DIR / result["image_path"]
+
+        response = self.client.delete(f'/api/art-styles/{result["style_id"]}')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {"style_id": result["style_id"], "deleted": True},
+        )
+        self.assertEqual(
+            self.client.get(f'/api/art-styles/{result["style_id"]}').status_code,
+            404,
+        )
+        self.assertFalse(image_path.exists())
+
     def test_unknown_style_returns_404(self):
-        response = self.client.get("/api/art-styles/999")
-        self.assertEqual(response.status_code, 404)
+        for method in (self.client.get, self.client.delete):
+            with self.subTest(method=method.__name__):
+                response = method("/api/art-styles/999")
+                self.assertEqual(response.status_code, 404)
 
 
 class NovelAISubscriptionTest(unittest.TestCase):
