@@ -129,6 +129,64 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, script)
 
+    def test_compact_generation_parameter_panel_and_prompt_persistence_exist(self):
+        for marker in (
+            'id="generationParameters"',
+            'id="toggleGenerationParameters"',
+            'id="generationModel"',
+            'id="generationResolutionPreset"',
+            'id="generationScheduler"',
+            'id="generationScaleRange"',
+            'id="generationCfgRescaleRange"',
+            'id="generationSeed"',
+            'id="generationSeedFixed"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        script = JS_PATH.read_text(encoding="utf-8")
+        self.assertIn('naiArtistRater.prompts.v1', script)
+        self.assertIn('localStorage.setItem', script)
+        self.assertIn('localStorage.getItem', script)
+
+    def test_prompt_token_editors_and_drag_groups_exist(self):
+        for marker in (
+            'class="prompt-workspace"',
+            'id="basePromptTokens"',
+            'id="negativePromptTokens"',
+            'id="addPromptGroup"',
+            'id="promptGroupList"',
+            'class="prompt-control-groups"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        source = JS_PATH.read_text(encoding="utf-8")
+        for marker in (
+            'application/x-style-prompt-token',
+            'function renderPromptTokens',
+            'function renderPromptGroups',
+            'function addPromptGroup',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, source)
+
+    def test_base_and_negative_prompts_use_tabs(self):
+        for marker in (
+            'class="prompt-tabs"',
+            'role="tablist"',
+            'id="basePromptTab"',
+            'aria-controls="basePromptPanel"',
+            'aria-selected="true"',
+            'id="negativePromptTab"',
+            'aria-controls="negativePromptPanel"',
+            'id="basePromptPanel"',
+            'id="negativePromptPanel"',
+            'class="field prompt-editor negative hidden"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        source = JS_PATH.read_text(encoding="utf-8")
+        self.assertIn("function selectPromptTab", source)
+
     def test_editor_script_exposes_state_and_required_operations(self):
         source = JS_PATH.read_text(encoding="utf-8")
         for marker in (
@@ -156,7 +214,7 @@ class StyleFrontendContractTest(unittest.TestCase):
             ".style-maker-layout",
             "minmax(210px, 280px)",
             "minmax(0, 1fr)",
-            "minmax(280px, 340px)",
+            "minmax(520px, 640px)",
             "overflow: auto",
             ".weight-column",
             "grid-template-columns: 1fr",
@@ -165,9 +223,21 @@ class StyleFrontendContractTest(unittest.TestCase):
                 self.assertIn(marker, self.css)
 
     def test_workspace_switches_before_the_981_to_1008_pixel_clipping_range(self):
-        self.assertIn("@media (max-width: 1040px)", self.css)
-        self.assertIn("grid-template-columns: minmax(210px, 280px) minmax(0, 1fr) minmax(280px, 340px)", self.css)
+        self.assertIn("@media (max-width: 1320px)", self.css)
+        self.assertIn("grid-template-columns: minmax(210px, 280px) minmax(0, 1fr) minmax(520px, 640px)", self.css)
         self.assertIn("overflow-x: auto", self.css)
+
+    def test_prompt_workspace_and_groups_have_responsive_styles(self):
+        for marker in (
+            ".prompt-workspace",
+            ".prompt-token-surface",
+            ".prompt-token-chip",
+            ".prompt-control-group",
+            ".prompt-group-drop-zone",
+            ".prompt-group-item",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.css)
 
     def test_score_and_drag_controls_expose_accessible_state(self):
         source = JS_PATH.read_text(encoding="utf-8")

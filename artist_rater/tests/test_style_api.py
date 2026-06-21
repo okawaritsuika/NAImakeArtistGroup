@@ -329,6 +329,7 @@ class NovelAIGenerationTest(unittest.TestCase):
             "scale": 5.0,
             "cfg_rescale": 0.4,
             "sampler": "k_euler_ancestral",
+            "noise_schedule": "native",
             "base_prompt": "masterpiece",
             "negative_prompt": "lowres",
             "character_prompts": [" hero ", " villain "],
@@ -391,6 +392,14 @@ class NovelAIGenerationTest(unittest.TestCase):
             },
         )
         self.assertEqual(MODEL, payload["model"])
+
+    def test_generation_payload_uses_selected_noise_schedule(self):
+        from novelai import build_generation_payload
+
+        payload = build_generation_payload(
+            self.generation_data(noise_schedule="karras"), "artist", 42
+        )
+        self.assertEqual(payload["parameters"]["noise_schedule"], "karras")
 
     def test_generation_transport_posts_json_and_extracts_first_png(self):
         from novelai import GENERATION_URL, generate_novelai_png
@@ -539,6 +548,7 @@ class GenerationApiTest(StyleApiTest):
             "width": 832,
             "height": 1216,
             "sampler": "k_euler_ancestral",
+            "noise_schedule": "karras",
             "steps": 28,
             "scale": 5.0,
             "cfg_rescale": 0.4,
@@ -561,10 +571,12 @@ class GenerationApiTest(StyleApiTest):
             set(data),
             {
                 "style_id", "image_id", "image_url", "image_path", "artist_prompt", "seed",
-                "width", "height", "sampler", "steps", "scale", "cfg_rescale", "model",
+                "width", "height", "sampler", "noise_schedule", "steps", "scale", "cfg_rescale", "model",
             },
         )
+
         self.assertEqual(data["sampler"], "k_euler_ancestral")
+        self.assertEqual(data["noise_schedule"], "karras")
         self.assertEqual(data["steps"], 28)
         self.assertEqual(data["scale"], 5.0)
         self.assertEqual(data["cfg_rescale"], 0.4)
@@ -585,6 +597,7 @@ class GenerationApiTest(StyleApiTest):
         self.assertEqual(image["width"], 832)
         self.assertEqual(image["height"], 1216)
         self.assertEqual(image["sampler"], "k_euler_ancestral")
+        self.assertEqual(image["noise_schedule"], "karras")
         self.assertEqual(image["steps"], 28)
         self.assertEqual(image["scale"], 5.0)
         self.assertEqual(image["cfg_rescale"], 0.4)

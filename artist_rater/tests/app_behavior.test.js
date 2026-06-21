@@ -71,7 +71,7 @@ global.document = {
 };
 global.window = { location: { origin: "http://localhost" } };
 
-const { renderRatingCard } = require("../static/app.js");
+const { renderRatingCard, manualPreviewRatingFields } = require("../static/app.js");
 
 test("rating cards render hostile stored data as inert text and reject unsafe image URLs", () => {
   const hostile = '<img src=x onerror="globalThis.xss = true">';
@@ -96,4 +96,20 @@ test("rating cards render hostile stored data as inert text and reject unsafe im
   for (const action of ["copy", "edit", "delete", "apply"]) {
     assert.equal(typeof card.querySelector(`[data-action="${action}"]`).listeners.click, "function");
   }
+  assert.equal(typeof card.querySelector('[data-action="find-thumbnail"]').listeners.click, "function");
+});
+
+test("manual ratings reuse the selected preview only for the same artist and tags", () => {
+  const preview = {
+    artist: "artist_a",
+    queryTags: ["solo"],
+    sample: { id: 123, preview_url: "https://example.test/preview.jpg" },
+    sampleIds: [123, 456],
+  };
+  assert.deepEqual(manualPreviewRatingFields("artist_a", ["solo"], preview), {
+    representative_post_id: 123,
+    representative_preview_url: "https://example.test/preview.jpg",
+    sample_post_ids: [123, 456],
+  });
+  assert.deepEqual(manualPreviewRatingFields("artist_b", ["solo"], preview), {});
 });

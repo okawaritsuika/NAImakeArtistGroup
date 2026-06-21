@@ -17,6 +17,7 @@
         <button class="tab" data-tab="ratings">평가 관리</button>
         <button class="tab" data-tab="style-maker">그림체 제작</button>
         <button class="tab" data-tab="style-manager">그림체 관리</button>
+        <button class="tab" data-tab="arca-style-collector">공유 그림체 수집</button>
         <button id="openSettings" class="icon-button" type="button" title="NovelAI 설정" aria-label="NovelAI 설정">⚙</button>
       </nav>
     </header>
@@ -294,27 +295,48 @@
           <aside id="styleMakerGeneration" class="style-maker-pane style-maker-generation">
             <div class="style-pane-head"><h2>프롬프트와 생성</h2></div>
             <div class="generation-scroll">
-              <label class="field">
-                <span>기본 프롬프트</span>
-                <textarea id="basePrompt" placeholder="masterpiece, best quality"></textarea>
-              </label>
-              <label class="field">
-                <span>네거티브 프롬프트</span>
-                <textarea id="negativePrompt"></textarea>
-              </label>
+              <div class="prompt-workspace">
+                <div class="prompt-tabs" role="tablist" aria-label="프롬프트 종류">
+                  <button id="basePromptTab" class="prompt-tab active" type="button" role="tab" aria-selected="true" aria-controls="basePromptPanel" data-prompt-tab="base">기본 프롬프트</button>
+                  <button id="negativePromptTab" class="prompt-tab" type="button" role="tab" aria-selected="false" aria-controls="negativePromptPanel" data-prompt-tab="negative" tabindex="-1">네거티브 프롬프트</button>
+                </div>
+                <label id="basePromptPanel" class="field prompt-editor" role="tabpanel" aria-labelledby="basePromptTab">
+                  <span>기본 프롬프트</span>
+                  <textarea id="basePrompt" placeholder="masterpiece, best quality"></textarea>
+                  <div id="basePromptTokens" class="prompt-token-surface" data-prompt-field="base" aria-label="기본 프롬프트 토큰"></div>
+                </label>
+                <label id="negativePromptPanel" class="field prompt-editor negative hidden" role="tabpanel" aria-labelledby="negativePromptTab">
+                  <span>네거티브 프롬프트</span>
+                  <textarea id="negativePrompt"></textarea>
+                  <div id="negativePromptTokens" class="prompt-token-surface" data-prompt-field="negative" aria-label="네거티브 프롬프트 토큰"></div>
+                </label>
+              </div>
               <div class="style-subhead">
                 <h3>캐릭터 프롬프트</h3>
                 <button id="addCharacterPrompt" class="icon-button" type="button" title="캐릭터 프롬프트 추가" aria-label="캐릭터 프롬프트 추가">＋</button>
               </div>
               <div id="characterPromptList" class="character-prompt-list"></div>
-              <div class="generation-grid">
-                <label class="field"><span>너비</span><input id="generationWidth" type="number" min="64" step="64" value="832"></label>
-                <label class="field"><span>높이</span><input id="generationHeight" type="number" min="64" step="64" value="1216"></label>
-                <label class="field generation-wide"><span>샘플러</span><select id="generationSampler"><option value="k_euler_ancestral">Euler Ancestral</option><option value="k_dpmpp_2m">DPM++ 2M</option><option value="k_dpmpp_sde">DPM++ SDE</option></select></label>
-                <label class="field"><span>스텝</span><input id="generationSteps" type="number" min="1" max="50" value="28"></label>
-                <label class="field"><span>스케일</span><input id="generationScale" type="number" min="0" step="0.1" value="5"></label>
-                <label class="field generation-wide"><span>CFG Rescale</span><input id="generationCfgRescale" type="number" min="0" max="1" step="0.01" value="0"></label>
-              </div>
+              <section class="prompt-control-groups">
+                <div class="style-subhead">
+                  <h3>프롬프트 그룹</h3>
+                  <button id="addPromptGroup" class="icon-button" type="button" title="프롬프트 그룹 추가" aria-label="프롬프트 그룹 추가">＋</button>
+                </div>
+                <div id="promptGroupList" class="prompt-group-list"></div>
+              </section>
+              <section id="generationParameters" class="generation-parameters">
+                <button id="toggleGenerationParameters" class="generation-parameters-toggle" type="button" aria-expanded="true">▼ 생성 파라미터 닫기</button>
+                <div class="generation-parameters-body">
+                  <label class="parameter-row"><span>모델</span><input id="generationModel" value="NAID4.5F" readonly></label>
+                  <label class="parameter-row"><span>해상도</span><select id="generationResolutionPreset"><option value="832x1216" selected>832 × 1216</option><option value="1216x832">1216 × 832</option><option value="1024x1024">1024 × 1024</option><option value="custom">직접 입력</option></select></label>
+                  <div class="parameter-row resolution-inputs"><span>직접 입력</span><input id="generationWidth" type="number" min="64" step="64" value="832" aria-label="너비"><input id="generationHeight" type="number" min="64" step="64" value="1216" aria-label="높이"></div>
+                  <label class="parameter-row"><span>샘플러</span><select id="generationSampler"><option value="k_euler_ancestral">k_euler_ancestral</option><option value="k_dpmpp_2m">k_dpmpp_2m</option><option value="k_dpmpp_sde">k_dpmpp_sde</option></select></label>
+                  <label class="parameter-row"><span>스케줄러</span><select id="generationScheduler"><option value="native" selected>native</option><option value="karras">karras</option><option value="exponential">exponential</option><option value="polyexponential">polyexponential</option></select></label>
+                  <label class="parameter-row"><span>Steps</span><input id="generationSteps" type="number" min="1" max="50" value="28"></label>
+                  <div class="parameter-row range-parameter"><span>CFG Scale</span><input id="generationScaleRange" type="range" min="0" max="10" step="0.1" value="5"><input id="generationScale" type="number" min="0" max="10" step="0.1" value="5"></div>
+                  <div class="parameter-row range-parameter"><span>CFG Rescale</span><input id="generationCfgRescaleRange" type="range" min="0" max="1" step="0.01" value="0"><input id="generationCfgRescale" type="number" min="0" max="1" step="0.01" value="0"></div>
+                  <div class="parameter-row seed-parameter"><span>시드</span><input id="generationSeed" type="number" min="1" max="4294967295" placeholder="랜덤"><label class="compact-check"><input id="generationSeedFixed" type="checkbox"> 고정</label></div>
+                </div>
+              </section>
               <div class="continuous-controls">
                 <label class="field">
                   <span>실행 방식</span>
@@ -348,7 +370,52 @@
           <div class="latest-result-placeholder">확인할 그림체를 선택하세요.</div>
         </section>
       </section>
+      <section id="arca-style-collector-tab" class="view arca-style-collector-view">
+        <section class="arca-collection-progress panel" aria-live="polite">
+          <div class="arca-collection-progress-head">
+            <strong>수집 상태</strong>
+            <span id="arcaCollectionState" class="arca-collection-state" data-state="idle">준비</span>
+          </div>
+          <progress id="arcaCollectionProgress" max="100" value="0"></progress>
+          <div id="arcaCollectionCounts">페이지 0/? · 게시글 0/? · 이미지 0개</div>
+          <div class="arca-collection-times">
+            <span id="arcaCollectionElapsed">경과 0초</span>
+            <span id="arcaCollectionEta">남은 시간 계산 중</span>
+          </div>
+        </section>
+        <aside class="arca-collector-panel panel">
+          <h2>아카라이브 그림체 수집</h2>
+          <p class="notice">그림체 공유 제목만 검색합니다.</p>
+          <section class="arca-direct-add">
+            <label class="field"><span>게시글 링크로 추가</span><input id="arcaDirectUrl" type="url" placeholder="https://arca.live/b/aiart/174457459"></label>
+            <button id="collectArcaUrl" type="button">링크로 추가</button>
+          </section>
+          <section class="arca-browser-session">
+            <div><strong>🔞 게시판 로그인</strong><span id="arcaBrowserSessionState" class="status">브라우저 로그인 연결 안 됨</span></div>
+            <button id="importArcaBrowserSession" type="button">브라우저 로그인 가져오기</button>
+          </section>
+          <div class="check-row"><label><input id="arcaTabNai" type="checkbox" checked> NAI</label><label><input id="arcaTabR18Nai" type="checkbox" checked> 🔞 NAI</label></div>
+          <label class="field"><span>시작일</span><input id="arcaStartDate" type="date"></label><label class="field"><span>종료일</span><input id="arcaEndDate" type="date"></label>
+          <div id="arcaSearchCoverage" class="status"></div><button id="collectArcaStyles" class="primary" type="button">수집 시작</button><button id="refreshArcaStyles" type="button">목록 새로고침</button><div id="arcaCollectorStatus" class="status"></div>
+        </aside>
+        <section class="arca-style-main"><section class="panel arca-style-filters"><label class="field"><span>목록 검색</span><input id="arcaStyleSearch" type="search" placeholder="제목, 프롬프트, 링크"></label><label class="field"><span>메타데이터</span><select id="arcaMetadataFilter"><option value="all">전체</option><option value="ok">추출 성공</option><option value="body_only">본문 추출</option><option value="no_metadata">없음</option><option value="error">오류</option></select></label><label class="field"><span>정렬</span><select id="arcaStyleSort"><option value="posted_desc" selected>최신순</option><option value="posted_asc">오래된순</option><option value="recommend_desc">추천순</option><option value="views_desc">조회순</option></select></label></section><div id="arcaStyleListStatus" class="status"></div><section id="arcaStyleList" class="arca-style-list arca-style-list-scroll"></section></section>
+      </section>
     </main>
+
+    <div id="arcaStyleDialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="arcaStyleDialogTitle">
+      <div class="modal-backdrop" data-close-arca-style></div>
+      <section class="modal-dialog arca-style-dialog">
+        <div class="modal-head"><h2 id="arcaStyleDialogTitle">수집 그림체</h2><div class="arca-dialog-head-actions"><a id="arcaStyleSourceLink" class="arca-source-link" href="#" target="_blank" rel="noreferrer">링크 열기</a><button id="closeArcaStyle" type="button">닫기</button></div></div>
+        <div class="arca-dialog-scroll">
+          <div id="arcaStyleImages" class="arca-style-images"></div>
+          <label class="field"><span>프롬프트</span><textarea id="arcaEditPrompt"></textarea></label>
+          <label class="field"><span>UC</span><textarea id="arcaEditNegativePrompt"></textarea></label>
+          <label class="field"><span>메모</span><textarea id="arcaEditMemo"></textarea></label>
+          <div class="modal-actions"><button id="deleteArcaStyle" class="ghost" type="button">삭제</button><button id="saveArcaStyle" class="primary" type="button">저장</button></div>
+          <div id="arcaStyleDialogStatus" class="status"></div>
+        </div>
+      </section>
+    </div>
 
     <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
       <div class="modal-backdrop" data-close-settings></div>
@@ -415,5 +482,6 @@
 
     <script src="{{ url_for('static', filename='app.js') }}"></script>
     <script src="{{ url_for('static', filename='style_maker.js') }}"></script>
+    <script src="{{ url_for('static', filename='arca_style_collector.js') }}"></script>
   </body>
 </html>

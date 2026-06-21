@@ -13,7 +13,79 @@ const {
   interpolateWeightProfile,
   formatArtistPromptTag,
   hasProfileDragMoved,
+  normalizeStoredPrompts,
+  promptStoragePayload,
+  parsePromptTokens,
+  addPromptGroupItem,
+  cleanPromptGroups,
+  buildEffectivePromptText,
 } = require("../static/style_maker.js");
+
+test("prompt storage keeps one normalized snapshot", () => {
+  assert.deepEqual(
+    promptStoragePayload(" base ", " negative ", [" char one ", "", " char two "]),
+    {
+      base_prompt: " base ",
+      negative_prompt: " negative ",
+      character_prompts: [" char one ", "", " char two "],
+      character_prompt_ids: ["character-1", "character-2", "character-3"],
+      prompt_groups: [],
+    },
+  );
+  assert.deepEqual(
+    normalizeStoredPrompts({ base_prompt: "base", negative_prompt: "neg", character_prompts: ["a", 3, "b"] }),
+    {
+      base_prompt: "base",
+      negative_prompt: "neg",
+      character_prompts: ["a", "b"],
+      character_prompt_ids: ["character-1", "character-2"],
+      prompt_groups: [],
+    },
+  );
+  assert.deepEqual(normalizeStoredPrompts(null), {
+    base_prompt: "",
+    negative_prompt: "",
+    character_prompts: [""],
+    character_prompt_ids: ["character-1"],
+    prompt_groups: [],
+  });
+});
+
+test("prompt tokens preserve order and ignore empty comma entries", () => {
+  assert.deepEqual(parsePromptTokens("masterpiece, best quality,, {blue eyes:1.2}"), [
+    "masterpiece",
+    "best quality",
+    "{blue eyes:1.2}",
+  ]);
+});
+
+test("prompt groups reject duplicate references and clean stale tokens", () => {
+  const group = { id: "group-1", name: "quality", enabled: true, expanded: true, items: [] };
+  const item = { field: "base", character_id: "", token: "masterpiece" };
+  assert.equal(addPromptGroupItem(group, item), true);
+  assert.equal(addPromptGroupItem(group, item), false);
+  const cleaned = cleanPromptGroups([group], {
+    base_prompt: "best quality",
+    negative_prompt: "",
+    character_prompts: [],
+    character_prompt_ids: [],
+  });
+  assert.deepEqual(cleaned[0].items, []);
+});
+
+test("disabled groups remove referenced tokens without changing remaining order", () => {
+  const groups = [{
+    id: "group-1",
+    name: "quality",
+    enabled: false,
+    expanded: true,
+    items: [{ field: "base", character_id: "", token: "best quality" }],
+  }];
+  assert.equal(
+    buildEffectivePromptText("masterpiece, best quality, solo", "base", "", groups),
+    "masterpiece, solo",
+  );
+});
 
 test("profile point interaction distinguishes a click from a drag", () => {
   assert.equal(hasProfileDragMoved(100, 100, 101, 102), false);

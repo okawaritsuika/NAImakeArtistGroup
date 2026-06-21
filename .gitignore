@@ -4,3 +4,13 @@ artist_rater/__pycache__/
 artist_rater/tests/__pycache__/
 artist_rater/server.err.log
 artist_rater/server.out.log
+artist_rater/.build/
+artist_rater/build/
+artist_rater/dist/
+release/
+*.spec
+*.sqlite*
+settings.json
+arca_login_profile/
+.env
+.env.*

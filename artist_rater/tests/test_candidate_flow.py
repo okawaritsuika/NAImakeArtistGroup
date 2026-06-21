@@ -55,6 +55,17 @@ class CandidateFlowTest(unittest.TestCase):
         self.assertEqual(item["mode"], "manual")
         self.assertEqual(item["query_tags"], ["dakimakura_(medium)", "solo"])
 
+    def test_missing_rating_thumbnail_can_be_fetched_from_danbooru(self):
+        self.client.post("/api/ratings", json={"artist_tag": "manual_artist", "score": 4, "mode": "manual"})
+        sample = {"id": 77, "preview_url": "https://example.test/77.jpg", "large_url": "https://example.test/77-large.jpg"}
+        with patch("app.fetch_artist_samples", return_value=[sample]), patch("app.download_thumbnail", return_value="manual_artist_77.jpg"):
+            response = self.client.post("/api/ratings/1/thumbnail")
+
+        self.assertEqual(response.status_code, 200)
+        item = self.client.get("/api/ratings").get_json()[0]
+        self.assertEqual(item["thumbnail_url"], "/thumbnails/manual_artist_77.jpg")
+        self.assertEqual(item["representative_post_id"], 77)
+
     def test_candidates_endpoint_returns_artist_pool_without_samples(self):
         with patch("app.search_posts") as search_posts, patch("app.get_artist_post_count") as post_count:
             search_posts.return_value = [

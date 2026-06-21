@@ -5,6 +5,7 @@ import os
 import random
 import re
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,28 @@ from urllib.parse import urlparse
 
 import requests
 from flask import Flask, jsonify, render_template, request, send_from_directory
+
+from arca_login_window import ArcaLoginWindowManager
+
+from arca_style_collector import (
+    ArcaCollectorError,
+    connect_arca_cookie_jar,
+    delete_arca_style,
+    get_collection_job,
+    get_arca_browser_session_status,
+    get_arca_style_detail,
+    get_completed_coverage,
+    init_arca_style_tables,
+    import_arca_browser_session,
+    list_arca_styles,
+    mark_interrupted_collection_jobs,
+    normalize_collect_payload,
+    normalize_arca_article_url,
+    revalidate_stored_metadata,
+    start_collection_job,
+    start_url_collection_job,
+    update_arca_style,
+)
 
 from novelai import (
     MODEL,
@@ -43,10 +66,27 @@ from style_logic import (
 )
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+def resolve_runtime_paths(frozen, executable, module_file, bundle_dir=None):
+    source_dir = Path(module_file).resolve().parent
+    if frozen:
+        resource_dir = Path(bundle_dir or source_dir).resolve()
+        data_dir = Path(executable).resolve().parent / "data"
+    else:
+        resource_dir = source_dir
+        data_dir = source_dir / "data"
+    return resource_dir, data_dir
+
+
+RESOURCE_DIR, DATA_DIR = resolve_runtime_paths(
+    frozen=bool(getattr(sys, "frozen", False)),
+    executable=sys.executable,
+    module_file=__file__,
+    bundle_dir=getattr(sys, "_MEIPASS", None),
+)
+BASE_DIR = RESOURCE_DIR
 THUMBNAIL_DIR = DATA_DIR / "thumbnails"
 GENERATED_DIR = DATA_DIR / "generated"
+ARCA_STYLE_IMAGE_DIR = DATA_DIR / "arca_style_images"
 SETTINGS_JSON_PATH = DATA_DIR / "settings.json"
 DB_PATH = DATA_DIR / "artist_rater.sqlite"
 DANBOORU_BASE_URL = "https://danbooru.donmai.us"
@@ -55,7 +95,16 @@ DATE_TAG = "date:<=2025-01-31"
 REQUEST_TIMEOUT = 12
 USER_AGENT = "DanbooruArtistRater/1.0 (local personal tool)"
 
-app = Flask(__name__)
+ARCA_LOGIN_MANAGER = ArcaLoginWindowManager(
+    DATA_DIR / "arca_login_profile",
+    lambda jar: connect_arca_cookie_jar(jar, "전용 Chrome"),
+)
+
+app = Flask(
+    __name__,
+    template_folder=str(RESOURCE_DIR / "templates"),
+    static_folder=str(RESOURCE_DIR / "static"),
+)
 app.config["JSON_AS_ASCII"] = False
 SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -72,6 +121,7 @@ def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(
             """
@@ -145,6 +195,7 @@ def init_db():
                 width INTEGER NOT NULL,
                 height INTEGER NOT NULL,
                 sampler TEXT NOT NULL,
+                noise_schedule TEXT NOT NULL DEFAULT 'native',
                 steps INTEGER NOT NULL,
                 scale REAL NOT NULL,
                 cfg_rescale REAL NOT NULL,
@@ -167,10 +218,16 @@ def init_db():
             )
             """
         )
+        image_columns = {row[1] for row in conn.execute("PRAGMA table_info(generated_images)")}
+        if "noise_schedule" not in image_columns:
+            conn.execute("ALTER TABLE generated_images ADD COLUMN noise_schedule TEXT NOT NULL DEFAULT 'native'")
 
     from style_store import reconcile_generated_storage
 
     reconcile_generated_storage(DB_PATH, GENERATED_DIR)
+    init_arca_style_tables(DB_PATH)
+    revalidate_stored_metadata(DB_PATH)
+    mark_interrupted_collection_jobs(DB_PATH)
 
 
 def db():
@@ -966,6 +1023,7 @@ def _generation_response(result):
         "width": result["width"],
         "height": result["height"],
         "sampler": result["sampler"],
+        "noise_schedule": result["noise_schedule"],
         "steps": result["steps"],
         "scale": result["scale"],
         "cfg_rescale": result["cfg_rescale"],
@@ -1011,6 +1069,7 @@ def _generation_payload_hash(data):
         "width": data["width"],
         "height": data["height"],
         "sampler": data["sampler"],
+        "noise_schedule": data["noise_schedule"],
         "steps": data["steps"],
         "scale": data["scale"],
         "cfg_rescale": data["cfg_rescale"],
@@ -1075,6 +1134,7 @@ def api_style_maker_generate():
             width=data["width"],
             height=data["height"],
             sampler=data["sampler"],
+            noise_schedule=data["noise_schedule"],
             steps=data["steps"],
             scale=data["scale"],
             cfg_rescale=data["cfg_rescale"],
@@ -1117,6 +1177,140 @@ def api_art_style_detail(style_id):
     return json_response(detail)
 
 
+def _add_arca_urls(item):
+    representative = item.get("representative_image_path") or ""
+    if representative:
+        item["representative_image_url"] = f"/arca-style-images/{representative}"
+    for image in item.get("images", []):
+        if image.get("image_path"):
+            image["image_url"] = f"/arca-style-images/{image['image_path']}"
+    for group in item.get("style_groups", []):
+        for image in group.get("images", []):
+            if image.get("image_path"):
+                image["image_url"] = f"/arca-style-images/{image['image_path']}"
+    return item
+
+
+@app.route("/api/arca-styles/collect", methods=["POST"])
+def api_collect_arca_styles():
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ArcaCollectorError("요청 데이터가 올바르지 않습니다.")
+        job_id = start_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, payload)
+        return json_response({"job_id": job_id, "status": "queued"}, 202)
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+    except requests.RequestException:
+        app.logger.exception("Arca collection request failed")
+        return json_response({"error": "수집 대상에 연결하지 못했습니다."}, 502)
+    except Exception:
+        app.logger.exception("Unexpected Arca collection failure")
+        return json_response({"error": "수집 중 오류가 발생했습니다."}, 500)
+
+
+@app.route("/api/arca-styles/collection-jobs/<int:job_id>")
+def api_arca_collection_job(job_id):
+    job = get_collection_job(DB_PATH, job_id)
+    if job is None:
+        return json_response({"error": "수집 작업을 찾을 수 없습니다."}, 404)
+    return json_response(job)
+
+
+@app.route("/api/arca-styles/collect-url", methods=["POST"])
+def api_collect_arca_style_url():
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ArcaCollectorError("요청 데이터가 올바르지 않습니다.")
+        source_url = normalize_arca_article_url(payload.get("source_url"))
+        job_id = start_url_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, source_url)
+        return json_response({"job_id": job_id, "status": "queued"}, 202)
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+def _safe_arca_browser_status(status, login_status=None):
+    connected = bool(status.get("connected"))
+    if connected:
+        browser = str(status.get("browser") or "")
+        return {
+            "connected": True, "browser": browser, "error": "",
+            "state": "connected", "message": f"{browser or '브라우저'} 로그인 연결됨",
+        }
+    login_status = login_status or ARCA_LOGIN_MANAGER.status()
+    return {
+        "connected": bool(login_status.get("connected")),
+        "browser": str(login_status.get("browser") or ""),
+        "error": str(login_status.get("error") or ""),
+        "state": str(login_status.get("state") or "idle"),
+        "message": str(login_status.get("message") or "브라우저 로그인 연결 안 됨"),
+    }
+
+
+@app.route("/api/arca-styles/browser-session", methods=["GET"])
+def api_arca_browser_session_status():
+    return json_response(_safe_arca_browser_status(get_arca_browser_session_status()))
+
+
+@app.route("/api/arca-styles/browser-session/import", methods=["POST"])
+def api_import_arca_browser_session():
+    imported = import_arca_browser_session()
+    if imported.get("connected"):
+        return json_response(_safe_arca_browser_status(imported), 200)
+    return json_response(_safe_arca_browser_status(imported, ARCA_LOGIN_MANAGER.start()), 202)
+
+
+@app.route("/api/arca-styles", methods=["GET"])
+def api_arca_styles():
+    filters = {key: request.args.get(key) for key in ("q", "tab", "metadata", "start_date", "end_date", "limit", "sort") if request.args.get(key) is not None}
+    try:
+        return json_response([_add_arca_urls(item) for item in list_arca_styles(DB_PATH, filters)])
+    except (ValueError, ArcaCollectorError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/search-status", methods=["GET"])
+def api_arca_search_status():
+    try:
+        params = normalize_collect_payload(request.args.to_dict(flat=True) | {"tabs": request.args.getlist("tabs") or ["NAI", "R18_NAI"]})
+        coverage = get_completed_coverage(DB_PATH, params)
+        return json_response({"coverage": [{"start_date": start.isoformat(), "end_date": end.isoformat()} for start, end in coverage]})
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/<int:item_id>", methods=["GET", "PATCH", "DELETE"])
+def api_arca_style_detail(item_id):
+    try:
+        if request.method == "PATCH":
+            item = update_arca_style(DB_PATH, item_id, request.get_json(silent=True))
+        elif request.method == "DELETE":
+            result = delete_arca_style(DB_PATH, ARCA_STYLE_IMAGE_DIR, item_id)
+            if not result:
+                return json_response({"error": "수집 항목을 찾을 수 없습니다."}, 404)
+            return json_response(result)
+        else:
+            item = get_arca_style_detail(DB_PATH, item_id)
+        if item is None:
+            return json_response({"error": "수집 항목을 찾을 수 없습니다."}, 404)
+        return json_response(_add_arca_urls(item))
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/arca-style-images/<path:filename>")
+def arca_style_image(filename):
+    normalized = filename.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute() or ".." in path.parts or normalized != filename:
+        return json_response({"error": "Invalid archive image path."}, 400)
+    target, root = (ARCA_STYLE_IMAGE_DIR / path).resolve(), ARCA_STYLE_IMAGE_DIR.resolve()
+    if root not in target.parents:
+        return json_response({"error": "Invalid archive image path."}, 400)
+    return send_from_directory(root, path.as_posix())
+
+
 @app.route("/generated/<path:filename>")
 def generated(filename):
     normalized = filename.replace("\\", "/")
@@ -1155,6 +1349,38 @@ def api_update_rating(rating_id):
     if cursor.rowcount == 0:
         return json_response({"ok": False, "error": "평가를 찾을 수 없습니다."}, 404)
     return json_response({"ok": True})
+
+
+@app.route("/api/ratings/<int:rating_id>/thumbnail", methods=["POST"])
+def api_find_rating_thumbnail(rating_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT artist_tag,query_tags_json FROM ratings WHERE id = ?",
+            (rating_id,),
+        ).fetchone()
+    if not row:
+        return json_response({"ok": False, "error": "평가를 찾을 수 없습니다."}, 404)
+    try:
+        query_tags = json.loads(row["query_tags_json"] or "[]")
+    except json.JSONDecodeError:
+        query_tags = []
+    try:
+        samples = fetch_artist_samples(row["artist_tag"], query_tags, 1)
+    except requests.RequestException as exc:
+        return json_response({"ok": False, "error": f"Danbooru API 오류: {exc}"}, 502)
+    if not samples:
+        return json_response({"ok": False, "error": "Danbooru에서 썸네일을 찾지 못했습니다."}, 404)
+    sample = samples[0]
+    preview_url = sample.get("preview_url") or sample.get("large_url") or ""
+    thumbnail = download_thumbnail(preview_url, row["artist_tag"], sample.get("id"))
+    if not thumbnail:
+        return json_response({"ok": False, "error": "썸네일 저장에 실패했습니다."}, 502)
+    with db() as conn:
+        conn.execute(
+            "UPDATE ratings SET representative_post_id=?,representative_thumbnail_path=?,representative_preview_url=?,sample_post_ids_json=?,updated_at=? WHERE id=?",
+            (sample.get("id"), thumbnail, preview_url, json.dumps([sample.get("id")]), now_text(), rating_id),
+        )
+    return json_response({"ok": True, "thumbnail_url": f"/thumbnails/{thumbnail}"})
 
 
 @app.route("/api/ratings/<int:rating_id>", methods=["DELETE"])

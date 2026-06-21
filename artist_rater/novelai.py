@@ -25,6 +25,7 @@ MAX_PROMPT_LENGTH = 8192
 MAX_CHARACTER_PROMPTS = 16
 MAX_CHARACTER_PROMPT_LENGTH = 4096
 SAFE_SAMPLER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SAFE_NOISE_SCHEDULES = {"native", "karras", "exponential", "polyexponential"}
 
 
 class NovelAIError(Exception):
@@ -114,6 +115,9 @@ def normalize_generation_data(data):
     sampler = data.get("sampler")
     if type(sampler) is not str or not SAFE_SAMPLER.fullmatch(sampler.strip()):
         raise ValueError("sampler must be a nonempty safe token.")
+    noise_schedule = data.get("noise_schedule", "native")
+    if noise_schedule not in SAFE_NOISE_SCHEDULES:
+        raise ValueError("noise_schedule is not supported.")
 
     if "seed" not in data:
         seed = random.SystemRandom().randint(1, 4294967295)
@@ -134,6 +138,7 @@ def normalize_generation_data(data):
             "scale": _finite_number(data, "scale", 0, 10),
             "cfg_rescale": _finite_number(data, "cfg_rescale", 0, 1),
             "sampler": sampler.strip(),
+            "noise_schedule": noise_schedule,
             "seed": seed,
         }
     )
@@ -168,7 +173,7 @@ def build_generation_payload(data, artist_prompt, seed=None):
             "scale": normalized["scale"],
             "negative_prompt": negative,
             "cfg_rescale": normalized["cfg_rescale"],
-            "noise_schedule": "native",
+            "noise_schedule": normalized["noise_schedule"],
             "params_version": 3,
             "legacy": False,
             "legacy_v3_extend": False,

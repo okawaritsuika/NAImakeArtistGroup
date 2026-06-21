@@ -15,6 +15,8 @@ const state = {
   manualArtistIndex: -1,
   manualPreviewSamples: [],
   manualPreviewIndex: 0,
+  manualPreviewArtist: "",
+  manualPreviewQueryTags: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -281,17 +283,38 @@ async function addManualRating() {
         query_tags: tags,
         artist_post_count: Number($("manualArtist")?.dataset.postCount || 0),
         prompt_text: `${artist}, masterpiece, best quality, very aesthetic`,
+        ...manualPreviewRatingFields(artist, tags, {
+          artist: state.manualPreviewArtist,
+          queryTags: state.manualPreviewQueryTags,
+          sample: state.manualPreviewSamples[state.manualPreviewIndex],
+          sampleIds: state.manualPreviewSamples.map((item) => item.id),
+        }),
       }),
     });
     $("manualArtist").value = "";
     $("manualArtist").dataset.postCount = "0";
     $("manualTags").value = "";
     $("manualMemo").value = "";
+    state.manualPreviewSamples = [];
+    state.manualPreviewIndex = 0;
+    state.manualPreviewArtist = "";
+    state.manualPreviewQueryTags = [];
     showStatus($("ratingsStatus"), `${artist} 작가를 추가했습니다.`, "ok");
     await loadRatings();
   } catch (error) {
     showStatus($("ratingsStatus"), error.message, "error");
   }
+}
+
+function manualPreviewRatingFields(artist, queryTags, preview) {
+  const sameArtist = String(preview?.artist || "") === String(artist || "");
+  const sameTags = JSON.stringify(preview?.queryTags || []) === JSON.stringify(queryTags || []);
+  if (!sameArtist || !sameTags || !preview?.sample) return {};
+  return {
+    representative_post_id: preview.sample.id,
+    representative_preview_url: preview.sample.preview_url || preview.sample.large_url || "",
+    sample_post_ids: preview.sampleIds || [],
+  };
 }
 
 function renderManualPreviewSample() {
@@ -314,8 +337,6 @@ function moveManualPreview(delta) {
 
 function closeManualPreview() {
   $("manualPreviewModal")?.classList.add("hidden");
-  state.manualPreviewSamples = [];
-  state.manualPreviewIndex = 0;
 }
 
 async function openManualPreview() {
@@ -327,6 +348,10 @@ async function openManualPreview() {
   }
   const modal = $("manualPreviewModal");
   const viewer = $("manualPreviewViewer");
+  state.manualPreviewSamples = [];
+  state.manualPreviewIndex = 0;
+  state.manualPreviewArtist = "";
+  state.manualPreviewQueryTags = [];
   modal?.classList.remove("hidden");
   viewer?.classList.add("hidden");
   setText("manualPreviewArtist", artist);
@@ -347,6 +372,8 @@ async function openManualPreview() {
     }
     state.manualPreviewSamples = data.samples;
     state.manualPreviewIndex = 0;
+    state.manualPreviewArtist = artist;
+    state.manualPreviewQueryTags = queryTags;
     viewer?.classList.remove("hidden");
     showStatus($("manualPreviewStatus"), `${data.samples.length}장을 가져왔습니다.`, "ok");
     renderManualPreviewSample();
@@ -568,6 +595,11 @@ function renderRatingCard(item) {
     image.alt = String(item.artist_tag || "");
     image.loading = "lazy";
     card.append(image);
+  } else {
+    const empty = document.createElement("div");
+    empty.className = "thumb thumb-empty";
+    empty.textContent = "썸네일 없음";
+    card.append(empty);
   }
 
   const body = document.createElement("div");
@@ -602,6 +634,13 @@ function renderRatingCard(item) {
     button.textContent = label;
     actions.append(button);
   });
+  if (!thumb) {
+    const findThumbnail = document.createElement("button");
+    findThumbnail.type = "button";
+    findThumbnail.dataset.action = "find-thumbnail";
+    findThumbnail.textContent = "썸네일 찾기";
+    actions.append(findThumbnail);
+  }
 
   const editor = document.createElement("div");
   editor.className = "inline-edit hidden";
@@ -628,6 +667,7 @@ function renderRatingCard(item) {
   card.querySelector('[data-action="copy"]').addEventListener("click", () => copyText(item.prompt_text));
   card.querySelector('[data-action="edit"]').addEventListener("click", () => card.querySelector(".inline-edit").classList.toggle("hidden"));
   card.querySelector('[data-action="delete"]').addEventListener("click", () => deleteRating(item.id));
+  card.querySelector('[data-action="find-thumbnail"]')?.addEventListener("click", () => findRatingThumbnail(item.id));
   card.querySelector('[data-action="apply"]').addEventListener("click", () => {
     patchRating(item.id, {
       score: Number(card.querySelector('[data-edit="score"]').value),
@@ -635,6 +675,16 @@ function renderRatingCard(item) {
     });
   });
   return card;
+}
+
+async function findRatingThumbnail(id) {
+  showStatus($("ratingsStatus"), "Danbooru에서 썸네일을 찾는 중입니다...");
+  try {
+    await apiFetch(`/api/ratings/${id}/thumbnail`, { method: "POST" });
+    await loadRatings();
+  } catch (error) {
+    showStatus($("ratingsStatus"), error.message, "error");
+  }
 }
 
 async function loadRatings() {
@@ -763,5 +813,5 @@ loadRatings();
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { renderRatingCard, validatedImageUrl };
+  module.exports = { renderRatingCard, validatedImageUrl, manualPreviewRatingFields };
 }

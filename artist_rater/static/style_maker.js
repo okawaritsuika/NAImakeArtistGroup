@@ -15,11 +15,14 @@ const styleState = {
   managerDirty: true,
   managerImages: [],
   managerImageIndex: 0,
+  promptGroups: [],
   weightProfile: [
     { position: 0, weight: 0.1 },
     { position: 1, weight: 2.3 },
   ],
 };
+
+const PROMPT_STORAGE_KEY = "naiArtistRater.prompts.v1";
 
 const STYLE_REQUEST_CONTROL_IDS = [
   "rerollStyleArtists",
@@ -170,6 +173,334 @@ function formatArtistPromptTag(artist) {
 
 function hasProfileDragMoved(startX, startY, currentX, currentY) {
   return Math.hypot(currentX - startX, currentY - startY) >= 3;
+}
+
+function parsePromptTokens(text) {
+  return String(text || "")
+    .split(",")
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function normalizePromptToken(token) {
+  return String(token || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function promptGroupItemKey(item) {
+  const field = item?.field === "negative" || item?.field === "character" ? item.field : "base";
+  const characterId = field === "character" ? String(item?.character_id || "") : "";
+  return `${field}:${characterId}:${normalizePromptToken(item?.token)}`;
+}
+
+function normalizePromptGroup(group, index = 0) {
+  const items = Array.isArray(group?.items) ? group.items : [];
+  const normalizedItems = [];
+  const seen = new Set();
+  items.forEach((item) => {
+    const normalized = {
+      field: item?.field === "negative" || item?.field === "character" ? item.field : "base",
+      character_id: item?.field === "character" ? String(item.character_id || "") : "",
+      token: String(item?.token || "").trim(),
+    };
+    const key = promptGroupItemKey(normalized);
+    if (!normalized.token || seen.has(key)) return;
+    seen.add(key);
+    normalizedItems.push(normalized);
+  });
+  return {
+    id: String(group?.id || `group-${index + 1}`),
+    name: String(group?.name || `그룹 ${index + 1}`),
+    enabled: group?.enabled !== false,
+    expanded: group?.expanded !== false,
+    items: normalizedItems,
+  };
+}
+
+function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, characterPromptIds = [], promptGroups = []) {
+  const prompts = Array.isArray(characterPrompts)
+    ? characterPrompts.map((value) => (typeof value === "string" ? value : ""))
+    : [""];
+  const ids = prompts.map((_, index) => String(characterPromptIds[index] || `character-${index + 1}`));
+  return {
+    base_prompt: typeof basePrompt === "string" ? basePrompt : "",
+    negative_prompt: typeof negativePrompt === "string" ? negativePrompt : "",
+    character_prompts: prompts,
+    character_prompt_ids: ids,
+    prompt_groups: Array.isArray(promptGroups) ? promptGroups.map(normalizePromptGroup) : [],
+  };
+}
+
+function normalizeStoredPrompts(value) {
+  if (!value || typeof value !== "object") return promptStoragePayload("", "", [""]);
+  const characters = Array.isArray(value.character_prompts)
+    ? value.character_prompts.filter((item) => typeof item === "string")
+    : [""];
+  return promptStoragePayload(
+    typeof value.base_prompt === "string" ? value.base_prompt : "",
+    typeof value.negative_prompt === "string" ? value.negative_prompt : "",
+    characters.length ? characters : [""],
+    Array.isArray(value.character_prompt_ids) ? value.character_prompt_ids : [],
+    Array.isArray(value.prompt_groups) ? value.prompt_groups : [],
+  );
+}
+
+function addPromptGroupItem(group, item) {
+  if (!group || !String(item?.token || "").trim()) return false;
+  group.items = Array.isArray(group.items) ? group.items : [];
+  const normalized = normalizePromptGroup({ items: [item] }).items[0];
+  if (!normalized) return false;
+  const key = promptGroupItemKey(normalized);
+  if (group.items.some((existing) => promptGroupItemKey(existing) === key)) return false;
+  group.items.push(normalized);
+  return true;
+}
+
+function availablePromptItemKeys(prompts) {
+  const keys = new Set();
+  parsePromptTokens(prompts?.base_prompt).forEach((token) => keys.add(promptGroupItemKey({ field: "base", token })));
+  parsePromptTokens(prompts?.negative_prompt).forEach((token) => keys.add(promptGroupItemKey({ field: "negative", token })));
+  (prompts?.character_prompts || []).forEach((text, index) => {
+    const characterId = String(prompts?.character_prompt_ids?.[index] || `character-${index + 1}`);
+    parsePromptTokens(text).forEach((token) => keys.add(promptGroupItemKey({ field: "character", character_id: characterId, token })));
+  });
+  return keys;
+}
+
+function cleanPromptGroups(groups, prompts) {
+  const available = availablePromptItemKeys(prompts);
+  return (Array.isArray(groups) ? groups : []).map((group, index) => {
+    const normalized = normalizePromptGroup(group, index);
+    normalized.items = normalized.items.filter((item) => available.has(promptGroupItemKey(item)));
+    return normalized;
+  });
+}
+
+function buildEffectivePromptText(text, field, characterId, groups) {
+  const disabled = new Set();
+  (Array.isArray(groups) ? groups : []).forEach((group) => {
+    if (group?.enabled !== false) return;
+    (group.items || []).forEach((item) => disabled.add(promptGroupItemKey(item)));
+  });
+  return parsePromptTokens(text)
+    .filter((token) => !disabled.has(promptGroupItemKey({ field, character_id: characterId, token })))
+    .join(", ");
+}
+
+function savePromptDraft() {
+  if (typeof localStorage === "undefined") return;
+  const rows = typeof document === "undefined" ? [] : [...document.querySelectorAll("#characterPromptList .character-prompt-row")];
+  const characters = rows.map((row) => row.querySelector("textarea")?.value || "");
+  const characterIds = rows.map((row, index) => row.dataset.characterId || `character-${index + 1}`);
+  const draft = {
+    base_prompt: styleElement("basePrompt")?.value || "",
+    negative_prompt: styleElement("negativePrompt")?.value || "",
+    character_prompts: characters,
+    character_prompt_ids: characterIds,
+  };
+  styleState.promptGroups = cleanPromptGroups(styleState.promptGroups, draft);
+  const payload = promptStoragePayload(
+    draft.base_prompt,
+    draft.negative_prompt,
+    characters,
+    characterIds,
+    styleState.promptGroups,
+  );
+  try { localStorage.setItem(PROMPT_STORAGE_KEY, JSON.stringify(payload)); } catch (_) { /* Storage can be disabled. */ }
+}
+
+function loadPromptDraft() {
+  if (typeof localStorage === "undefined") return normalizeStoredPrompts(null);
+  try { return normalizeStoredPrompts(JSON.parse(localStorage.getItem(PROMPT_STORAGE_KEY) || "null")); }
+  catch (_) { return normalizeStoredPrompts(null); }
+}
+
+function isPromptItemDisabled(item) {
+  const key = promptGroupItemKey(item);
+  return styleState.promptGroups.some((group) => (
+    group.enabled === false && group.items.some((candidate) => promptGroupItemKey(candidate) === key)
+  ));
+}
+
+function setPromptDragData(event, item) {
+  event.dataTransfer.effectAllowed = "copy";
+  event.dataTransfer.setData("application/x-style-prompt-token", JSON.stringify(item));
+  event.dataTransfer.setData("text/plain", item.token);
+}
+
+function renderPromptTokens(surface, text, field, characterId = "") {
+  if (!surface) return;
+  surface.replaceChildren();
+  const tokens = parsePromptTokens(text);
+  if (!tokens.length) {
+    const empty = document.createElement("span");
+    empty.className = "prompt-token-empty";
+    empty.textContent = "쉼표로 태그를 나누면 여기에 토큰이 표시됩니다.";
+    surface.append(empty);
+    return;
+  }
+  tokens.forEach((token) => {
+    const item = { field, character_id: field === "character" ? characterId : "", token };
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `prompt-token-chip ${field}${isPromptItemDisabled(item) ? " disabled-by-group" : ""}`;
+    chip.draggable = true;
+    chip.textContent = token;
+    chip.title = "그룹으로 드래그";
+    chip.addEventListener("dragstart", (event) => setPromptDragData(event, item));
+    surface.append(chip);
+  });
+}
+
+function renderAllPromptTokens() {
+  renderPromptTokens(styleElement("basePromptTokens"), styleElement("basePrompt")?.value, "base");
+  renderPromptTokens(styleElement("negativePromptTokens"), styleElement("negativePrompt")?.value, "negative");
+  document.querySelectorAll("#characterPromptList .character-prompt-row").forEach((row) => {
+    renderPromptTokens(
+      row.querySelector(".prompt-token-surface"),
+      row.querySelector("textarea")?.value,
+      "character",
+      row.dataset.characterId,
+    );
+  });
+}
+
+function persistAndRenderPromptControls() {
+  savePromptDraft();
+  renderAllPromptTokens();
+  renderPromptGroups();
+}
+
+function selectPromptTab(tabName) {
+  const selected = tabName === "negative" ? "negative" : "base";
+  document.querySelectorAll("[data-prompt-tab]").forEach((button) => {
+    const active = button.dataset.promptTab === selected;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  styleElement("basePromptPanel")?.classList.toggle("hidden", selected !== "base");
+  styleElement("negativePromptPanel")?.classList.toggle("hidden", selected !== "negative");
+}
+
+function addPromptGroup() {
+  styleState.promptGroups.push({
+    id: createRequestId(),
+    name: `그룹 ${styleState.promptGroups.length + 1}`,
+    enabled: true,
+    expanded: true,
+    items: [],
+  });
+  persistAndRenderPromptControls();
+}
+
+function fieldLabelForPromptItem(item) {
+  if (item.field === "negative") return "NEG";
+  if (item.field === "character") return "CHAR";
+  return "BASE";
+}
+
+function renderPromptGroups() {
+  const list = styleElement("promptGroupList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!styleState.promptGroups.length) {
+    const empty = document.createElement("p");
+    empty.className = "prompt-group-empty";
+    empty.textContent = "그룹을 추가한 뒤 위 토큰을 끌어다 놓으세요.";
+    list.append(empty);
+    return;
+  }
+  styleState.promptGroups.forEach((group) => {
+    const wrapper = document.createElement("section");
+    wrapper.className = `prompt-control-group${group.enabled ? "" : " off"}${group.expanded ? " expanded" : ""}`;
+
+    const header = document.createElement("div");
+    header.className = "prompt-control-group-header";
+    const name = document.createElement("strong");
+    name.className = "prompt-control-group-name";
+    name.textContent = group.name;
+    const rename = document.createElement("button");
+    rename.type = "button";
+    rename.className = "icon-button small";
+    rename.title = "그룹 이름 변경";
+    rename.textContent = "✎";
+    rename.addEventListener("click", () => {
+      const next = prompt("그룹 이름", group.name);
+      if (!next?.trim()) return;
+      group.name = next.trim();
+      persistAndRenderPromptControls();
+    });
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = `prompt-group-toggle${group.enabled ? " on" : ""}`;
+    toggle.textContent = group.enabled ? "ON" : "OFF";
+    toggle.title = "생성 프롬프트 포함 여부";
+    toggle.addEventListener("click", () => {
+      group.enabled = !group.enabled;
+      persistAndRenderPromptControls();
+    });
+    const expand = document.createElement("button");
+    expand.type = "button";
+    expand.className = "icon-button small";
+    expand.title = group.expanded ? "그룹 접기" : "그룹 펼치기";
+    expand.textContent = group.expanded ? "▴" : "▾";
+    expand.addEventListener("click", () => {
+      group.expanded = !group.expanded;
+      persistAndRenderPromptControls();
+    });
+    const removeGroup = document.createElement("button");
+    removeGroup.type = "button";
+    removeGroup.className = "icon-button small danger-button";
+    removeGroup.title = "그룹 삭제";
+    removeGroup.textContent = "×";
+    removeGroup.addEventListener("click", () => {
+      styleState.promptGroups = styleState.promptGroups.filter((candidate) => candidate.id !== group.id);
+      persistAndRenderPromptControls();
+    });
+    header.append(name, rename, toggle, expand, removeGroup);
+
+    const dropZone = document.createElement("div");
+    dropZone.className = "prompt-group-drop-zone";
+    dropZone.addEventListener("dragover", (event) => {
+      if (![...event.dataTransfer.types].includes("application/x-style-prompt-token")) return;
+      event.preventDefault();
+      dropZone.classList.add("drag-over");
+    });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+    dropZone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      dropZone.classList.remove("drag-over");
+      try {
+        const item = JSON.parse(event.dataTransfer.getData("application/x-style-prompt-token"));
+        if (addPromptGroupItem(group, item)) persistAndRenderPromptControls();
+      } catch (_) { /* Ignore invalid external drag data. */ }
+    });
+    if (!group.items.length) {
+      const empty = document.createElement("span");
+      empty.className = "prompt-group-empty";
+      empty.textContent = "토큰을 여기에 놓기";
+      dropZone.append(empty);
+    } else {
+      group.items.forEach((item, itemIndex) => {
+        const chip = document.createElement("span");
+        chip.className = `prompt-group-item ${item.field}`;
+        const label = document.createElement("span");
+        label.textContent = `${fieldLabelForPromptItem(item)} · ${item.token}`;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.title = "그룹에서 제거";
+        remove.textContent = "×";
+        remove.addEventListener("click", () => {
+          group.items.splice(itemIndex, 1);
+          persistAndRenderPromptControls();
+        });
+        chip.append(label, remove);
+        dropZone.append(chip);
+      });
+    }
+    wrapper.append(header, dropZone);
+    list.append(wrapper);
+  });
 }
 
 function interpolateWeightProfile(profile, position) {
@@ -661,23 +992,37 @@ function addWeightRange() {
   renderCustomRanges();
 }
 
-function addCharacterPrompt(value = "") {
+function addCharacterPrompt(value = "", characterId = createRequestId()) {
   const list = styleElement("characterPromptList");
   if (!list) return;
   const row = document.createElement("div");
   row.className = "character-prompt-row";
+  row.dataset.characterId = characterId;
+  const editor = document.createElement("label");
+  editor.className = "field prompt-editor character";
   const input = document.createElement("textarea");
   input.placeholder = "캐릭터 프롬프트";
   input.value = value;
+  const tokens = document.createElement("div");
+  tokens.className = "prompt-token-surface";
+  tokens.dataset.promptField = "character";
+  tokens.setAttribute("aria-label", "캐릭터 프롬프트 토큰");
+  input.addEventListener("input", persistAndRenderPromptControls);
+  editor.append(input, tokens);
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "icon-button danger-button";
   remove.title = "캐릭터 프롬프트 삭제";
   remove.setAttribute("aria-label", "캐릭터 프롬프트 삭제");
   remove.textContent = "×";
-  remove.addEventListener("click", () => row.remove());
-  row.append(input, remove);
+  remove.addEventListener("click", () => {
+    row.remove();
+    if (!styleElement("characterPromptList")?.children.length) addCharacterPrompt();
+    persistAndRenderPromptControls();
+  });
+  row.append(editor, remove);
   list.append(row);
+  renderPromptTokens(tokens, value, "character", characterId);
 }
 
 function createRequestId() {
@@ -692,8 +1037,13 @@ function generationNumber(id, fallback) {
 
 function readCharacterPrompts() {
   if (typeof document === "undefined") return [];
-  return [...document.querySelectorAll("#characterPromptList textarea")]
-    .map((input) => input.value.trim())
+  return [...document.querySelectorAll("#characterPromptList .character-prompt-row")]
+    .map((row) => buildEffectivePromptText(
+      row.querySelector("textarea")?.value,
+      "character",
+      row.dataset.characterId,
+      styleState.promptGroups,
+    ))
     .filter(Boolean);
 }
 
@@ -709,19 +1059,25 @@ function buildGenerationRequest(requestId = createRequestId()) {
   }
   if (!Number.isInteger(steps) || steps < 1 || steps > 50) throw new Error("스텝은 1~50이어야 합니다.");
   if (scale < 0 || scale > 10 || cfgRescale < 0 || cfgRescale > 1) throw new Error("생성 수치 범위를 확인하세요.");
-  return {
+  const seedFixed = Boolean(styleElement("generationSeedFixed")?.checked);
+  const seed = Number(styleElement("generationSeed")?.value);
+  if (seedFixed && (!Number.isInteger(seed) || seed < 1 || seed > 4294967295)) throw new Error("고정 시드를 확인하세요.");
+  const payload = {
     request_id: requestId,
     artists: styleState.artists.map(({ artist, score, weight }) => ({ artist, score, weight })),
-    base_prompt: styleElement("basePrompt")?.value.trim() || "",
-    negative_prompt: styleElement("negativePrompt")?.value.trim() || "",
+    base_prompt: buildEffectivePromptText(styleElement("basePrompt")?.value, "base", "", styleState.promptGroups),
+    negative_prompt: buildEffectivePromptText(styleElement("negativePrompt")?.value, "negative", "", styleState.promptGroups),
     character_prompts: readCharacterPrompts(),
     width,
     height,
     sampler: styleElement("generationSampler")?.value || "k_euler_ancestral",
+    noise_schedule: styleElement("generationScheduler")?.value || "native",
     steps,
     scale,
     cfg_rescale: cfgRescale,
   };
+  if (seedFixed) payload.seed = seed;
+  return payload;
 }
 
 function setGenerationBusy(busy) {
@@ -741,7 +1097,7 @@ function renderGenerationResult(result) {
   image.alt = `그림체 ${result.style_id} 생성 결과`;
   const meta = document.createElement("div");
   meta.className = "latest-result-meta";
-  meta.textContent = `그림체 #${result.style_id} · ${result.width}×${result.height} · ${result.sampler} · ${result.steps} steps · Scale ${result.scale} · CFG Rescale ${result.cfg_rescale} · Seed ${result.seed}`;
+  meta.textContent = `그림체 #${result.style_id} · ${result.width}×${result.height} · ${result.sampler} / ${result.noise_schedule} · ${result.steps} steps · Scale ${result.scale} · CFG Rescale ${result.cfg_rescale} · Seed ${result.seed}`;
   target.append(image, meta);
 }
 
@@ -985,7 +1341,7 @@ function renderGeneratedImageModal() {
   appendMetaRow(meta, "기본 프롬프트", item.base_prompt);
   appendMetaRow(meta, "네거티브", item.negative_prompt);
   appendMetaRow(meta, "캐릭터", (item.character_prompts || []).join(" / "));
-  appendMetaRow(meta, "생성 설정", `${item.width}×${item.height} · ${item.sampler} · ${item.steps} steps · CFG ${item.scale} · Seed ${item.seed}`);
+  appendMetaRow(meta, "생성 설정", `${item.width}×${item.height} · ${item.sampler} / ${item.noise_schedule || "native"} · ${item.steps} steps · CFG ${item.scale} · Rescale ${item.cfg_rescale} · Seed ${item.seed}`);
 }
 
 function toggleStyleSettings() {
@@ -1041,7 +1397,43 @@ function initializeStyleMaker() {
   styleElement("sortStyleDesc")?.addEventListener("click", () => sortStyleArtists("desc"));
   styleElement("styleArtistSearch")?.addEventListener("input", renderRatedArtistSelect);
   styleElement("addStyleArtist")?.addEventListener("click", addStyleArtist);
-  styleElement("addCharacterPrompt")?.addEventListener("click", () => addCharacterPrompt());
+  styleElement("addCharacterPrompt")?.addEventListener("click", () => {
+    addCharacterPrompt();
+    persistAndRenderPromptControls();
+  });
+  styleElement("addPromptGroup")?.addEventListener("click", addPromptGroup);
+  document.querySelectorAll("[data-prompt-tab]").forEach((button) => {
+    button.addEventListener("click", () => selectPromptTab(button.dataset.promptTab));
+    button.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      const next = button.dataset.promptTab === "base" ? "negative" : "base";
+      selectPromptTab(next);
+      styleElement(next === "base" ? "basePromptTab" : "negativePromptTab")?.focus();
+    });
+  });
+  ["basePrompt", "negativePrompt"].forEach((id) => styleElement(id)?.addEventListener("input", persistAndRenderPromptControls));
+  styleElement("toggleGenerationParameters")?.addEventListener("click", () => {
+    const panel = styleElement("generationParameters");
+    const button = styleElement("toggleGenerationParameters");
+    const collapsed = panel?.classList.toggle("collapsed");
+    if (button) {
+      button.setAttribute("aria-expanded", String(!collapsed));
+      button.textContent = collapsed ? "▶ 생성 파라미터 열기" : "▼ 생성 파라미터 닫기";
+    }
+  });
+  styleElement("generationResolutionPreset")?.addEventListener("change", (event) => {
+    if (event.target.value === "custom") return;
+    const [width, height] = event.target.value.split("x");
+    styleElement("generationWidth").value = width;
+    styleElement("generationHeight").value = height;
+  });
+  [["generationScaleRange", "generationScale"], ["generationCfgRescaleRange", "generationCfgRescale"]].forEach(([rangeId, numberId]) => {
+    const range = styleElement(rangeId);
+    const number = styleElement(numberId);
+    range?.addEventListener("input", () => { number.value = range.value; });
+    number?.addEventListener("input", () => { range.value = number.value; });
+  });
   styleElement("generateOne")?.addEventListener("click", () => generateCurrentStyle().catch(() => {}));
   styleElement("startContinuous")?.addEventListener("click", runContinuousGeneration);
   styleElement("pauseContinuous")?.addEventListener("click", () => {
@@ -1062,7 +1454,14 @@ function initializeStyleMaker() {
   styleElement("closeWeightGraph")?.addEventListener("click", closeWeightGraphModal);
   document.querySelectorAll("[data-close-weight-graph]").forEach((item) => item.addEventListener("click", closeWeightGraphModal));
 
-  addCharacterPrompt();
+  const storedPrompts = loadPromptDraft();
+  styleState.promptGroups = storedPrompts.prompt_groups;
+  styleElement("basePrompt").value = storedPrompts.base_prompt;
+  styleElement("negativePrompt").value = storedPrompts.negative_prompt;
+  storedPrompts.character_prompts.forEach((value, index) => addCharacterPrompt(value, storedPrompts.character_prompt_ids[index]));
+  styleState.promptGroups = cleanPromptGroups(styleState.promptGroups, storedPrompts);
+  renderAllPromptTokens();
+  renderPromptGroups();
   addWeightRange();
   syncScoreControls();
   renderWeightProfilePreview();
@@ -1113,6 +1512,12 @@ if (typeof module !== "undefined" && module.exports) {
     interpolateWeightProfile,
     formatArtistPromptTag,
     hasProfileDragMoved,
+    normalizeStoredPrompts,
+    promptStoragePayload,
+    parsePromptTokens,
+    addPromptGroupItem,
+    cleanPromptGroups,
+    buildEffectivePromptText,
     reachedGenerationLimit,
   };
 }

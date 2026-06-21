@@ -168,6 +168,7 @@ def _stored_result(row):
         "width": row["width"],
         "height": row["height"],
         "sampler": row["sampler"],
+        "noise_schedule": row["noise_schedule"],
         "steps": row["steps"],
         "scale": row["scale"],
         "cfg_rescale": row["cfg_rescale"],
@@ -182,6 +183,7 @@ def _find_request(conn, request_id):
                generated_images.image_path, generated_images.artist_prompt,
                generated_images.seed, generated_images.width,
                generated_images.height, generated_images.sampler,
+               generated_images.noise_schedule,
                generated_images.steps, generated_images.scale,
                generated_images.cfg_rescale, generated_images.model,
                art_styles.style_hash
@@ -232,6 +234,7 @@ def reserve_generation_request(db_path, request_id, payload_hash):
                        generated_images.image_path, generated_images.artist_prompt,
                        generated_images.seed, generated_images.width,
                        generated_images.height, generated_images.sampler,
+                       generated_images.noise_schedule,
                        generated_images.steps, generated_images.scale,
                        generated_images.cfg_rescale, generated_images.model,
                        art_styles.style_hash
@@ -327,6 +330,7 @@ def save_generated_result(
     width=0,
     height=0,
     sampler="",
+    noise_schedule="native",
     steps=0,
     scale=0.0,
     cfg_rescale=0.0,
@@ -400,9 +404,9 @@ def save_generated_result(
                 INSERT INTO generated_images (
                     request_id, style_id, image_path, base_prompt, negative_prompt,
                     character_prompts_json, combined_prompt, artist_prompt,
-                    artists_json, seed, width, height, sampler, steps, scale,
+                    artists_json, seed, width, height, sampler, noise_schedule, steps, scale,
                     cfg_rescale, model, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
@@ -418,6 +422,7 @@ def save_generated_result(
                     int(width),
                     int(height),
                     sampler,
+                    noise_schedule,
                     int(steps),
                     float(scale),
                     float(cfg_rescale),
@@ -464,6 +469,7 @@ def save_generated_result(
             "width": int(width),
             "height": int(height),
             "sampler": sampler,
+            "noise_schedule": noise_schedule,
             "steps": int(steps),
             "scale": float(scale),
             "cfg_rescale": float(cfg_rescale),
