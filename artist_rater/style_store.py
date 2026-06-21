@@ -589,3 +589,46 @@ def get_style_detail(db_path, style_id):
         images.append(image)
     style["images"] = images
     return style
+
+
+def delete_style(db_path, generated_dir, style_id):
+    conn = connect_db(db_path)
+    try:
+        with conn:
+            style = conn.execute(
+                "SELECT id FROM art_styles WHERE id = ?", (style_id,)
+            ).fetchone()
+            if style is None:
+                return None
+            image_rows = conn.execute(
+                "SELECT id, image_path FROM generated_images WHERE style_id = ?",
+                (style_id,),
+            ).fetchall()
+            image_ids = [row["id"] for row in image_rows]
+            if image_ids:
+                placeholders = ",".join("?" for _ in image_ids)
+                conn.execute(
+                    f"DELETE FROM generation_requests WHERE image_id IN ({placeholders})",
+                    image_ids,
+                )
+            conn.execute("DELETE FROM generated_images WHERE style_id = ?", (style_id,))
+            conn.execute("DELETE FROM art_styles WHERE id = ?", (style_id,))
+    finally:
+        conn.close()
+
+    root = Path(generated_dir).resolve()
+    for row in image_rows:
+        target = (root / row["image_path"]).resolve()
+        if root not in target.parents:
+            continue
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+    style_dir = (root / str(int(style_id))).resolve()
+    if style_dir.parent == root:
+        try:
+            style_dir.rmdir()
+        except OSError:
+            pass
+    return {"style_id": int(style_id), "deleted": True}

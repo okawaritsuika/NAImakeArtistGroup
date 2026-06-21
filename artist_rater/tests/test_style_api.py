@@ -893,6 +893,62 @@ class GenerationApiTest(StyleApiTest):
                 self.assertIn(response.status_code, (400, 404))
                 self.assertNotIn(b"secret", response.data)
 
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_delete_style_removes_database_records_and_files(self, generate):
+        self.save_key()
+        result = self.client.post(
+            "/api/style-maker/generate", json=self.request_payload()
+        ).get_json()
+        image_path = app.GENERATED_DIR / result["image_path"]
+        style_dir = image_path.parent
+
+        deleted = style_store.delete_style(
+            app.DB_PATH, app.GENERATED_DIR, result["style_id"]
+        )
+
+        self.assertEqual(
+            deleted, {"style_id": result["style_id"], "deleted": True}
+        )
+        self.assertFalse(image_path.exists())
+        self.assertFalse(style_dir.exists())
+        with closing(app.db()) as conn:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM art_styles").fetchone()[0], 0
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM generated_images").fetchone()[0], 0
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM generation_requests").fetchone()[0], 0
+            )
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_delete_style_is_bounded_and_handles_missing_data(self, generate):
+        self.save_key()
+        result = self.client.post(
+            "/api/style-maker/generate", json=self.request_payload()
+        ).get_json()
+        generated_path = app.GENERATED_DIR / result["image_path"]
+        outside_path = app.DATA_DIR / "outside-generated.png"
+        outside_path.write_bytes(valid_png())
+        generated_path.unlink()
+        with closing(app.db()) as conn:
+            conn.execute(
+                "UPDATE generated_images SET image_path = ? WHERE id = ?",
+                ("../outside-generated.png", result["image_id"]),
+            )
+            conn.commit()
+
+        deleted = style_store.delete_style(
+            app.DB_PATH, app.GENERATED_DIR, result["style_id"]
+        )
+
+        self.assertEqual(deleted["deleted"], True)
+        self.assertTrue(outside_path.is_file())
+        self.assertIsNone(
+            style_store.delete_style(app.DB_PATH, app.GENERATED_DIR, 999999)
+        )
+
     def test_unknown_style_returns_404(self):
         response = self.client.get("/api/art-styles/999")
         self.assertEqual(response.status_code, 404)
