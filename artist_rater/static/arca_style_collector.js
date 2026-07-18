@@ -317,7 +317,7 @@ function imageRestoreEstimateText(estimate) {
   const local = Number(estimate?.local_images || 0);
   if (!missing) return `모든 이미지가 준비되어 있습니다 · 저장됨 ${local.toLocaleString()}장`;
   const basis = estimate?.estimate_source === "local_average" ? "현재 파일 평균 기준" : "이미지당 4 MB 기준";
-  return `누락 ${missing.toLocaleString()}장 · 예상 ${formatBytes(estimate?.estimated_download_bytes)} · 약 ${durationText(estimate?.estimated_seconds)} (${basis}, 인터넷 속도에 따라 달라짐)`;
+  return `누락 ${missing.toLocaleString()}장 · 예상 ${formatBytes(estimate?.estimated_download_bytes)} · 약 ${durationText(estimate?.estimated_seconds)} (${basis}, 사이트 제한·인터넷 속도에 따라 달라짐)`;
 }
 
 function collectionCountsText(job) {
@@ -612,23 +612,7 @@ function resetArcaImageRestoreEstimate() {
 
 async function prepareArcaImageRestore() {
   if (isArcaCollectionBusy(arcaState)) return;
-  arcaState.imageRestoreEstimate = null;
-  arcaState.collecting = true;
-  setArcaCollectionControlsDisabled(true);
-  const element = arcaEl("arcaImageRestoreEstimate");
-  if (element) element.textContent = "원본 게시글에서 최신 이미지 주소를 확인하는 중…";
-  arcaSetStatus("arcaCollectorStatus", "최신 이미지 주소를 갱신한 뒤 용량과 시간을 계산합니다.");
-  try {
-    const result = await arcaFetch("/api/arca-styles/restore-images/prepare", { method: "POST", body: "{}" });
-    arcaState.activeJobId = result.job_id;
-    await pollArcaCollectionJob(result.job_id);
-  } catch (error) {
-    arcaState.activeJobId = null;
-    arcaState.collecting = false;
-    setArcaCollectionControlsDisabled(false);
-    resetArcaImageRestoreEstimate();
-    arcaSetStatus("arcaCollectorStatus", error.message, "error");
-  }
+  await loadArcaImageRestoreEstimate();
 }
 
 function scheduleArcaSearchCoverage() {
@@ -1440,9 +1424,17 @@ async function collectArcaStyles() {
 async function restoreArcaImages() {
   if (isArcaCollectionBusy(arcaState)) return;
   if (Number(arcaState.imageRestoreEstimate?.missing_images || 0) <= 0) return;
+  if (!arcaState.browserConnected) {
+    arcaSetStatus("arcaCollectorStatus", "R18 게시글 확인을 위해 Chrome 로그인을 연결합니다.");
+    await importArcaBrowserSession();
+    if (!arcaState.browserConnected) {
+      arcaSetStatus("arcaCollectorStatus", "Chrome 로그인을 연결한 뒤 다시 다운로드를 시작해 주세요.", "error");
+      return;
+    }
+  }
   arcaState.collecting = true;
   setArcaCollectionControlsDisabled(true);
-  arcaSetStatus("arcaCollectorStatus", "누락 이미지를 병렬로 받기 시작합니다.");
+  arcaSetStatus("arcaCollectorStatus", "게시글별 최신 주소를 확인하며 누락 이미지를 안전 속도로 받습니다.");
   try {
     const result = await arcaFetch("/api/arca-styles/restore-images", { method: "POST", body: "{}" });
     arcaState.activeJobId = result.job_id;

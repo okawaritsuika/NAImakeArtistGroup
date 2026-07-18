@@ -17,7 +17,7 @@ from http.cookiejar import CookieJar
 from itertools import combinations
 from pathlib import Path
 from statistics import median
-from threading import Event, RLock, Thread
+from threading import Event, Lock, RLock, Thread
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
@@ -37,7 +37,12 @@ EDITABLE_LIMIT = 100_000
 SEARCH_SCOPE = "title-category-session-v6"
 MAX_ARCHIVE_SEARCH_PAGE = 4096
 COLLECTION_WORKERS = 6
-IMAGE_RESTORE_WORKERS = 16
+IMAGE_RESTORE_WORKERS = 1
+ARTICLE_REFRESH_INTERVAL_SECONDS = 0.55
+IMAGE_DOWNLOAD_INTERVAL_SECONDS = 1.1
+TRANSIENT_REQUEST_ATTEMPTS = 8
+RATE_LIMIT_REQUEST_ATTEMPTS = 24
+TRANSIENT_RETRY_DELAYS = (2, 4, 8, 15, 30, 30, 30)
 DEFAULT_IMAGE_ESTIMATE_BYTES = 4 * 1024 * 1024
 IMAGE_RESTORE_ESTIMATE_BYTES_PER_SECOND = 8 * 1024 * 1024
 GENERATION_KEYS = {"seed", "sampler", "steps", "scale", "noise_schedule", "model", "width", "height"}
@@ -68,6 +73,25 @@ _ARCA_BROWSER_COOKIES = CookieJar()
 _ARCA_BROWSER_STATUS = {"connected": False, "browser": "", "error": ""}
 _COLLECTION_CONTROL_LOCK = RLock()
 _COLLECTION_CONTROLS = {}
+
+
+class _RequestPacer:
+    def __init__(self, interval_seconds):
+        self.interval_seconds = max(0.0, float(interval_seconds))
+        self._lock = Lock()
+        self._next_start = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_start - now)
+            self._next_start = max(now, self._next_start) + self.interval_seconds
+        if delay:
+            time.sleep(delay)
+
+    def defer(self, seconds):
+        with self._lock:
+            self._next_start = max(self._next_start, time.monotonic() + max(0.0, float(seconds)))
 
 
 def create_arca_session():
@@ -797,6 +821,11 @@ def start_url_collection_job(db_path, image_dir, source_url):
 def create_image_restore_job(db_path, image_dir):
     init_arca_style_tables(db_path)
     missing = _missing_image_rows(db_path, image_dir)
+    if any(row.get("board_tab") == "R18_NAI" for row in missing):
+        if not get_arca_browser_session_status()["connected"]:
+            raise ArcaBrowserSessionRequired(
+                "R18 공유 그림체 이미지를 받으려면 먼저 Chrome 로그인을 연결해 주세요."
+            )
     estimate = get_image_restore_estimate(db_path, image_dir)
     now = datetime.now().isoformat(timespec="seconds")
     with closing(_connect(db_path)) as conn, conn:
@@ -814,8 +843,10 @@ def create_image_restore_job(db_path, image_dir):
 def _missing_image_rows(db_path, image_dir):
     with closing(_connect(db_path)) as conn:
         rows = conn.execute(
-            "SELECT id,item_id,image_url,image_path,content_type FROM arca_style_images "
-            "WHERE metadata_status='ok' AND TRIM(COALESCE(image_url,''))<>'' ORDER BY id"
+            "SELECT i.id,i.item_id,i.image_url,i.image_path,i.content_type,"
+            "s.source_url,s.board_tab FROM arca_style_images i "
+            "JOIN arca_style_items s ON s.id=i.item_id "
+            "WHERE i.metadata_status='ok' AND TRIM(COALESCE(i.image_url,''))<>'' ORDER BY i.id"
         ).fetchall()
     return [dict(row) for row in rows if not _local_image_exists(image_dir, row["image_path"])]
 
@@ -995,6 +1026,11 @@ def get_image_restore_estimate(db_path, image_dir):
         else DEFAULT_IMAGE_ESTIMATE_BYTES
     )
     estimated_bytes = average_bytes * missing_images
+    missing_item_count = len({row["item_id"] for row in _missing_image_rows(db_path, image_dir)})
+    site_limited_seconds = round(
+        missing_images * IMAGE_DOWNLOAD_INTERVAL_SECONDS
+        + missing_item_count * ARTICLE_REFRESH_INTERVAL_SECONDS
+    )
     return {
         "total_images": total_images,
         "local_images": local_images,
@@ -1002,7 +1038,10 @@ def get_image_restore_estimate(db_path, image_dir):
         "local_bytes": sum(local_sizes),
         "average_image_bytes": average_bytes,
         "estimated_download_bytes": estimated_bytes,
-        "estimated_seconds": round(estimated_bytes / IMAGE_RESTORE_ESTIMATE_BYTES_PER_SECOND),
+        "estimated_seconds": max(
+            round(estimated_bytes / IMAGE_RESTORE_ESTIMATE_BYTES_PER_SECOND),
+            site_limited_seconds,
+        ),
         "estimate_source": "local_average" if local_images else "default_average",
         "parallel_workers": IMAGE_RESTORE_WORKERS,
     }
@@ -1010,6 +1049,7 @@ def get_image_restore_estimate(db_path, image_dir):
 
 def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
     rows = list(missing if missing is not None else _missing_image_rows(db_path, image_dir))
+    rows.sort(key=lambda row: (not _image_url_is_fresh(row["image_url"]), row["id"]))
     total = len(rows)
     update_collection_job(
         db_path, job_id, status="running", stage="restoring_images", total_pages=0,
@@ -1022,61 +1062,88 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
     session = create_arca_session()
     if get_arca_browser_session_status()["connected"]:
         _apply_imported_arca_cookies(session)
-
-    def fetch_one(row):
-        try:
-            data, content_type = download_image(session, row["image_url"])
-            return row, data, content_type
-        except (requests.RequestException, ArcaCollectorError):
-            return row, None, ""
-
+    article_session = _clone_arca_session(session, use_retries=False)
+    image_session = _clone_arca_session(session, use_retries=False)
+    session.close()
+    article_pacer = _RequestPacer(ARTICLE_REFRESH_INTERVAL_SECONDS)
+    image_pacer = _RequestPacer(IMAGE_DOWNLOAD_INTERVAL_SECONDS)
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row["item_id"]].append(row)
     restored = failed = processed = downloaded_bytes = 0
+    error_details = []
     started = time.monotonic()
-    workers = min(IMAGE_RESTORE_WORKERS, total)
-    pending_rows = iter(rows)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        pending = {}
-        for _ in range(workers):
-            row = next(pending_rows, None)
-            if row is None:
-                break
-            pending[executor.submit(fetch_one, row)] = row
-        while pending:
+    try:
+        for item_rows in grouped.values():
             _wait_for_collection_control(db_path, job_id, "restoring_images")
-            future = next(as_completed(tuple(pending)))
-            pending.pop(future)
-            row, data, content_type = future.result()
-            processed += 1
-            if data is None:
-                failed += 1
-            else:
+            source_url = item_rows[0]["source_url"]
+            fresh_urls = {
+                _image_identity(row["image_url"]): row["image_url"]
+                for row in item_rows if _image_url_is_fresh(row["image_url"])
+            }
+            if len(fresh_urls) < len(item_rows):
                 try:
-                    path = save_image_bytes(image_dir, row["image_url"], data, content_type)
-                except OSError:
+                    html = _with_transient_retries(
+                        lambda: fetch_html(article_session, source_url), article_pacer
+                    )
+                    article = extract_article_data(html, source_url)
+                    fresh_urls.update(
+                        {_image_identity(url): url for url in article.get("image_urls", [])}
+                    )
+                    _refresh_item_image_urls(db_path, item_rows[0]["item_id"], article)
+                except (requests.RequestException, ArcaCollectorError) as exc:
+                    error_details.append(f"게시글 {source_url}: {_request_error_text(exc)}")
+            for row in item_rows:
+                _wait_for_collection_control(db_path, job_id, "restoring_images")
+                fresh_url = fresh_urls.get(_image_identity(row["image_url"]))
+                data = None
+                content_type = ""
+                if fresh_url:
+                    try:
+                        data, content_type = _with_transient_retries(
+                            lambda url=fresh_url: download_image(image_session, url), image_pacer
+                        )
+                    except (requests.RequestException, ArcaCollectorError) as exc:
+                        error_details.append(f"이미지 {row['id']}: {_request_error_text(exc)}")
+                elif fresh_urls:
+                    error_details.append(f"이미지 {row['id']}: 현재 게시글에서 원본을 찾지 못했습니다.")
+                processed += 1
+                if data is None:
                     failed += 1
                 else:
-                    restored += 1
-                    downloaded_bytes += len(data)
-                    with closing(_connect(db_path)) as conn, conn:
-                        conn.execute(
-                            "UPDATE arca_style_images SET image_path=?,content_type=? WHERE id=?",
-                            (path, content_type, row["id"]),
-                        )
-                        conn.execute(
-                            "UPDATE arca_style_items SET representative_image_path=? "
-                            "WHERE id=? AND representative_image_url=?",
-                            (path, row["item_id"], row["image_url"]),
-                        )
-            average = (time.monotonic() - started) / processed
-            update_collection_job(
-                db_path, job_id, stage="restoring_images", scanned_posts=processed,
-                downloaded_images=restored, downloaded_bytes=downloaded_bytes,
-                updated=restored, average_post_seconds=average,
-            )
-            row = next(pending_rows, None)
-            if row is not None:
-                pending[executor.submit(fetch_one, row)] = row
-    error = f"{failed}개 이미지를 받지 못했습니다. 다시 실행하면 실패한 이미지만 재시도합니다." if failed else ""
+                    try:
+                        path = save_image_bytes(image_dir, fresh_url, data, content_type)
+                    except OSError as exc:
+                        failed += 1
+                        error_details.append(f"이미지 {row['id']}: 파일 저장 실패 ({exc})")
+                    else:
+                        restored += 1
+                        downloaded_bytes += len(data)
+                        with closing(_connect(db_path)) as conn, conn:
+                            conn.execute(
+                                "UPDATE arca_style_images SET image_url=?,image_path=?,content_type=? WHERE id=?",
+                                (fresh_url, path, content_type, row["id"]),
+                            )
+                            conn.execute(
+                                "UPDATE arca_style_items SET representative_image_path=? "
+                                "WHERE id=? AND representative_image_url=?",
+                                (path, row["item_id"], fresh_url),
+                            )
+                average = (time.monotonic() - started) / processed
+                update_collection_job(
+                    db_path, job_id, stage="restoring_images", scanned_posts=processed,
+                    downloaded_images=restored, downloaded_bytes=downloaded_bytes,
+                    updated=restored, average_post_seconds=average,
+                )
+    finally:
+        article_session.close()
+        image_session.close()
+    error = ""
+    if failed:
+        detail = " / ".join(error_details[:3])
+        error = f"{failed}개 이미지를 받지 못했습니다."
+        if detail:
+            error += f" 원인: {detail}"
     update_collection_job(
         db_path, job_id, status="completed", stage="completed", scanned_posts=processed,
         downloaded_images=restored, downloaded_bytes=downloaded_bytes,
@@ -1893,14 +1960,58 @@ def fetch_html(session, url):
     return response.text
 
 
-def _clone_arca_session(session):
-    cloned = create_arca_session()
+def _clone_arca_session(session, use_retries=True):
+    cloned = create_arca_session() if use_retries else requests.Session()
     headers = getattr(session, "headers", None)
     if headers:
         cloned.headers.update(dict(headers))
     for cookie in getattr(session, "cookies", ()):
         cloned.cookies.set_cookie(copy.copy(cookie))
     return cloned
+
+
+def _request_error_text(exc):
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return f"HTTP {status}" if status else str(exc)
+
+
+def _image_url_is_fresh(value, minimum_seconds=120):
+    parsed = urlparse(str(value or ""))
+    if parsed.netloc.lower() != "ac.namu.la":
+        return bool(parsed.scheme and parsed.netloc)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    try:
+        expires = int(query.get("expires", 0))
+    except (TypeError, ValueError):
+        return False
+    return expires > time.time() + minimum_seconds
+
+
+def _is_transient_request_error(exc):
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status in {429, 500, 502, 503, 504} or status is None
+
+
+def _with_transient_retries(operation, pacer):
+    attempt = 0
+    while True:
+        pacer.wait()
+        try:
+            return operation()
+        except requests.RequestException as exc:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            limit = RATE_LIMIT_REQUEST_ATTEMPTS if status == 429 else TRANSIENT_REQUEST_ATTEMPTS
+            if not _is_transient_request_error(exc) or attempt + 1 >= limit:
+                raise
+            delay = TRANSIENT_RETRY_DELAYS[min(attempt, len(TRANSIENT_RETRY_DELAYS) - 1)]
+            retry_after = getattr(response, "headers", {}).get("Retry-After", "") if response is not None else ""
+            if str(retry_after).isdigit():
+                delay = max(delay, int(retry_after))
+            pacer.defer(delay)
+            attempt += 1
 
 
 def _fetch_article_htmls(session, search_items):

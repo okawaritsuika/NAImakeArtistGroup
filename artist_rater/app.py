@@ -47,7 +47,6 @@ from arca_style_collector import (
     revalidate_stored_metadata,
     start_collection_job,
     start_image_restore_job,
-    start_image_url_refresh_job,
     start_url_collection_job,
     resume_collection_job,
     stop_collection_job,
@@ -1267,11 +1266,7 @@ def api_restore_arca_style_images():
 
 @app.route("/api/arca-styles/restore-images/prepare", methods=["POST"])
 def api_prepare_arca_style_images():
-    try:
-        job_id = start_image_url_refresh_job(DB_PATH, ARCA_STYLE_IMAGE_DIR)
-        return json_response({"job_id": job_id, "status": "queued"}, 202)
-    except ArcaCollectorError as exc:
-        return json_response({"error": str(exc)}, 400)
+    return json_response(get_image_restore_estimate(DB_PATH, ARCA_STYLE_IMAGE_DIR))
 
 
 @app.route("/api/arca-styles/restore-images/estimate")

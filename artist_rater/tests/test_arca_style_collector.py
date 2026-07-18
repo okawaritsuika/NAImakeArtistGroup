@@ -14,6 +14,7 @@ from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 from unittest.mock import patch
 from PIL import Image
+import requests
 
 import arca_style_collector as collector_module
 from arca_style_collector import (
@@ -281,30 +282,107 @@ class ArcaCollectorTest(unittest.TestCase):
             self.assertIsNone(conn.execute("SELECT artist_tag,score FROM ratings").fetchone())
             self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache").fetchone()[0], 1234)
 
-    def test_image_restore_uses_saved_urls_without_fetching_posts(self):
+    def test_image_restore_refreshes_each_fixed_post_before_downloading(self):
         image_dir = Path(self.temp.name) / "images"
+        old_url = "https://ac.namu.la/path/1.png?expires=1&key=old&type=orig"
+        fresh_url = "https://ac.namu.la/path/1.png?expires=9999999999&key=fresh&type=orig"
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             item_id = conn.execute(
                 "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_url,metadata_status) VALUES(?,?,?,?,?)",
-                ("https://arca.live/b/aiart/1", "now", "now", "https://img/1.png", "ok"),
+                ("https://arca.live/b/aiart/1", "now", "now", old_url, "ok"),
             ).lastrowid
             conn.execute(
                 "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,created_at) VALUES(?,?,?,?,?)",
-                (item_id, "https://img/1.png", "", "ok", "now"),
+                (item_id, old_url, "", "ok", "now"),
             )
         job_id, missing = create_image_restore_job(self.db_path, image_dir)
-        with patch.object(collector_module, "download_image", return_value=(b"png-bytes", "image/png")):
+        html = f'<div class="article-content"><img src="{fresh_url}"></div><span>NAI</span>'
+        with (
+            patch.object(collector_module, "fetch_html", return_value=html) as fetch,
+            patch.object(collector_module, "download_image", return_value=(b"png-bytes", "image/png")) as download,
+        ):
             result = restore_arca_style_images(self.db_path, image_dir, job_id, missing)
         self.assertEqual(result, {"restored": 1, "failed": 0, "downloaded_bytes": 9, "skipped_existing": False})
+        fetch.assert_called_once()
+        self.assertEqual(download.call_args.args[1], fresh_url)
         with closing(sqlite3.connect(self.db_path)) as conn:
-            image_path = conn.execute("SELECT image_path FROM arca_style_images").fetchone()[0]
+            image_url, image_path = conn.execute("SELECT image_url,image_path FROM arca_style_images").fetchone()
             representative = conn.execute("SELECT representative_image_path FROM arca_style_items").fetchone()[0]
+        self.assertEqual(image_url, fresh_url)
         self.assertEqual(representative, image_path)
         self.assertEqual((image_dir / image_path).read_bytes(), b"png-bytes")
 
         estimate = get_image_restore_estimate(self.db_path, image_dir)
         self.assertEqual((estimate["total_images"], estimate["local_images"], estimate["missing_images"]), (1, 1, 0))
         self.assertEqual(estimate["local_bytes"], 9)
+
+    def test_image_restore_retries_429_in_the_same_run(self):
+        image_dir = Path(self.temp.name) / "images"
+        old_url = "https://ac.namu.la/path/2.png?expires=1&key=old&type=orig"
+        fresh_url = "https://ac.namu.la/path/2.png?expires=9999999999&key=fresh&type=orig"
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_url,metadata_status) VALUES(?,?,?,?,?)",
+                ("https://arca.live/b/aiart/2", "now", "now", old_url, "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,created_at) VALUES(?,?,?,?,?)",
+                (item_id, old_url, "", "ok", "now"),
+            )
+        job_id, missing = create_image_restore_job(self.db_path, image_dir)
+        html = f'<div class="article-content"><img src="{fresh_url}"></div><span>NAI</span>'
+        response = requests.Response()
+        response.status_code = 429
+        rate_limit_error = requests.HTTPError("rate limited", response=response)
+        with (
+            patch.object(collector_module, "IMAGE_DOWNLOAD_INTERVAL_SECONDS", 0),
+            patch.object(collector_module, "TRANSIENT_RETRY_DELAYS", (0,) * 7),
+            patch.object(collector_module, "fetch_html", return_value=html),
+            patch.object(
+                collector_module,
+                "download_image",
+                side_effect=[rate_limit_error, (b"retried", "image/png")],
+            ) as download,
+        ):
+            result = restore_arca_style_images(self.db_path, image_dir, job_id, missing)
+        self.assertEqual(result["restored"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(download.call_count, 2)
+
+    def test_image_restore_reuses_still_valid_signed_url_without_refetching_post(self):
+        image_dir = Path(self.temp.name) / "images"
+        fresh_url = "https://ac.namu.la/path/3.png?expires=9999999999&key=fresh&type=orig"
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_url,metadata_status) VALUES(?,?,?,?,?)",
+                ("https://arca.live/b/aiart/3", "now", "now", fresh_url, "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,created_at) VALUES(?,?,?,?,?)",
+                (item_id, fresh_url, "", "ok", "now"),
+            )
+        job_id, missing = create_image_restore_job(self.db_path, image_dir)
+        with (
+            patch.object(collector_module, "fetch_html", side_effect=AssertionError("post must not be fetched")),
+            patch.object(collector_module, "download_image", return_value=(b"cached-url", "image/png")) as download,
+        ):
+            result = restore_arca_style_images(self.db_path, image_dir, job_id, missing)
+        self.assertEqual(result["restored"], 1)
+        download.assert_called_once()
+
+    def test_image_restore_requires_login_for_missing_r18_images(self):
+        image_dir = Path(self.temp.name) / "images"
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,board_tab,collected_at,updated_at,metadata_status) VALUES(?,?,?,?,?)",
+                ("https://arca.live/b/aiart/4", "R18_NAI", "now", "now", "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,created_at) VALUES(?,?,?,?,?)",
+                (item_id, "https://ac.namu.la/path/4.png?expires=1&key=old", "", "ok", "now"),
+            )
+        with self.assertRaises(ArcaBrowserSessionRequired):
+            create_image_restore_job(self.db_path, image_dir)
 
     def test_image_url_refresh_replaces_expired_signature_without_losing_metadata(self):
         image_dir = Path(self.temp.name) / "images"

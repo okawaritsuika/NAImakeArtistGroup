@@ -105,6 +105,8 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn("loadCurrentArcaCollectionJob", source)
         self.assertIn("controlArcaCollection", source)
         self.assertIn("/api/arca-styles/collection-jobs/current", source)
+        self.assertNotIn("/api/arca-styles/restore-images/prepare", source)
+        self.assertIn("await loadArcaImageRestoreEstimate()", source)
         css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
         self.assertIn(".arca-style-list-scroll", css)
         self.assertIn("overflow-y: auto", css)
