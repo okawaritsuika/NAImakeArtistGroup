@@ -12,6 +12,8 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
             'data-tab="arca-style-collector"', 'id="arca-style-collector-tab"',
             'data-tab="arca-style-statistics"', 'id="arca-style-statistics-tab"',
             'id="collectArcaStyles"', 'id="restoreArcaImages"',
+            'id="downloadArcaImageArchive"', 'id="chooseArcaImageArchive"',
+            'id="arcaImageArchiveFile"', 'id="arcaImageArchiveStatus"',
             'id="confirmRestoreArcaImages"', 'id="cancelRestoreArcaImages"',
             'id="arcaSearchCoverage"', 'id="arcaStyleList"',
             'id="arcaStyleDialog"', 'id="saveArcaStyle"', 'id="deleteArcaStyle"',
@@ -68,6 +70,7 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
             "loadArcaStyles", "collectArcaStyles", "pollArcaCollectionJob",
             "openArcaStyle", "renderArcaStyleGroups", "saveArcaStyle", "deleteArcaStyle",
             "collectArcaUrl", "restoreArcaImages", "prepareArcaImageRestore", "loadArcaImageRestoreEstimate",
+            "startGoogleArcaImageArchive", "uploadLocalArcaImageArchive",
             "loadArcaBrowserSession", "importArcaBrowserSession",
             "setupArcaSessionBridge", "loadArcaSearchCoverage", "loadArcaStyleStatistics",
             "renderArcaPagination", "applyArcaCardSize", "goToArcaPage",
@@ -105,6 +108,8 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn("loadCurrentArcaCollectionJob", source)
         self.assertIn("controlArcaCollection", source)
         self.assertIn("/api/arca-styles/collection-jobs/current", source)
+        self.assertIn("/api/arca-styles/image-archive/google", source)
+        self.assertIn("/api/arca-styles/image-archive/upload/start", source)
         self.assertNotIn("/api/arca-styles/restore-images/prepare", source)
         self.assertIn("await loadArcaImageRestoreEstimate()", source)
         css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")

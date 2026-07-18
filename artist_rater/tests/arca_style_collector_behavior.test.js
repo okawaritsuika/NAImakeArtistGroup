@@ -225,6 +225,10 @@ test("collection progress handles known and unknown totals", () => {
   assert.equal(arcaSummaryText({ job_type: "image_restore", downloaded_images: 30 }), "이미지 30개를 복원했습니다.");
   assert.equal(collectionCountsText({ job_type: "image_url_refresh", updated: 25, progress: { posts: [3, 10] } }), "게시글 주소 갱신 3/10 · 이미지 URL 25개");
   assert.equal(arcaSummaryText({ job_type: "image_url_refresh", scanned_posts: 10, updated: 25 }), "게시글 10개를 확인하고 이미지 URL 25개를 갱신했습니다.");
+  assert.deepEqual(collectionProgress({ job_type: "image_archive", stage: "downloading_archive", progress: { bytes: [25, 100], posts: [0, 1687] } }), { determinate: true, percent: 25 });
+  assert.equal(collectionCountsText({ job_type: "image_archive", stage: "downloading_archive", progress: { bytes: [1024, 2048], posts: [0, 1687] } }), "ZIP 다운로드 1.00 KB/2.00 KB");
+  assert.equal(collectionCountsText({ job_type: "image_archive", stage: "extracting_archive", progress: { posts: [500, 1687], images: 499 } }), "압축 해제 500/1687 · 준비 499장");
+  assert.equal(arcaSummaryText({ job_type: "image_archive", downloaded_images: 1687 }), "공유 그림체 이미지 1687장을 ZIP에서 설치했습니다.");
 });
 
 test("style group helpers separate prompt sections", () => {

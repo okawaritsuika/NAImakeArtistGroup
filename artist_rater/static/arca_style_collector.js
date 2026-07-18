@@ -261,6 +261,9 @@ function arcaBrowserSessionAction(status, hasPendingCollection = false) {
 
 function arcaSummaryText(result) {
   if (result.error) return String(result.error);
+  if (result.job_type === "image_archive") {
+    return `공유 그림체 이미지 ${result.downloaded_images || 0}장을 ZIP에서 설치했습니다.`;
+  }
   if (result.job_type === "image_url_refresh") {
     return result.skipped_existing
       ? "받을 이미지가 없습니다."
@@ -279,6 +282,17 @@ function arcaSummaryText(result) {
 function collectionProgress(job) {
   if (job?.status === "completed" && job?.skipped_existing) {
     return { determinate: true, percent: 100 };
+  }
+  if (job?.job_type === "image_archive") {
+    if (job.stage === "downloading_archive") {
+      const bytes = job?.progress?.bytes || [0, null];
+      const done = Number(bytes[0] || 0);
+      const total = bytes[1] == null ? null : Number(bytes[1]);
+      return total && Number.isFinite(total)
+        ? { determinate: true, percent: Math.min(100, Math.round(done * 100 / total)) }
+        : { determinate: false, percent: 0 };
+    }
+    if (job.stage === "verifying_archive") return { determinate: false, percent: 0 };
   }
   const posts = job?.progress?.posts || [job?.scanned_posts || 0, job?.total_posts ?? null];
   const done = Number(posts[0] || 0);
@@ -328,6 +342,14 @@ function collectionCountsText(job) {
   const pages = progress.pages || [0, null];
   const posts = progress.posts || [0, null];
   const total = (pair) => pair[1] == null ? "?" : pair[1];
+  if (job?.job_type === "image_archive") {
+    const bytes = progress.bytes || [job?.downloaded_bytes || 0, job?.estimated_bytes ?? null];
+    if (job.stage === "downloading_archive") {
+      return `ZIP 다운로드 ${formatBytes(bytes[0])}/${bytes[1] == null ? "?" : formatBytes(bytes[1])}`;
+    }
+    if (job.stage === "verifying_archive") return "ZIP SHA-256 및 매니페스트 확인 중";
+    return `압축 해제 ${posts[0] || 0}/${total(posts)} · 준비 ${progress.images || 0}장`;
+  }
   if (job?.job_type === "image_url_refresh") {
     return `게시글 주소 갱신 ${posts[0] || 0}/${total(posts)} · 이미지 URL ${job.updated || 0}개`;
   }
@@ -419,7 +441,11 @@ function renderArcaCollectionProgress(job) {
   };
   const progress = collectionProgress(job);
   const bar = arcaEl("arcaCollectionProgress");
-  arcaEl("arcaCollectionState").textContent = job.job_type === "image_restore" && job.status === "running"
+  arcaEl("arcaCollectionState").textContent = job.job_type === "image_archive" && job.status === "running"
+    ? job.stage === "downloading_archive" ? "ZIP 다운로드 중"
+      : job.stage === "verifying_archive" ? "ZIP 검증 중"
+        : "ZIP 압축 해제 중"
+    : job.job_type === "image_restore" && job.status === "running"
     ? "이미지 복원 중"
     : job.job_type === "image_url_refresh" && job.status === "running"
       ? "최신 이미지 주소 확인 중"
@@ -445,7 +471,7 @@ function renderArcaCollectionProgress(job) {
 }
 
 function setArcaCollectionControlsDisabled(disabled) {
-  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "arcaTabNai", "arcaTabR18Nai", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
+  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "downloadArcaImageArchive", "chooseArcaImageArchive", "arcaImageArchiveFile", "arcaTabNai", "arcaTabR18Nai", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
     const element = arcaEl(id);
     if (element) element.disabled = disabled;
   }
@@ -615,6 +641,70 @@ async function prepareArcaImageRestore() {
   await loadArcaImageRestoreEstimate();
 }
 
+async function startGoogleArcaImageArchive() {
+  if (isArcaCollectionBusy(arcaState)) return;
+  arcaState.collecting = true;
+  setArcaCollectionControlsDisabled(true);
+  arcaSetStatus("arcaImageArchiveStatus", "Google Drive ZIP 다운로드를 준비합니다.");
+  try {
+    const result = await arcaFetch("/api/arca-styles/image-archive/google", { method: "POST", body: "{}" });
+    arcaState.activeJobId = result.job_id;
+    arcaSetStatus("arcaImageArchiveStatus", "다운로드 중입니다. 중단되면 같은 버튼으로 이어받을 수 있습니다.");
+    await pollArcaCollectionJob(result.job_id);
+  } catch (error) {
+    arcaState.activeJobId = null;
+    arcaState.collecting = false;
+    setArcaCollectionControlsDisabled(false);
+    arcaSetStatus("arcaImageArchiveStatus", error.message, "error");
+  }
+}
+
+async function uploadLocalArcaImageArchive(file) {
+  if (!file || isArcaCollectionBusy(arcaState)) return;
+  arcaState.collecting = true;
+  setArcaCollectionControlsDisabled(true);
+  arcaSetStatus("arcaImageArchiveStatus", `로컬 ZIP 확인 중 · ${formatBytes(file.size)}`);
+  let upload = null;
+  try {
+    upload = await arcaFetch("/api/arca-styles/image-archive/upload/start", {
+      method: "POST",
+      body: JSON.stringify({ name: file.name, size: file.size }),
+    });
+    let offset = Number(upload.uploaded_bytes || 0);
+    const chunkBytes = Number(upload.chunk_bytes || 8 * 1024 * 1024);
+    while (offset < file.size) {
+      const chunk = file.slice(offset, Math.min(file.size, offset + chunkBytes));
+      const response = await fetch(
+        `/api/arca-styles/image-archive/upload/${encodeURIComponent(upload.upload_id)}?offset=${offset}`,
+        { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: chunk },
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      offset = Number(data.uploaded_bytes || 0);
+      const percent = Math.min(100, Math.round(offset * 100 / file.size));
+      arcaSetStatus("arcaImageArchiveStatus", `로컬 ZIP 전달 중 ${percent}% · ${formatBytes(offset)}/${formatBytes(file.size)}`);
+    }
+    const result = await arcaFetch(
+      `/api/arca-styles/image-archive/upload/${encodeURIComponent(upload.upload_id)}/finish`,
+      { method: "POST", body: "{}" },
+    );
+    arcaState.activeJobId = result.job_id;
+    arcaSetStatus("arcaImageArchiveStatus", "로컬 ZIP의 SHA-256을 확인하고 압축을 풉니다.");
+    await pollArcaCollectionJob(result.job_id);
+  } catch (error) {
+    if (upload?.upload_id) {
+      await fetch(`/api/arca-styles/image-archive/upload/${encodeURIComponent(upload.upload_id)}`, { method: "DELETE" }).catch(() => null);
+    }
+    arcaState.activeJobId = null;
+    arcaState.collecting = false;
+    setArcaCollectionControlsDisabled(false);
+    arcaSetStatus("arcaImageArchiveStatus", error.message, "error");
+  } finally {
+    const input = arcaEl("arcaImageArchiveFile");
+    if (input) input.value = "";
+  }
+}
+
 function scheduleArcaSearchCoverage() {
   clearTimeout(arcaState.coverageTimer);
   arcaState.coverageTimer = setTimeout(loadArcaSearchCoverage, 200);
@@ -631,6 +721,12 @@ async function pollArcaCollectionJob(jobId) {
       if (job.status === "completed") arcaState.activeJobId = null;
       arcaState.collecting = false;
       setArcaCollectionControlsDisabled(false);
+      if (job.job_type === "image_archive") {
+        const message = job.status === "completed"
+          ? arcaSummaryText(job)
+          : job.error || "ZIP 설치가 중단되었습니다.";
+        arcaSetStatus("arcaImageArchiveStatus", message, job.status === "completed" ? "success" : "error");
+      }
       if (job.status === "completed") {
         arcaSetStatus("arcaCollectorStatus", arcaSummaryText(job), job.error ? "error" : "success");
         await Promise.all([loadArcaStyles(), loadArcaSearchCoverage(), loadArcaStyleStatistics(), loadArcaImageRestoreEstimate()]);
@@ -1524,6 +1620,9 @@ function bindArcaCollector() {
   arcaEl("restoreArcaImages")?.addEventListener("click", prepareArcaImageRestore);
   arcaEl("confirmRestoreArcaImages")?.addEventListener("click", restoreArcaImages);
   arcaEl("cancelRestoreArcaImages")?.addEventListener("click", resetArcaImageRestoreEstimate);
+  arcaEl("downloadArcaImageArchive")?.addEventListener("click", startGoogleArcaImageArchive);
+  arcaEl("chooseArcaImageArchive")?.addEventListener("click", () => arcaEl("arcaImageArchiveFile")?.click());
+  arcaEl("arcaImageArchiveFile")?.addEventListener("change", (event) => uploadLocalArcaImageArchive(event.target.files?.[0]));
   arcaEl("collectArcaUrl")?.addEventListener("click", collectArcaUrl);
   arcaEl("importArcaBrowserSession")?.addEventListener("click", importArcaBrowserSession);
   arcaEl("setupArcaSessionBridge")?.addEventListener("click", setupArcaSessionBridge);

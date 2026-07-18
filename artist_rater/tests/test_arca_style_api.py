@@ -149,6 +149,51 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.get_json(), {"missing_images": 12, "estimated_seconds": 30})
         get_estimate.assert_called_once_with(app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR)
 
+    @patch("app.start_google_archive_job")
+    def test_google_image_archive_route_starts_background_job(self, start_job):
+        start_job.return_value = 41
+        response = self.client.post("/api/arca-styles/image-archive/google", json={})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"job_id": 41, "status": "queued"})
+        start_job.assert_called_once_with(app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, app.DATA_DIR)
+
+    @patch("app.start_local_upload")
+    def test_local_image_archive_upload_route_returns_chunk_size(self, start_upload):
+        start_upload.return_value = {"upload_id": "a" * 32, "chunk_bytes": 8, "uploaded_bytes": 0}
+        response = self.client.post(
+            "/api/arca-styles/image-archive/upload/start",
+            json={"name": "copy.zip", "size": 123},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["chunk_bytes"], 8)
+        start_upload.assert_called_once_with(app.DATA_DIR, "copy.zip", 123)
+
+    @patch("app.append_local_upload")
+    def test_local_image_archive_chunk_route_streams_raw_body(self, append_upload):
+        append_upload.return_value = {"uploaded_bytes": 3, "total_bytes": 6}
+        response = self.client.put(
+            f"/api/arca-styles/image-archive/upload/{'a' * 32}?offset=0",
+            data=b"abc",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["uploaded_bytes"], 3)
+        self.assertEqual(append_upload.call_args.args[:2], ("a" * 32, 0))
+        self.assertEqual(append_upload.call_args.args[3], 3)
+
+    @patch("app.finish_local_upload")
+    def test_local_image_archive_finish_route_starts_install_job(self, finish_upload):
+        finish_upload.return_value = 42
+        response = self.client.post(
+            f"/api/arca-styles/image-archive/upload/{'b' * 32}/finish",
+            json={},
+        )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"job_id": 42, "status": "queued"})
+        finish_upload.assert_called_once_with(
+            app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, app.DATA_DIR, "b" * 32,
+        )
+
     @patch("app.get_arca_style_page")
     def test_list_passes_paging_sort_and_recommendation_filter(self, get_page):
         get_page.return_value = {"items": [], "page": 3, "per_page": 20, "total": 0, "total_pages": 1}

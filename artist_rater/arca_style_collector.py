@@ -590,7 +590,7 @@ def get_collection_job(db_path, job_id):
         "posts": [job["scanned_posts"], job["total_posts"]],
         "images": job["downloaded_images"],
     }
-    if job.get("job_type") == "image_restore":
+    if job.get("job_type") in {"image_restore", "image_archive"}:
         job["progress"]["bytes"] = [job.get("downloaded_bytes") or 0, job.get("estimated_bytes")]
     return job
 
@@ -678,6 +678,9 @@ def resume_collection_job(db_path, image_dir, job_id):
         return start_image_restore_job(db_path, image_dir)
     if job.get("job_type") == "image_url_refresh":
         return start_image_url_refresh_job(db_path, image_dir)
+    if job.get("job_type") == "image_archive":
+        from arca_image_archive import resume_archive_job
+        return resume_archive_job(db_path, image_dir, Path(image_dir).parent, job)
     try:
         payload = json.loads(job["request_json"])
     except (TypeError, json.JSONDecodeError):

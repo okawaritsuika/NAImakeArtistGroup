@@ -52,6 +52,17 @@ from arca_style_collector import (
     stop_collection_job,
     update_arca_style,
 )
+from arca_image_archive import (
+    ARCHIVE_BYTES,
+    ARCHIVE_FILENAME,
+    ARCHIVE_IMAGE_COUNT,
+    ARCHIVE_SHA256,
+    append_local_upload,
+    discard_local_upload,
+    finish_local_upload,
+    start_google_archive_job,
+    start_local_upload,
+)
 
 from novelai import (
     MODEL,
@@ -1272,6 +1283,66 @@ def api_prepare_arca_style_images():
 @app.route("/api/arca-styles/restore-images/estimate")
 def api_arca_style_image_restore_estimate():
     return json_response(get_image_restore_estimate(DB_PATH, ARCA_STYLE_IMAGE_DIR))
+
+
+@app.route("/api/arca-styles/image-archive")
+def api_arca_style_image_archive():
+    return json_response({
+        "filename": ARCHIVE_FILENAME,
+        "bytes": ARCHIVE_BYTES,
+        "image_count": ARCHIVE_IMAGE_COUNT,
+        "sha256": ARCHIVE_SHA256,
+    })
+
+
+@app.route("/api/arca-styles/image-archive/google", methods=["POST"])
+def api_download_arca_style_image_archive():
+    try:
+        job_id = start_google_archive_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, DATA_DIR)
+        return json_response({"job_id": job_id, "status": "queued"}, 202)
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/image-archive/upload/start", methods=["POST"])
+def api_start_arca_style_image_archive_upload():
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise ArcaCollectorError("로컬 ZIP 정보를 확인해 주세요.")
+        return json_response(start_local_upload(DATA_DIR, payload.get("name"), payload.get("size")))
+    except (ArcaCollectorError, TypeError, ValueError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/image-archive/upload/<upload_id>", methods=["PUT"])
+def api_append_arca_style_image_archive_upload(upload_id):
+    try:
+        offset = int(request.args.get("offset", ""))
+        result = append_local_upload(
+            upload_id,
+            offset,
+            request.stream,
+            request.content_length,
+        )
+        return json_response(result)
+    except (ArcaCollectorError, TypeError, ValueError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/image-archive/upload/<upload_id>", methods=["DELETE"])
+def api_discard_arca_style_image_archive_upload(upload_id):
+    discard_local_upload(upload_id)
+    return json_response({"discarded": True})
+
+
+@app.route("/api/arca-styles/image-archive/upload/<upload_id>/finish", methods=["POST"])
+def api_finish_arca_style_image_archive_upload(upload_id):
+    try:
+        job_id = finish_local_upload(DB_PATH, ARCA_STYLE_IMAGE_DIR, DATA_DIR, upload_id)
+        return json_response({"job_id": job_id, "status": "queued"}, 202)
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
 
 
 @app.route("/api/arca-styles/collection-jobs/<int:job_id>")
