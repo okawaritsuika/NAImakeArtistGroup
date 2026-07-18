@@ -67,7 +67,7 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         for marker in (
             "loadArcaStyles", "collectArcaStyles", "pollArcaCollectionJob",
             "openArcaStyle", "renderArcaStyleGroups", "saveArcaStyle", "deleteArcaStyle",
-            "collectArcaUrl", "restoreArcaImages", "loadArcaImageRestoreEstimate",
+            "collectArcaUrl", "restoreArcaImages", "prepareArcaImageRestore", "loadArcaImageRestoreEstimate",
             "loadArcaBrowserSession", "importArcaBrowserSession",
             "setupArcaSessionBridge", "loadArcaSearchCoverage", "loadArcaStyleStatistics",
             "renderArcaPagination", "applyArcaCardSize", "goToArcaPage",

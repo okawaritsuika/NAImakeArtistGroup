@@ -261,6 +261,11 @@ function arcaBrowserSessionAction(status, hasPendingCollection = false) {
 
 function arcaSummaryText(result) {
   if (result.error) return String(result.error);
+  if (result.job_type === "image_url_refresh") {
+    return result.skipped_existing
+      ? "받을 이미지가 없습니다."
+      : `게시글 ${result.scanned_posts || 0}개를 확인하고 이미지 URL ${result.updated || 0}개를 갱신했습니다.`;
+  }
   if (result.job_type === "image_restore") {
     return result.skipped_existing
       ? "받을 이미지가 없습니다."
@@ -323,6 +328,9 @@ function collectionCountsText(job) {
   const pages = progress.pages || [0, null];
   const posts = progress.posts || [0, null];
   const total = (pair) => pair[1] == null ? "?" : pair[1];
+  if (job?.job_type === "image_url_refresh") {
+    return `게시글 주소 갱신 ${posts[0] || 0}/${total(posts)} · 이미지 URL ${job.updated || 0}개`;
+  }
   if (job?.job_type === "image_restore") {
     const bytes = progress.bytes || [job?.downloaded_bytes || 0, job?.estimated_bytes ?? null];
     const byteTotal = bytes[1] == null ? "?" : formatBytes(bytes[1]);
@@ -413,7 +421,9 @@ function renderArcaCollectionProgress(job) {
   const bar = arcaEl("arcaCollectionProgress");
   arcaEl("arcaCollectionState").textContent = job.job_type === "image_restore" && job.status === "running"
     ? "이미지 복원 중"
-    : labels[job.status] || job.status;
+    : job.job_type === "image_url_refresh" && job.status === "running"
+      ? "최신 이미지 주소 확인 중"
+      : labels[job.status] || job.status;
   arcaEl("arcaCollectionState").dataset.state = job.status;
   arcaEl("arcaCollectionCounts").textContent = collectionCountsText(job);
   arcaEl("arcaCollectionElapsed").textContent = `경과 ${durationText(job.elapsed_seconds)}`;
@@ -598,6 +608,27 @@ function resetArcaImageRestoreEstimate() {
   arcaEl("cancelRestoreArcaImages")?.classList.add("hidden");
   const element = arcaEl("arcaImageRestoreEstimate");
   if (element) element.textContent = "아직 다운로드하지 않습니다. 먼저 아래 버튼으로 필요한 용량과 시간을 확인하세요.";
+}
+
+async function prepareArcaImageRestore() {
+  if (isArcaCollectionBusy(arcaState)) return;
+  arcaState.imageRestoreEstimate = null;
+  arcaState.collecting = true;
+  setArcaCollectionControlsDisabled(true);
+  const element = arcaEl("arcaImageRestoreEstimate");
+  if (element) element.textContent = "원본 게시글에서 최신 이미지 주소를 확인하는 중…";
+  arcaSetStatus("arcaCollectorStatus", "최신 이미지 주소를 갱신한 뒤 용량과 시간을 계산합니다.");
+  try {
+    const result = await arcaFetch("/api/arca-styles/restore-images/prepare", { method: "POST", body: "{}" });
+    arcaState.activeJobId = result.job_id;
+    await pollArcaCollectionJob(result.job_id);
+  } catch (error) {
+    arcaState.activeJobId = null;
+    arcaState.collecting = false;
+    setArcaCollectionControlsDisabled(false);
+    resetArcaImageRestoreEstimate();
+    arcaSetStatus("arcaCollectorStatus", error.message, "error");
+  }
 }
 
 function scheduleArcaSearchCoverage() {
@@ -1498,7 +1529,7 @@ function bindArcaCollector() {
   document.querySelector('[data-tab="arca-style-collector"]')?.addEventListener("click", () => { void loadArcaCollectorData(); });
   document.querySelector('[data-tab="arca-style-statistics"]')?.addEventListener("click", () => { if (!arcaState.statisticsLoaded) void loadArcaStyleStatistics(); });
   arcaEl("collectArcaStyles")?.addEventListener("click", collectArcaStyles);
-  arcaEl("restoreArcaImages")?.addEventListener("click", loadArcaImageRestoreEstimate);
+  arcaEl("restoreArcaImages")?.addEventListener("click", prepareArcaImageRestore);
   arcaEl("confirmRestoreArcaImages")?.addEventListener("click", restoreArcaImages);
   arcaEl("cancelRestoreArcaImages")?.addEventListener("click", resetArcaImageRestoreEstimate);
   arcaEl("collectArcaUrl")?.addEventListener("click", collectArcaUrl);

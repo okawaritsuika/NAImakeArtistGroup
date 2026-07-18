@@ -49,6 +49,7 @@ from arca_style_collector import (
     count_style_groups_for_item,
     create_collection_job,
     create_image_restore_job,
+    create_image_url_refresh_job,
     create_url_collection_job,
     delete_arca_style,
     get_collection_job,
@@ -65,6 +66,7 @@ from arca_style_collector import (
     pause_collection_job,
     resume_collection_job,
     restore_arca_style_images,
+    refresh_arca_style_image_urls,
     stop_collection_job,
     split_prompt_tags,
     update_collection_job,
@@ -303,6 +305,46 @@ class ArcaCollectorTest(unittest.TestCase):
         estimate = get_image_restore_estimate(self.db_path, image_dir)
         self.assertEqual((estimate["total_images"], estimate["local_images"], estimate["missing_images"]), (1, 1, 0))
         self.assertEqual(estimate["local_bytes"], 9)
+
+    def test_image_url_refresh_replaces_expired_signature_without_losing_metadata(self):
+        image_dir = Path(self.temp.name) / "images"
+        old_url = "https://ac.namu.la/path/image.png?expires=1&key=old&type=orig"
+        fresh_url = "https://ac.namu.la/path/image.png?expires=9999999999&key=fresh&type=orig"
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,board_tab,collected_at,updated_at,representative_image_url,metadata_status) VALUES(?,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/1", "NAI", "now", "now", old_url, "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,prompt,created_at) VALUES(?,?,?,?,?,?)",
+                (item_id, old_url, "", "ok", "artist:kept", "now"),
+            )
+        job_id, items = create_image_url_refresh_job(self.db_path, image_dir)
+        html = f'<div class="article-content"><img src="{fresh_url}"></div><span>NAI</span>'
+
+        with patch.object(collector_module, "fetch_html", return_value=html):
+            result = refresh_arca_style_image_urls(self.db_path, image_dir, job_id, items)
+
+        self.assertEqual(result, {"refreshed_urls": 1, "failed_posts": 0, "skipped_existing": False})
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            image = conn.execute("SELECT image_url,prompt,image_path FROM arca_style_images").fetchone()
+            representative = conn.execute("SELECT representative_image_url FROM arca_style_items").fetchone()[0]
+        self.assertEqual(image, (fresh_url, "artist:kept", ""))
+        self.assertEqual(representative, fresh_url)
+
+    def test_image_url_refresh_requires_login_when_r18_images_are_missing(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,board_tab,collected_at,updated_at,metadata_status) VALUES(?,?,?,?,?)",
+                ("https://arca.live/b/aiart/2", "R18_NAI", "now", "now", "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,created_at) VALUES(?,?,?,?,?)",
+                (item_id, "https://ac.namu.la/path/r18.png?expires=1&key=old", "", "ok", "now"),
+            )
+
+        with self.assertRaises(ArcaBrowserSessionRequired):
+            create_image_url_refresh_job(self.db_path, Path(self.temp.name) / "images")
     def test_collects_one_article_url_without_date_search(self):
         article_url = "https://arca.live/b/aiart/174457459"
         image_url = "https://img.example/direct.png"

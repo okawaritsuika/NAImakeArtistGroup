@@ -141,6 +141,14 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.get_json(), {"job_id": 31, "status": "queued"})
         start_job.assert_called_once_with(app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR)
 
+    @patch("app.start_image_url_refresh_job")
+    def test_prepare_image_restore_starts_url_refresh_job(self, start_job):
+        start_job.return_value = 32
+        response = self.client.post("/api/arca-styles/restore-images/prepare", json={})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"job_id": 32, "status": "queued"})
+        start_job.assert_called_once_with(app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR)
+
     @patch("app.get_arca_style_page")
     def test_list_passes_paging_sort_and_recommendation_filter(self, get_page):
         get_page.return_value = {"items": [], "page": 3, "per_page": 20, "total": 0, "total_pages": 1}

@@ -9,6 +9,7 @@ import launcher
 
 class FakeProcess:
     def __init__(self):
+        self.pid = 1234
         self.terminated = False
         self.waited = False
         self.returncode = None
@@ -86,6 +87,24 @@ class LauncherControllerTest(unittest.TestCase):
 
         self.assertEqual(launched[0], [str(Path("C:/App/DanbooruArtistRater.exe")), "--server"])
 
+    def test_frozen_stop_terminates_the_whole_server_process_tree(self):
+        calls = []
+        process = FakeProcess()
+
+        class Completed:
+            returncode = 0
+
+        controller = launcher.LauncherController(
+            frozen=True,
+            executable=Path("C:/App/DanbooruArtistRater.exe"),
+            process_run=lambda command, **kwargs: calls.append((command, kwargs)) or Completed(),
+        )
+        controller.process = process
+
+        self.assertEqual(controller.stop_server(), "서버를 종료했습니다.")
+        self.assertEqual(calls[0][0], ["taskkill", "/PID", "1234", "/T", "/F"])
+        self.assertIsNone(controller.process)
+
     def test_auto_open_setting_is_saved_in_data_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_dir = Path(temp_dir)
@@ -106,6 +125,25 @@ class LauncherControllerTest(unittest.TestCase):
         controller = launcher.LauncherController(urlopen=open_local)
         self.assertTrue(controller.wait_for_server(timeout_seconds=1))
         self.assertEqual(requested, [launcher.APP_URL])
+
+    def test_window_close_stops_server_before_destroying_root(self):
+        events = []
+
+        class Controller:
+            def stop_server(self):
+                events.append("stop")
+
+        class Root:
+            def destroy(self):
+                events.append("destroy")
+
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.controller = Controller()
+        app.root = Root()
+
+        app.close_app()
+
+        self.assertEqual(events, ["stop", "destroy"])
 
     def test_release_check_finds_newer_github_asset_and_notes(self):
         release = {

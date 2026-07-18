@@ -652,6 +652,8 @@ def resume_collection_job(db_path, image_dir, job_id):
         raise ArcaCollectorError("현재 작업은 이어서 시작할 수 없습니다.")
     if job.get("job_type") == "image_restore":
         return start_image_restore_job(db_path, image_dir)
+    if job.get("job_type") == "image_url_refresh":
+        return start_image_url_refresh_job(db_path, image_dir)
     try:
         payload = json.loads(job["request_json"])
     except (TypeError, json.JSONDecodeError):
@@ -816,6 +818,163 @@ def _missing_image_rows(db_path, image_dir):
             "WHERE metadata_status='ok' AND TRIM(COALESCE(image_url,''))<>'' ORDER BY id"
         ).fetchall()
     return [dict(row) for row in rows if not _local_image_exists(image_dir, row["image_path"])]
+
+
+def _items_with_missing_images(db_path, image_dir):
+    item_ids = sorted({row["item_id"] for row in _missing_image_rows(db_path, image_dir)})
+    if not item_ids:
+        return []
+    placeholders = ",".join("?" for _ in item_ids)
+    with closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            f"SELECT id,source_url,board_tab FROM arca_style_items WHERE id IN ({placeholders}) ORDER BY id",
+            item_ids,
+        ).fetchall()
+    return [dict(row) for row in rows if row["source_url"]]
+
+
+def _refresh_item_image_urls(db_path, item_id, article):
+    fresh_urls = {_image_identity(url): url for url in article.get("image_urls", [])}
+    if not fresh_urls:
+        return 0, 0
+    updated = matched = 0
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect(db_path)) as conn, conn:
+        rows = conn.execute(
+            "SELECT id,image_url FROM arca_style_images WHERE item_id=?",
+            (item_id,),
+        ).fetchall()
+        for row in rows:
+            fresh_url = fresh_urls.get(_image_identity(row["image_url"]))
+            if not fresh_url:
+                continue
+            matched += 1
+            if fresh_url != row["image_url"]:
+                cursor = conn.execute(
+                    "UPDATE OR IGNORE arca_style_images SET image_url=? WHERE id=?",
+                    (fresh_url, row["id"]),
+                )
+                updated += cursor.rowcount
+        item = conn.execute(
+            "SELECT representative_image_url FROM arca_style_items WHERE id=?",
+            (item_id,),
+        ).fetchone()
+        representative = fresh_urls.get(_image_identity(item[0])) if item and item[0] else ""
+        if representative:
+            conn.execute(
+                "UPDATE arca_style_items SET representative_image_url=?,updated_at=? WHERE id=?",
+                (representative, now, item_id),
+            )
+    return updated, matched
+
+
+def create_image_url_refresh_job(db_path, image_dir):
+    init_arca_style_tables(db_path)
+    items = _items_with_missing_images(db_path, image_dir)
+    if any(item.get("board_tab") == "R18_NAI" for item in items):
+        if not get_arca_browser_session_status()["connected"]:
+            raise ArcaBrowserSessionRequired(
+                "R18 공유 그림체의 최신 이미지 주소를 받으려면 먼저 Chrome 로그인을 연결해 주세요."
+            )
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect(db_path)) as conn, conn:
+        job_id = conn.execute(
+            "INSERT INTO arca_collection_jobs(request_json,job_type,status,stage,total_pages,total_posts,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                json.dumps({"mode": "image_url_refresh"}), "image_url_refresh",
+                "queued", "queued", 0, len(items), now, now,
+            ),
+        ).lastrowid
+    return job_id, items
+
+
+def refresh_arca_style_image_urls(db_path, image_dir, job_id, items=None):
+    targets = list(items if items is not None else _items_with_missing_images(db_path, image_dir))
+    total = len(targets)
+    update_collection_job(
+        db_path, job_id, status="running", stage="refreshing_image_urls",
+        total_pages=0, total_posts=total, scanned_posts=0, updated=0,
+    )
+    if not targets:
+        update_collection_job(db_path, job_id, status="completed", stage="completed", skipped_existing=1)
+        return {"refreshed_urls": 0, "failed_posts": 0, "skipped_existing": True}
+    session = create_arca_session()
+    if get_arca_browser_session_status()["connected"]:
+        _apply_imported_arca_cookies(session)
+
+    def refresh_one(item):
+        worker_session = _clone_arca_session(session)
+        try:
+            html = fetch_html(worker_session, item["source_url"])
+            article = extract_article_data(html, item["source_url"])
+            updated, matched = _refresh_item_image_urls(db_path, item["id"], article)
+            if not matched:
+                raise ArcaCollectorError("현재 게시글에서 기존 이미지 주소를 찾지 못했습니다.")
+            return updated, None
+        except (requests.RequestException, ArcaCollectorError) as exc:
+            return 0, str(exc)
+        finally:
+            worker_session.close()
+
+    processed = refreshed = failed = 0
+    started = time.monotonic()
+    workers = min(COLLECTION_WORKERS, total)
+    pending_targets = iter(targets)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+        for _ in range(workers):
+            item = next(pending_targets, None)
+            if item is None:
+                break
+            pending[executor.submit(refresh_one, item)] = item
+        while pending:
+            _wait_for_collection_control(db_path, job_id, "refreshing_image_urls")
+            future = next(as_completed(tuple(pending)))
+            pending.pop(future)
+            updated, error = future.result()
+            processed += 1
+            refreshed += updated
+            failed += int(bool(error))
+            update_collection_job(
+                db_path, job_id, stage="refreshing_image_urls", scanned_posts=processed,
+                updated=refreshed, average_post_seconds=(time.monotonic() - started) / processed,
+            )
+            item = next(pending_targets, None)
+            if item is not None:
+                pending[executor.submit(refresh_one, item)] = item
+    error = (
+        f"{failed}개 게시글의 이미지 주소를 갱신하지 못했습니다. 로그인 또는 삭제된 게시글을 확인해 주세요."
+        if failed else ""
+    )
+    estimate = get_image_restore_estimate(db_path, image_dir)
+    update_collection_job(
+        db_path, job_id, status="completed", stage="completed", scanned_posts=processed,
+        updated=refreshed, estimated_bytes=estimate["estimated_download_bytes"], error=error,
+    )
+    return {"refreshed_urls": refreshed, "failed_posts": failed, "skipped_existing": False}
+
+
+def _run_image_url_refresh_job(db_path, image_dir, job_id, items):
+    try:
+        refresh_arca_style_image_urls(db_path, image_dir, job_id, items)
+    except ArcaCollectionStopped as exc:
+        update_collection_job(db_path, job_id, status="stopped", stage="stopped", error=str(exc))
+    except Exception as exc:
+        update_collection_job(db_path, job_id, status="failed", stage="failed", error=str(exc)[:1000])
+    finally:
+        _remove_collection_control(job_id)
+
+
+def start_image_url_refresh_job(db_path, image_dir):
+    job_id, items = create_image_url_refresh_job(db_path, image_dir)
+    _register_collection_control(job_id)
+    Thread(
+        target=_run_image_url_refresh_job,
+        args=(db_path, image_dir, job_id, items),
+        daemon=True,
+    ).start()
+    return job_id
 
 
 def get_image_restore_estimate(db_path, image_dir):

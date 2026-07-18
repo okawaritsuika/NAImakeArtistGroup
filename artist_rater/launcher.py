@@ -86,6 +86,7 @@ class LauncherController:
         data_dir=None,
         current_version=CURRENT_VERSION,
         popen=None,
+        process_run=None,
         browser_open=None,
         urlopen=None,
         executable=None,
@@ -99,6 +100,7 @@ class LauncherController:
         self.data_dir = Path(data_dir or resolved_data_dir)
         self.current_version = current_version
         self.popen = popen or subprocess.Popen
+        self.process_run = process_run or subprocess.run
         self.browser_open = browser_open or webbrowser.open
         self.urlopen = urlopen or globals()["urlopen"]
         self.executable = Path(executable or sys.executable).resolve()
@@ -152,12 +154,27 @@ class LauncherController:
     def stop_server(self):
         if not self.is_server_running():
             return "실행 중인 서버가 없습니다."
+        if os.name == "nt" and self.frozen:
+            completed = self.process_run(
+                ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if completed.returncode == 0:
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                self.process = None
+                return "서버를 종료했습니다."
         self.process.terminate()
         try:
             self.process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=5)
+        self.process = None
         return "서버를 종료했습니다."
 
     def open_site(self):
@@ -238,6 +255,7 @@ class LauncherApp:
         self.root.geometry("520x560")
         self.root.minsize(500, 540)
         self.root.configure(bg=LAUNCHER_THEME["window_bg"])
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
 
         shell = Frame(self.root, bg=LAUNCHER_THEME["window_bg"])
         shell.pack(fill=BOTH, expand=True, padx=22, pady=22)
@@ -427,6 +445,12 @@ class LauncherApp:
 
     def stop_server(self):
         self.set_status(self.controller.stop_server())
+
+    def close_app(self):
+        try:
+            self.controller.stop_server()
+        finally:
+            self.root.destroy()
 
     def open_site(self):
         self.set_status(self.controller.open_site())

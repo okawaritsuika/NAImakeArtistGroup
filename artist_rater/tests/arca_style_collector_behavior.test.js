@@ -223,6 +223,8 @@ test("collection progress handles known and unknown totals", () => {
   assert.equal(imageRestoreEstimateText({ missing_images: 2, local_images: 1, estimated_download_bytes: 8 * 1024 * 1024, estimated_seconds: 65, estimate_source: "default_average" }), "누락 2장 · 예상 8.00 MB · 약 1분 5초 (이미지당 4 MB 기준, 인터넷 속도에 따라 달라짐)");
   assert.equal(collectionCountsText({ job_type: "image_restore", progress: { posts: [12, 30], images: 10, bytes: [1024, 2048] } }), "이미지 확인 12/30 · 복원 10장 · 1.00 KB/2.00 KB");
   assert.equal(arcaSummaryText({ job_type: "image_restore", downloaded_images: 30 }), "이미지 30개를 복원했습니다.");
+  assert.equal(collectionCountsText({ job_type: "image_url_refresh", updated: 25, progress: { posts: [3, 10] } }), "게시글 주소 갱신 3/10 · 이미지 URL 25개");
+  assert.equal(arcaSummaryText({ job_type: "image_url_refresh", scanned_posts: 10, updated: 25 }), "게시글 10개를 확인하고 이미지 URL 25개를 갱신했습니다.");
 });
 
 test("style group helpers separate prompt sections", () => {
