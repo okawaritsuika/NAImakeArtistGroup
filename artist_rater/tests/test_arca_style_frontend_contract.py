@@ -11,7 +11,9 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         for marker in (
             'data-tab="arca-style-collector"', 'id="arca-style-collector-tab"',
             'data-tab="arca-style-statistics"', 'id="arca-style-statistics-tab"',
-            'id="collectArcaStyles"', 'id="restoreArcaImages"', 'id="arcaSearchCoverage"', 'id="arcaStyleList"',
+            'id="collectArcaStyles"', 'id="restoreArcaImages"',
+            'id="confirmRestoreArcaImages"', 'id="cancelRestoreArcaImages"',
+            'id="arcaSearchCoverage"', 'id="arcaStyleList"',
             'id="arcaStyleDialog"', 'id="saveArcaStyle"', 'id="deleteArcaStyle"',
             'id="arcaStyleSourceLink"',
             'id="arcaCollectionState"', 'id="arcaCollectionProgress"',
@@ -52,6 +54,11 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertNotIn('id="arcaKeyword"', html)
         self.assertNotIn('id="arcaMaxPages"', html)
         self.assertNotIn('id="arcaMaxPosts"', html)
+        self.assertIn("먼저 아래 버튼으로 필요한 용량과 시간을 확인하세요", html)
+
+        css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+        self.assertIn(".arca-collector-panel", css)
+        self.assertIn("overflow-y: auto", css)
 
     def test_archive_script_uses_safe_dom_and_required_operations(self):
         source = (ROOT / "static" / "arca_style_collector.js").read_text(encoding="utf-8")
@@ -60,7 +67,7 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         for marker in (
             "loadArcaStyles", "collectArcaStyles", "pollArcaCollectionJob",
             "openArcaStyle", "renderArcaStyleGroups", "saveArcaStyle", "deleteArcaStyle",
-            "collectArcaUrl", "restoreArcaImages",
+            "collectArcaUrl", "restoreArcaImages", "loadArcaImageRestoreEstimate",
             "loadArcaBrowserSession", "importArcaBrowserSession",
             "setupArcaSessionBridge", "loadArcaSearchCoverage", "loadArcaStyleStatistics",
             "renderArcaPagination", "applyArcaCardSize", "goToArcaPage",

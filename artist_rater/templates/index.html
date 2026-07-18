@@ -453,8 +453,12 @@
               <strong id="arcaImageRestoreTitle">공유 그림체 이미지 한 번에 받기</strong>
               <p>배포 DB에 저장된 아카라이브 원본 이미지 URL에서 EXE 옆 <code>data\arca_style_images</code>로 받습니다. 처음 한 번만 실행하면 되며, 최대 16개를 동시에 받습니다.</p>
             </div>
-            <p id="arcaImageRestoreEstimate" class="arca-image-restore-estimate" aria-live="polite">누락 이미지와 예상 용량을 계산하는 중…</p>
-            <button id="restoreArcaImages" class="primary" type="button">누락 이미지 빠르게 받기</button>
+            <p id="arcaImageRestoreEstimate" class="arca-image-restore-estimate" aria-live="polite">아직 다운로드하지 않습니다. 먼저 아래 버튼으로 필요한 용량과 시간을 확인하세요.</p>
+            <div class="arca-image-restore-actions">
+              <button id="restoreArcaImages" class="primary" type="button">용량·시간 확인</button>
+              <button id="confirmRestoreArcaImages" class="primary hidden" type="button">다운로드 시작</button>
+              <button id="cancelRestoreArcaImages" class="hidden" type="button">취소</button>
+            </div>
           </section>
           <section class="arca-direct-add">
             <label class="field"><span>게시글 링크로 추가</span><input id="arcaDirectUrl" type="url" placeholder="https://arca.live/b/aiart/174457459"></label>

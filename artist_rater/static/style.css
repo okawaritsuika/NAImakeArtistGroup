@@ -1459,7 +1459,7 @@ textarea {
 }
 
 .arca-style-collector-view.active { display: grid; grid-template-columns: 320px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 16px; align-items: stretch; min-height: 0; }
-.arca-collector-panel { display: grid; gap: 12px; position: sticky; top: 16px; }
+.arca-collector-panel { display: grid; gap: 12px; min-height: 0; overflow-y: auto; align-content: start; padding-right: 8px; scrollbar-gutter: stable; }
 .arca-direct-add { display: grid; gap: 8px; padding: 10px; border: 1px solid #303a49; border-radius: 10px; background: #111720; }
 .arca-direct-add input { min-width: 0; }
 .arca-browser-session { display: grid; gap: 8px; padding: 10px; border: 1px solid #303a49; border-radius: 10px; background: #111720; }
@@ -1470,7 +1470,8 @@ textarea {
 .arca-image-restore-card p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .arca-image-restore-card code { color: var(--text); }
 .arca-image-restore-card .arca-image-restore-estimate { margin: 0; padding: 8px; border-radius: 7px; background: #0c121a; color: var(--text); font-weight: 700; }
-.arca-image-restore-card button { width: 100%; }
+.arca-image-restore-actions { display: grid; gap: 7px; }
+.arca-image-restore-actions button { width: 100%; }
 .arca-session-bridge-setup { padding-top: 8px; border-top: 1px solid #303a49; }
 .arca-session-bridge-setup summary { cursor: pointer; font-weight: 700; }
 .arca-session-bridge-setup .notice { margin: 8px 0; }
@@ -1600,7 +1601,7 @@ textarea {
 .arca-image-prompt-card img { width: 100%; height: 240px; }
 .arca-image-prompt-card pre { margin: 0; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 1100px) { .arca-style-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-@media (max-width: 900px) { .arca-style-collector-view.active { display: block; height: auto; overflow: visible; } .arca-collector-panel { position: static; margin: 16px 0; } .arca-style-main { overflow: visible; } .arca-style-list-scroll { padding-right: 0; } .arca-statistics-section-head { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { .arca-style-collector-view.active { display: block; height: auto; overflow: visible; } .arca-collector-panel { height: auto; overflow: visible; margin: 16px 0; padding-right: 14px; } .arca-style-main { overflow: visible; } .arca-style-list-scroll { padding-right: 0; } .arca-statistics-section-head { grid-template-columns: 1fr; } }
 @media (max-width: 1000px) { .arca-statistics-content { grid-template-columns: 1fr; } .arca-statistics-showcase { position: static; } .arca-statistics-sample-gallery, .arca-statistics-sample-gallery.is-quality { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); } .arca-statistics-browser { grid-template-columns: 1fr; } .arca-statistics-table-panel, .arca-quality-relations { grid-column: 1; } }
 @media (max-width: 700px) { .arca-recommendation-filter { grid-template-columns: 1fr 1fr; } .arca-statistics-controls { grid-template-columns: 1fr; } .arca-tag-image-gallery, .arca-sequence-image-gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); } .arca-tag-image-actions { align-items: stretch; flex-direction: column; } .arca-weight-statistics-table { font-size: 14px; } .arca-weight-statistics-table th, .arca-weight-statistics-table td { padding: 10px 8px; } }
 @media (max-width: 600px) { .arca-style-filters, .arca-style-list { grid-template-columns: 1fr; } .arca-style-list { --arca-card-min: 100%; --arca-card-thumb: 104px; --arca-card-height: 190px; } .arca-style-list[data-card-size="small"] .arca-style-card { aspect-ratio: auto; min-height: var(--arca-card-height); } .arca-style-pagination { flex-wrap: wrap; } }

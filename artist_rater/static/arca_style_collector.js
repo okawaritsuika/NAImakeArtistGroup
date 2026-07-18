@@ -2,6 +2,7 @@ const arcaState = {
   loaded: false, collecting: false, selectedId: null, timer: null, pollTimer: null,
   loginPollTimer: null, activeJobId: null, browserConnected: false,
   pendingCollectionPayload: null, loginImporting: false, browserSessionLoadPromise: null,
+  imageRestoreEstimate: null,
   coverageTimer: null, statisticsLoaded: false, statisticsData: null, statisticsView: "artist",
   page: 1, totalPages: 1, totalItems: 0,
   statisticTables: {
@@ -434,7 +435,7 @@ function renderArcaCollectionProgress(job) {
 }
 
 function setArcaCollectionControlsDisabled(disabled) {
-  for (const id of ["collectArcaStyles", "restoreArcaImages", "arcaTabNai", "arcaTabR18Nai", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
+  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "arcaTabNai", "arcaTabR18Nai", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
     const element = arcaEl(id);
     if (element) element.disabled = disabled;
   }
@@ -564,15 +565,39 @@ async function loadArcaSearchCoverage() {
 async function loadArcaImageRestoreEstimate() {
   const element = arcaEl("arcaImageRestoreEstimate");
   const button = arcaEl("restoreArcaImages");
+  const confirmButton = arcaEl("confirmRestoreArcaImages");
+  const cancelButton = arcaEl("cancelRestoreArcaImages");
+  if (button) button.disabled = true;
+  if (element) element.textContent = "누락 이미지와 예상 용량·시간을 계산하는 중…";
   try {
     const estimate = await arcaFetch("/api/arca-styles/restore-images/estimate");
+    arcaState.imageRestoreEstimate = estimate;
+    const hasMissing = Number(estimate.missing_images || 0) > 0;
     if (element) element.textContent = imageRestoreEstimateText(estimate);
-    if (button && !isArcaCollectionBusy(arcaState)) button.disabled = Number(estimate.missing_images || 0) === 0;
+    button?.classList.toggle("hidden", hasMissing);
+    confirmButton?.classList.toggle("hidden", !hasMissing);
+    cancelButton?.classList.toggle("hidden", !hasMissing);
+    if (button) button.disabled = !hasMissing;
     return estimate;
   } catch (error) {
+    arcaState.imageRestoreEstimate = null;
     if (element) element.textContent = `예상 용량을 계산하지 못했습니다: ${error.message}`;
+    if (button) button.disabled = false;
     return null;
   }
+}
+
+function resetArcaImageRestoreEstimate() {
+  arcaState.imageRestoreEstimate = null;
+  const button = arcaEl("restoreArcaImages");
+  if (button) {
+    button.classList.remove("hidden");
+    button.disabled = false;
+  }
+  arcaEl("confirmRestoreArcaImages")?.classList.add("hidden");
+  arcaEl("cancelRestoreArcaImages")?.classList.add("hidden");
+  const element = arcaEl("arcaImageRestoreEstimate");
+  if (element) element.textContent = "아직 다운로드하지 않습니다. 먼저 아래 버튼으로 필요한 용량과 시간을 확인하세요.";
 }
 
 function scheduleArcaSearchCoverage() {
@@ -1350,7 +1375,7 @@ async function refreshArcaStyleData() {
 }
 
 function loadArcaCollectorData() {
-  return Promise.all([arcaState.loaded ? Promise.resolve([]) : loadArcaStyles(), loadArcaImageRestoreEstimate()]);
+  return arcaState.loaded ? Promise.resolve([]) : loadArcaStyles();
 }
 
 async function runArcaCollection(payload) {
@@ -1383,6 +1408,7 @@ async function collectArcaStyles() {
 
 async function restoreArcaImages() {
   if (isArcaCollectionBusy(arcaState)) return;
+  if (Number(arcaState.imageRestoreEstimate?.missing_images || 0) <= 0) return;
   arcaState.collecting = true;
   setArcaCollectionControlsDisabled(true);
   arcaSetStatus("arcaCollectorStatus", "누락 이미지를 병렬로 받기 시작합니다.");
@@ -1472,7 +1498,9 @@ function bindArcaCollector() {
   document.querySelector('[data-tab="arca-style-collector"]')?.addEventListener("click", () => { void loadArcaCollectorData(); });
   document.querySelector('[data-tab="arca-style-statistics"]')?.addEventListener("click", () => { if (!arcaState.statisticsLoaded) void loadArcaStyleStatistics(); });
   arcaEl("collectArcaStyles")?.addEventListener("click", collectArcaStyles);
-  arcaEl("restoreArcaImages")?.addEventListener("click", restoreArcaImages);
+  arcaEl("restoreArcaImages")?.addEventListener("click", loadArcaImageRestoreEstimate);
+  arcaEl("confirmRestoreArcaImages")?.addEventListener("click", restoreArcaImages);
+  arcaEl("cancelRestoreArcaImages")?.addEventListener("click", resetArcaImageRestoreEstimate);
   arcaEl("collectArcaUrl")?.addEventListener("click", collectArcaUrl);
   arcaEl("importArcaBrowserSession")?.addEventListener("click", importArcaBrowserSession);
   arcaEl("setupArcaSessionBridge")?.addEventListener("click", setupArcaSessionBridge);
@@ -1556,7 +1584,6 @@ function bindArcaCollector() {
   });
   loadArcaBrowserSession();
   loadArcaSearchCoverage();
-  loadArcaImageRestoreEstimate();
   loadCurrentArcaCollectionJob();
 }
 
