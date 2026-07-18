@@ -44,6 +44,7 @@ const STYLE_REQUEST_CONTROL_IDS = [
   "sortStyleAsc",
   "sortStyleDesc",
   "styleArtistCount",
+  "sharedStyleArtistMin",
   "sharedStyleArtistMax",
   "styleScoreAll",
   "weightMode",
@@ -446,6 +447,7 @@ function readGenerationSettings() {
     seed_fixed: Boolean(styleElement("generationSeedFixed")?.checked),
     limit_mode: styleElement("generationLimitMode")?.value || "count",
     generation_count: Number(styleElement("generationCount")?.value || 10),
+    shared_artist_min: Number(styleElement("sharedStyleArtistMin")?.value || 0),
     shared_artist_max: Number(styleElement("sharedStyleArtistMax")?.value || 0),
     random_targets: [...selectedRandomTargets()],
   };
@@ -469,6 +471,7 @@ function applyGenerationSettings(settings = {}) {
   setValue("generationSeed", settings.seed);
   setValue("generationLimitMode", settings.limit_mode);
   setValue("generationCount", settings.generation_count);
+  setValue("sharedStyleArtistMin", settings.shared_artist_min ?? 0);
   setValue("sharedStyleArtistMax", settings.shared_artist_max);
   setRandomTargets(settings.random_targets, settings.style_change_mode);
   const fixed = styleElement("generationSeedFixed");
@@ -991,13 +994,26 @@ function readStyleOptions() {
   const count = Number(styleElement("styleArtistCount")?.value);
   const minWeight = Number(styleElement("styleMinWeight")?.value);
   const maxWeight = Number(styleElement("styleMaxWeight")?.value);
+  const sharedArtistMin = Number(styleElement("sharedStyleArtistMin")?.value || 0);
   const sharedArtistMax = Number(styleElement("sharedStyleArtistMax")?.value || 0);
   if (!Number.isInteger(count) || count < 1) throw new Error("작가 수는 1 이상의 정수여야 합니다.");
   if (![minWeight, maxWeight].every(Number.isFinite) || minWeight <= 0 || minWeight > maxWeight) {
     throw new Error("전체 가중치 범위를 확인하세요.");
   }
-  if (!Number.isInteger(sharedArtistMax) || sharedArtistMax < 0 || sharedArtistMax > 50) {
-    throw new Error("공유 그림체 작가 최대 인원은 0부터 50 사이의 정수여야 합니다.");
+  if (
+    !Number.isInteger(sharedArtistMin)
+    || !Number.isInteger(sharedArtistMax)
+    || sharedArtistMin < 0
+    || sharedArtistMax < 0
+    || sharedArtistMax > 50
+  ) {
+    throw new Error("공유 그림체 작가 인원은 0부터 50 사이의 정수여야 합니다.");
+  }
+  if (sharedArtistMin > sharedArtistMax) {
+    throw new Error("공유 그림체 작가 최소 인원은 최대 인원보다 클 수 없습니다.");
+  }
+  if (sharedArtistMin > count) {
+    throw new Error("공유 그림체 작가 최소 인원은 전체 작가 수보다 클 수 없습니다.");
   }
 
   const mode = styleElement("weightMode")?.value || "balanced";
@@ -1010,6 +1026,7 @@ function readStyleOptions() {
     prefer_high_scores: Boolean(styleElement("preferHighScores")?.checked),
     ranges: validateCustomRanges(),
     weight_profile: mode === "profile" ? styleState.weightProfile : undefined,
+    shared_artist_min: sharedArtistMin,
     shared_artist_max: sharedArtistMax,
   };
 }
@@ -2459,6 +2476,7 @@ function initializeStyleMaker() {
     "generationSeed",
     "generationSeedFixed",
     "generationCount",
+    "sharedStyleArtistMin",
     "sharedStyleArtistMax",
   ].forEach((id) => styleElement(id)?.addEventListener("change", savePromptDraft));
   ["styleMinWeight", "styleMaxWeight"].forEach((id) => styleElement(id)?.addEventListener("change", renderWeightGraph));

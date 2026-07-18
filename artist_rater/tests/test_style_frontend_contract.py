@@ -355,6 +355,7 @@ class StyleFrontendContractTest(unittest.TestCase):
             "rerollStyleWeights",
             "rerollStyleAll",
             "styleArtistCount",
+            "sharedStyleArtistMin",
             "sharedStyleArtistMax",
             "styleScoreAll",
             "weightMode",
@@ -366,7 +367,8 @@ class StyleFrontendContractTest(unittest.TestCase):
         source = JS_PATH.read_text(encoding="utf-8")
         for marker in (
             'id="settingsModal"', 'id="novelAiAppKey"', 'id="testNovelAiKey"',
-            'id="generationLimitMode"', 'id="generationCount"', 'id="sharedStyleArtistMax"',
+            'id="generationLimitMode"', 'id="generationCount"',
+            'id="sharedStyleArtistMin"', 'id="sharedStyleArtistMax"',
             'data-random-target="artists"', 'data-random-target="weights"',
             'data-random-target="quality"', 'data-random-target="negative"',
             'id="startContinuous"', 'id="pauseContinuous"', 'id="stopContinuous"',

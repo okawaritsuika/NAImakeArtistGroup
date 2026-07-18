@@ -594,7 +594,7 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         self.assertIn("style_hash", data)
 
     @patch("app.get_shared_style_artist_pool")
-    def test_endpoint_can_fill_zero_to_max_slots_from_shared_styles(self, shared_pool):
+    def test_endpoint_can_fill_fixed_slots_from_shared_styles(self, shared_pool):
         shared_pool.return_value = [
             {"artist": "shared_alpha", "sample_count": 8},
             {"artist": "shared_beta", "sample_count": 5},
@@ -604,6 +604,7 @@ class ArtistStyleEndpointTest(unittest.TestCase):
             json={
                 "count": 2,
                 "scores": [1, 2, 3, 4, 5],
+                "shared_artist_min": 2,
                 "shared_artist_max": 2,
                 "rng_seed": 5,
             },
@@ -612,6 +613,53 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         artists = response.get_json()["artists"]
         self.assertEqual({item["artist"] for item in artists}, {"shared_alpha", "shared_beta"})
         self.assertTrue(all(item["shared_style"] for item in artists))
+
+    @patch("app.get_shared_style_artist_pool")
+    def test_endpoint_can_build_twelve_artists_only_from_shared_styles(self, shared_pool):
+        shared_pool.return_value = [
+            {"artist": f"shared_{index}", "sample_count": 20 - index}
+            for index in range(12)
+        ] + [{"artist": "shared 0", "sample_count": 1}]
+        with closing(app.db()) as conn, conn:
+            conn.execute("DELETE FROM ratings")
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 12,
+                "scores": [1, 2, 3, 4, 5],
+                "shared_artist_min": 12,
+                "shared_artist_max": 12,
+                "rng_seed": 17,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual(len(artists), 12)
+        self.assertEqual(len({item["artist"].replace("_", " ").casefold() for item in artists}), 12)
+        self.assertTrue(all(item["shared_style"] for item in artists))
+
+    @patch("app.get_shared_style_artist_pool")
+    def test_endpoint_randomizes_shared_count_inside_requested_range(self, shared_pool):
+        shared_pool.return_value = [
+            {"artist": f"shared_{index}", "sample_count": 20 - index}
+            for index in range(8)
+        ]
+        counts = set()
+        for seed in range(12):
+            response = self.client.post(
+                "/api/style-maker/artists",
+                json={
+                    "count": 5,
+                    "scores": [1, 2, 3, 4, 5],
+                    "shared_artist_min": 2,
+                    "shared_artist_max": 4,
+                    "rng_seed": seed,
+                },
+            )
+            self.assertEqual(response.status_code, 200)
+            counts.add(sum(bool(item.get("shared_style")) for item in response.get_json()["artists"]))
+        self.assertTrue(counts <= {2, 3, 4})
+        self.assertGreater(len(counts), 1)
 
     def test_optional_artists_preserve_order_and_only_reroll_weights(self):
         supplied = [
@@ -774,6 +822,9 @@ class ArtistStyleEndpointTest(unittest.TestCase):
                 ]
             },
             {"count": 1, "scores": [5], "weight_mode": "unknown"},
+            {"count": 1, "scores": [5], "shared_artist_min": -1, "shared_artist_max": 1},
+            {"count": 1, "scores": [5], "shared_artist_min": True, "shared_artist_max": 1},
+            {"count": 1, "scores": [5], "shared_artist_min": 2, "shared_artist_max": 1},
             {"count": 1, "scores": [5], "shared_artist_max": -1},
             {"count": 1, "scores": [5], "shared_artist_max": True},
         )

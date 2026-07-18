@@ -224,10 +224,17 @@
                 <span>작가 수</span>
                 <input id="styleArtistCount" type="number" min="1" value="12">
               </label>
-              <label class="field">
-                <span>공유 그림체 작가 최대 인원</span>
-                <input id="sharedStyleArtistMax" type="number" min="0" max="50" value="0">
-              </label>
+              <div class="compact-fields">
+                <label class="field">
+                  <span>공유 작가 최소</span>
+                  <input id="sharedStyleArtistMin" type="number" min="0" max="50" value="0">
+                </label>
+                <label class="field">
+                  <span>공유 작가 최대</span>
+                  <input id="sharedStyleArtistMax" type="number" min="0" max="50" value="0">
+                </label>
+              </div>
+              <p class="help-text">공유 그림체에서 최소~최대 명을 무작위로 넣습니다. 둘을 같게 하면 고정 인원입니다.</p>
               <fieldset class="style-fieldset">
                 <legend>허용 평점</legend>
                 <div id="styleScoreButtons" class="segmented" aria-label="허용 평점 다중 선택">

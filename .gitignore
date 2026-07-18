@@ -8,6 +8,7 @@ artist_rater/.build/
 artist_rater/build/
 artist_rater/dist/
 release/
+local_release_guide/
 *.spec
 *.sqlite*
 !artist_rater/arca_style_seed.sqlite

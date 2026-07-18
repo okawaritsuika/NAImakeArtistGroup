@@ -866,9 +866,18 @@ def api_style_maker_artists():
         ):
             raise ValueError("평점 우선 여부는 JSON 불리언이어야 합니다.")
         prefer_high_scores = payload.get("prefer_high_scores", False)
+        shared_artist_min = payload.get("shared_artist_min", 0)
         shared_artist_max = payload.get("shared_artist_max", 0)
-        if type(shared_artist_max) is not int or shared_artist_max < 0 or shared_artist_max > 50:
-            raise ValueError("공유 그림체 작가 최대 인원은 0부터 50 사이의 정수여야 합니다.")
+        if (
+            type(shared_artist_min) is not int
+            or type(shared_artist_max) is not int
+            or shared_artist_min < 0
+            or shared_artist_max < 0
+            or shared_artist_max > 50
+        ):
+            raise ValueError("공유 그림체 작가 인원은 0부터 50 사이의 정수여야 합니다.")
+        if shared_artist_min > shared_artist_max:
+            raise ValueError("공유 그림체 작가 최소 인원은 최대 인원보다 클 수 없습니다.")
         if "ranges" in payload and not isinstance(payload["ranges"], list):
             raise ValueError("가중치 구간은 JSON 배열이어야 합니다.")
         ranges = payload.get("ranges", [])
@@ -910,19 +919,55 @@ def api_style_maker_artists():
                 item for item in shared_pool
                 if item["artist"].replace("_", " ").casefold() not in current_names
             ]
-            shared_count = rng.randint(0, min(shared_artist_max, target_count, len(shared_pool))) if shared_pool else 0
+            unique_shared_pool = {}
+            for item in shared_pool:
+                normalized_name = item["artist"].replace("_", " ").casefold()
+                unique_shared_pool.setdefault(normalized_name, item)
+            shared_pool = list(unique_shared_pool.values())
+            shared_limit = min(shared_artist_max, target_count, len(shared_pool))
+            if shared_artist_min > shared_limit:
+                raise ValueError("공유 그림체에서 선택 가능한 작가가 최소 인원보다 적습니다.")
+            shared_count = rng.randint(shared_artist_min, shared_limit) if shared_limit else 0
+            selected_shared = rng.sample(shared_pool, shared_count)
+            rated_names = {
+                item["artist"].replace("_", " ").casefold()
+                for item in pool if item["score"] in scores
+            }
+            while len(selected_shared) < shared_limit:
+                selected_names = {
+                    item["artist"].replace("_", " ").casefold()
+                    for item in selected_shared
+                }
+                rated_available = [
+                    item for item in pool
+                    if item["score"] in scores
+                    and item["artist"].replace("_", " ").casefold() not in selected_names
+                ]
+                if len(rated_available) >= target_count - len(selected_shared):
+                    break
+                remaining_shared = [
+                    item for item in shared_pool
+                    if item["artist"].replace("_", " ").casefold() not in selected_names
+                ]
+                if not remaining_shared:
+                    break
+                shared_only = [
+                    item for item in remaining_shared
+                    if item["artist"].replace("_", " ").casefold() not in rated_names
+                ]
+                selected_shared.append(rng.choice(shared_only or remaining_shared))
             shared_artists = [
                 {"artist": item["artist"], "shared_style": True}
-                for item in rng.sample(shared_pool, shared_count)
+                for item in selected_shared
             ]
             shared_names = {item["artist"].replace("_", " ").casefold() for item in shared_artists}
             pool = [item for item in pool if item["artist"].replace("_", " ").casefold() not in shared_names]
             rated_artists = select_artists(
                 pool,
-                target_count - shared_count,
+                target_count - len(shared_artists),
                 scores,
                 rng_seed=rng_seed,
-            ) if target_count > shared_count else []
+            ) if target_count > len(shared_artists) else []
             artists = rated_artists + shared_artists
             rng.shuffle(artists)
 
