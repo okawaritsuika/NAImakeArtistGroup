@@ -35,6 +35,8 @@ Danbooru 작가를 평가하고, 평가 결과로 NovelAI용 그림체 프롬프
 
 빠른 설치는 공유 그림체 수집 화면의 `Google Drive에서 빠르게 받기`를 사용합니다. 약 3.10 GB ZIP을 중단 지점부터 이어받고 SHA-256과 파일별 매니페스트를 검증한 뒤 `data\arca_style_images`에 안전하게 풉니다. Drive 자동 다운로드가 막히면 [공유 ZIP](https://drive.google.com/file/d/1JdTHVsu7a99TB2NulAu0TxZhYlsJa5Fs/view?usp=sharing)을 브라우저에서 직접 받은 뒤 `내 ZIP 설치`로 선택할 수 있습니다. 기존 아카라이브 직접 다운로드 방식도 그대로 사용할 수 있습니다.
 
+ZIP 이미지는 사용자 DB의 변동 가능한 내부 행 번호가 아니라 게시글 주소와 안정 이미지 주소로 연결됩니다. 이미지가 모두 준비되면 두 다운로드 방식은 접힌 `공유 그림체 이미지 설치·복원` 영역 안에 최소화되며 필요할 때 다시 열 수 있습니다.
+
 ## 소스 실행
 
 ```powershell

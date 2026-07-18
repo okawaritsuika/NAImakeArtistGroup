@@ -1298,7 +1298,7 @@ def api_arca_style_image_archive():
 @app.route("/api/arca-styles/image-archive/google", methods=["POST"])
 def api_download_arca_style_image_archive():
     try:
-        job_id = start_google_archive_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, DATA_DIR)
+        job_id = start_google_archive_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, DATA_DIR, ARCA_STYLE_SEED_PATH)
         return json_response({"job_id": job_id, "status": "queued"}, 202)
     except ArcaCollectorError as exc:
         return json_response({"error": str(exc)}, 400)
@@ -1339,7 +1339,9 @@ def api_discard_arca_style_image_archive_upload(upload_id):
 @app.route("/api/arca-styles/image-archive/upload/<upload_id>/finish", methods=["POST"])
 def api_finish_arca_style_image_archive_upload(upload_id):
     try:
-        job_id = finish_local_upload(DB_PATH, ARCA_STYLE_IMAGE_DIR, DATA_DIR, upload_id)
+        job_id = finish_local_upload(
+            DB_PATH, ARCA_STYLE_IMAGE_DIR, DATA_DIR, ARCA_STYLE_SEED_PATH, upload_id,
+        )
         return json_response({"job_id": job_id, "status": "queued"}, 202)
     except ArcaCollectorError as exc:
         return json_response({"error": str(exc)}, 400)
@@ -1364,7 +1366,9 @@ def api_control_arca_collection_job(job_id, action):
         if action == "pause":
             return json_response(pause_collection_job(DB_PATH, job_id))
         if action == "resume":
-            resumed_job_id = resume_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, job_id)
+            resumed_job_id = resume_collection_job(
+                DB_PATH, ARCA_STYLE_IMAGE_DIR, job_id, ARCA_STYLE_SEED_PATH,
+            )
             return json_response({"job_id": resumed_job_id, "status": "running"})
         if action == "stop":
             return json_response(stop_collection_job(DB_PATH, job_id))

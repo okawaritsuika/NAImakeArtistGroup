@@ -663,7 +663,7 @@ def stop_collection_job(db_path, job_id):
     return get_collection_job(db_path, job_id)
 
 
-def resume_collection_job(db_path, image_dir, job_id):
+def resume_collection_job(db_path, image_dir, job_id, seed_db_path=None):
     job = get_collection_job(db_path, job_id)
     if not job:
         raise ArcaCollectorError("수집 작업을 찾을 수 없습니다.")
@@ -680,7 +680,9 @@ def resume_collection_job(db_path, image_dir, job_id):
         return start_image_url_refresh_job(db_path, image_dir)
     if job.get("job_type") == "image_archive":
         from arca_image_archive import resume_archive_job
-        return resume_archive_job(db_path, image_dir, Path(image_dir).parent, job)
+        return resume_archive_job(
+            db_path, image_dir, Path(image_dir).parent, seed_db_path, job,
+        )
     try:
         payload = json.loads(job["request_json"])
     except (TypeError, json.JSONDecodeError):

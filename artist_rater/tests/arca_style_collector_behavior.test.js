@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const {
   normalizeArcaPayload, arcaSummaryText, collectionProgress, durationText,
   etaText, collectionCountsText, groupTitle, promptSection,
-  formatBytes, imageRestoreEstimateText,
+  formatBytes, imageRestoreEstimateText, imageDownloadSummary,
   promptKindClass,
   imagePromptFields,
   normalizeArcaUrlPayload,
@@ -220,6 +220,8 @@ test("collection progress handles known and unknown totals", () => {
   assert.deepEqual(collectionProgress({ status: "completed", skipped_existing: 1, progress: { posts: [0, null] } }), { determinate: true, percent: 100 });
   assert.equal(collectionCountsText({ status: "completed", skipped_existing: 1 }), "이미 수집한 기간 · 새 요청 없음");
   assert.equal(formatBytes(1536), "1.50 KB");
+  assert.deepEqual(imageDownloadSummary({ total_images: 1687, local_images: 1687, missing_images: 0 }), { completed: true, text: "이미지 1,687장 준비됨 · 필요할 때 열기" });
+  assert.deepEqual(imageDownloadSummary({ total_images: 1687, local_images: 4, missing_images: 1683 }), { completed: false, text: "누락 1,683장 · 설치 방법 보기" });
   assert.equal(imageRestoreEstimateText({ missing_images: 2, local_images: 1, estimated_download_bytes: 8 * 1024 * 1024, estimated_seconds: 65, estimate_source: "default_average" }), "누락 2장 · 예상 8.00 MB · 약 1분 5초 (이미지당 4 MB 기준, 사이트 제한·인터넷 속도에 따라 달라짐)");
   assert.equal(collectionCountsText({ job_type: "image_restore", progress: { posts: [12, 30], images: 10, bytes: [1024, 2048] } }), "이미지 확인 12/30 · 복원 10장 · 1.00 KB/2.00 KB");
   assert.equal(arcaSummaryText({ job_type: "image_restore", downloaded_images: 30 }), "이미지 30개를 복원했습니다.");

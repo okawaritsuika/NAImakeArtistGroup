@@ -110,6 +110,8 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn("/api/arca-styles/collection-jobs/current", source)
         self.assertIn("/api/arca-styles/image-archive/google", source)
         self.assertIn("/api/arca-styles/image-archive/upload/start", source)
+        self.assertIn('id="arcaImageDownloadOptions"', html)
+        self.assertIn("imageDownloadSummary", source)
         self.assertNotIn("/api/arca-styles/restore-images/prepare", source)
         self.assertIn("await loadArcaImageRestoreEstimate()", source)
         css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")

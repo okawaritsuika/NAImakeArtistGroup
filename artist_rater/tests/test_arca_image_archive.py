@@ -51,8 +51,10 @@ class ArcaImageArchiveTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.db_path = self.root / "test.sqlite"
+        self.seed_path = self.root / "seed.sqlite"
         self.image_dir = self.root / "images"
         init_arca_style_tables(self.db_path)
+        init_arca_style_tables(self.seed_path)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -96,16 +98,16 @@ class ArcaImageArchiveTest(unittest.TestCase):
         self.assertEqual(session.calls[0][1]["headers"], {"Range": "bytes=3-"})
         self.assertTrue(response.closed)
 
-    def test_installs_verified_images_and_updates_database_paths(self):
-        first_name = "1" * 64 + ".png"
-        second_name = "2" * 64 + ".png"
+    def test_installs_by_stable_seed_identity_when_local_row_ids_differ(self):
         first_url = "https://ac.namu.la/path/one.png?expires=1&key=old"
         second_url = "https://ac.namu.la/path/two.png?expires=1&key=old"
-        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+        first_name = hashlib.sha256(first_url.encode()).hexdigest() + ".png"
+        second_name = hashlib.sha256(second_url.encode()).hexdigest() + ".png"
+        with closing(sqlite3.connect(self.seed_path)) as connection, connection:
             connection.execute(
-                "INSERT INTO arca_style_items(id,source_url,collected_at,updated_at,representative_image_url,metadata_status) "
-                "VALUES(1,?,?,?,?,?)",
-                ("https://arca.live/b/aiart/1", "now", "now", first_url, "ok"),
+                "INSERT INTO arca_style_items(id,source_url,collected_at,updated_at,metadata_status) "
+                "VALUES(1,?,?,?,?)",
+                ("https://arca.live/b/aiart/1", "now", "now", "ok"),
             )
             connection.execute(
                 "INSERT INTO arca_style_images(id,item_id,image_url,image_path,metadata_status,created_at) "
@@ -117,6 +119,24 @@ class ArcaImageArchiveTest(unittest.TestCase):
                 "VALUES(2,1,?,?,?,?)",
                 (second_url, "", "ok", "now"),
             )
+        local_first_url = "https://ac.namu.la/path/one.png?expires=99&key=new"
+        local_second_url = "https://ac.namu.la/path/two.png?expires=99&key=new"
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO arca_style_items(id,source_url,collected_at,updated_at,representative_image_url,metadata_status) "
+                "VALUES(91,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/1", "now", "now", local_first_url, "ok"),
+            )
+            connection.execute(
+                "INSERT INTO arca_style_images(id,item_id,image_url,image_path,metadata_status,created_at) "
+                "VALUES(101,91,?,?,?,?)",
+                (local_first_url, "", "ok", "now"),
+            )
+            connection.execute(
+                "INSERT INTO arca_style_images(id,item_id,image_url,image_path,metadata_status,created_at) "
+                "VALUES(102,91,?,?,?,?)",
+                (local_second_url, "", "ok", "now"),
+            )
         archive_path = self.make_archive([
             (1, 1, first_name, b"first"),
             (2, 1, second_name, b"second"),
@@ -126,6 +146,7 @@ class ArcaImageArchiveTest(unittest.TestCase):
             archive_path,
             self.db_path,
             self.image_dir,
+            self.seed_path,
             expected_archive_sha256=archive_hash,
             expected_archive_bytes=archive_path.stat().st_size,
             expected_count=2,
@@ -137,7 +158,7 @@ class ArcaImageArchiveTest(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as connection:
             paths = connection.execute("SELECT image_path FROM arca_style_images ORDER BY id").fetchall()
             representative = connection.execute(
-                "SELECT representative_image_path FROM arca_style_items WHERE id=1"
+                "SELECT representative_image_path FROM arca_style_items WHERE id=91"
             ).fetchone()[0]
         self.assertEqual(paths, [(first_name,), (second_name,)])
         self.assertEqual(representative, first_name)

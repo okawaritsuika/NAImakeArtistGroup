@@ -212,20 +212,65 @@ def _validated_manifest(archive, expected_count=ARCHIVE_IMAGE_COUNT, expected_by
     return files
 
 
-def _matching_database_rows(db_path, manifest_files):
-    ids = {item["image_id"] for item in manifest_files}
+def _matching_database_rows(db_path, seed_db_path, manifest_files):
+    """Resolve archive entries through stable seed metadata, never local row ids."""
+    seed_path = Path(seed_db_path)
+    if not seed_path.is_file():
+        raise ArcaImageArchiveError("공유 그림체 ZIP 연결용 기본 DB를 찾지 못했습니다.")
+    manifest_ids = {item["image_id"] for item in manifest_files}
+    with closing(_connect(seed_path)) as seed:
+        seed_rows = seed.execute(
+            "SELECT image.id,image.item_id,image.image_url,item.source_url "
+            "FROM arca_style_images image "
+            "JOIN arca_style_items item ON item.id=image.item_id",
+        ).fetchall()
+    seed_by_id = {row["id"]: dict(row) for row in seed_rows if row["id"] in manifest_ids}
+    archive_keys = {}
+    for entry in manifest_files:
+        seed_row = seed_by_id.get(entry["image_id"])
+        expected_name = (
+            hashlib.sha256(seed_row["image_url"].encode()).hexdigest() + ".png"
+            if seed_row else ""
+        )
+        if (
+            not seed_row
+            or seed_row["item_id"] != entry["item_id"]
+            or expected_name != entry["name"]
+        ):
+            raise ArcaImageArchiveError("공유 그림체 ZIP과 기본 DB의 이미지 연결 정보가 일치하지 않습니다.")
+        key = (seed_row["source_url"], _image_identity(seed_row["image_url"]))
+        if key in archive_keys:
+            raise ArcaImageArchiveError("공유 그림체 ZIP의 안정 이미지 식별자가 중복됩니다.")
+        archive_keys[key] = entry["name"]
+
     with closing(_connect(db_path)) as connection:
         rows = connection.execute(
-            "SELECT id,item_id,image_url,image_path FROM arca_style_images "
-            "WHERE metadata_status='ok'",
+            "SELECT image.id,image.item_id,image.image_url,image.image_path,item.source_url "
+            "FROM arca_style_images image "
+            "JOIN arca_style_items item ON item.id=image.item_id "
+            "WHERE image.metadata_status='ok'",
         ).fetchall()
-    return {row["id"]: dict(row) for row in rows if row["id"] in ids}
+    exact_rows = {(row["source_url"], row["image_url"]): dict(row) for row in rows}
+    stable_rows = {}
+    for row in rows:
+        key = (row["source_url"], _image_identity(row["image_url"]))
+        stable_rows.setdefault(key, dict(row))
+
+    result = {}
+    for entry in manifest_files:
+        seed_row = seed_by_id[entry["image_id"]]
+        stable_key = (seed_row["source_url"], _image_identity(seed_row["image_url"]))
+        row = exact_rows.get((seed_row["source_url"], seed_row["image_url"])) or stable_rows.get(stable_key)
+        if row:
+            result[entry["name"]] = row
+    return result
 
 
 def install_image_archive(
     archive_path,
     db_path,
     image_dir,
+    seed_db_path,
     progress=None,
     control=None,
     expected_archive_sha256=ARCHIVE_SHA256,
@@ -243,15 +288,15 @@ def install_image_archive(
     image_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as archive:
         manifest_files = _validated_manifest(archive, expected_count, expected_bytes)
-        database_rows = _matching_database_rows(db_path, manifest_files)
+        database_rows = _matching_database_rows(db_path, seed_db_path, manifest_files)
         installed = reused = processed = 0
         started = time.monotonic()
         updates = []
         for item in manifest_files:
             if control:
                 control()
-            row = database_rows.get(item["image_id"])
-            if not row or row["item_id"] != item["item_id"]:
+            row = database_rows.get(item["name"])
+            if not row:
                 processed += 1
                 if progress:
                     progress(processed, expected_count, installed, reused, time.monotonic() - started)
@@ -281,7 +326,7 @@ def install_image_archive(
                     if temporary.exists():
                         temporary.unlink()
                 installed += 1
-            updates.append((item["name"], item["image_id"], item["item_id"]))
+            updates.append((item["name"], row["id"], row["item_id"]))
             processed += 1
             if progress:
                 progress(processed, expected_count, installed, reused, time.monotonic() - started)
@@ -317,7 +362,7 @@ def install_image_archive(
     }
 
 
-def _run_archive_job(db_path, image_dir, data_dir, job_id, mode, archive_path):
+def _run_archive_job(db_path, image_dir, data_dir, seed_db_path, job_id, mode, archive_path):
     last_download_update = [0.0]
 
     def control(stage):
@@ -354,6 +399,7 @@ def _run_archive_job(db_path, image_dir, data_dir, job_id, mode, archive_path):
             archive_path,
             db_path,
             image_dir,
+            seed_db_path,
             progress=install_progress,
             control=lambda: control("extracting_archive"),
         )
@@ -377,33 +423,33 @@ def _run_archive_job(db_path, image_dir, data_dir, job_id, mode, archive_path):
         _remove_collection_control(job_id)
 
 
-def _start_archive_job(db_path, image_dir, data_dir, mode, archive_path):
+def _start_archive_job(db_path, image_dir, data_dir, seed_db_path, mode, archive_path):
     job_id = _create_archive_job(db_path, mode, archive_path)
     _register_collection_control(job_id)
     Thread(
         target=_run_archive_job,
-        args=(db_path, image_dir, data_dir, job_id, mode, archive_path),
+        args=(db_path, image_dir, data_dir, seed_db_path, job_id, mode, archive_path),
         daemon=True,
     ).start()
     return job_id
 
 
-def start_google_archive_job(db_path, image_dir, data_dir):
+def start_google_archive_job(db_path, image_dir, data_dir, seed_db_path):
     archive_path = _archive_path(data_dir)
-    return _start_archive_job(db_path, image_dir, data_dir, "google_drive", archive_path)
+    return _start_archive_job(db_path, image_dir, data_dir, seed_db_path, "google_drive", archive_path)
 
 
-def start_local_archive_job(db_path, image_dir, data_dir, archive_path):
-    return _start_archive_job(db_path, image_dir, data_dir, "local_upload", archive_path)
+def start_local_archive_job(db_path, image_dir, data_dir, seed_db_path, archive_path):
+    return _start_archive_job(db_path, image_dir, data_dir, seed_db_path, "local_upload", archive_path)
 
 
-def resume_archive_job(db_path, image_dir, data_dir, job):
+def resume_archive_job(db_path, image_dir, data_dir, seed_db_path, job):
     try:
         payload = json.loads(job.get("request_json") or "{}")
     except json.JSONDecodeError as exc:
         raise ArcaImageArchiveError("이전 ZIP 작업 정보를 읽지 못했습니다.") from exc
     if payload.get("mode") == "google_drive":
-        return start_google_archive_job(db_path, image_dir, data_dir)
+        return start_google_archive_job(db_path, image_dir, data_dir, seed_db_path)
     if payload.get("mode") == "local_upload":
         archive_path = Path(payload.get("archive_path", "")).resolve()
         data_root = Path(data_dir).resolve()
@@ -411,7 +457,7 @@ def resume_archive_job(db_path, image_dir, data_dir, job):
             raise ArcaImageArchiveError("이전 로컬 ZIP 경로가 올바르지 않습니다.")
         if not archive_path.is_file() or archive_path.stat().st_size != ARCHIVE_BYTES:
             raise ArcaImageArchiveError("이전 로컬 ZIP을 찾지 못했습니다. 다시 선택해 주세요.")
-        return start_local_archive_job(db_path, image_dir, data_dir, archive_path)
+        return start_local_archive_job(db_path, image_dir, data_dir, seed_db_path, archive_path)
     raise ArcaImageArchiveError("이전 ZIP 작업 방식을 확인하지 못했습니다.")
 
 
@@ -459,11 +505,11 @@ def append_local_upload(upload_id, offset, stream, content_length):
     return {"uploaded_bytes": path.stat().st_size, "total_bytes": ARCHIVE_BYTES}
 
 
-def finish_local_upload(db_path, image_dir, data_dir, upload_id):
+def finish_local_upload(db_path, image_dir, data_dir, seed_db_path, upload_id):
     with _UPLOAD_LOCK:
         path = _LOCAL_UPLOADS.pop(upload_id, None)
     if path is None or not path.is_file() or path.stat().st_size != ARCHIVE_BYTES:
         raise ArcaImageArchiveError("로컬 ZIP 업로드가 완료되지 않았습니다.")
     final_path = path.with_suffix("")
     os.replace(path, final_path)
-    return start_local_archive_job(db_path, image_dir, data_dir, final_path)
+    return start_local_archive_job(db_path, image_dir, data_dir, seed_db_path, final_path)

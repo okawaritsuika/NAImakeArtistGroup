@@ -1465,6 +1465,10 @@ textarea {
 .arca-browser-session { display: grid; gap: 8px; padding: 10px; border: 1px solid #303a49; border-radius: 10px; background: #111720; }
 .arca-browser-session > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .arca-browser-session .status { margin: 0; text-align: right; }
+.arca-image-download-options { border: 1px solid #303a49; border-radius: 10px; background: #111720; }
+.arca-image-download-options > summary { display: grid; gap: 3px; padding: 11px 12px; cursor: pointer; list-style-position: inside; font-weight: 700; }
+.arca-image-download-options > summary span:last-child { padding-left: 18px; color: var(--muted); font-size: 12px; font-weight: 500; }
+.arca-image-download-content { display: grid; gap: 10px; padding: 0 10px 10px; }
 .arca-image-restore-card { display: grid; gap: 9px; padding: 12px; border: 1px solid color-mix(in srgb, var(--accent) 70%, #303a49); border-radius: 10px; background: color-mix(in srgb, var(--accent) 9%, #111720); }
 .arca-image-restore-card strong { color: var(--accent-strong); }
 .arca-image-restore-card p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }

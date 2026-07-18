@@ -155,7 +155,9 @@ class ArcaStyleApiTest(unittest.TestCase):
         response = self.client.post("/api/arca-styles/image-archive/google", json={})
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json(), {"job_id": 41, "status": "queued"})
-        start_job.assert_called_once_with(app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, app.DATA_DIR)
+        start_job.assert_called_once_with(
+            app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, app.DATA_DIR, app.ARCA_STYLE_SEED_PATH,
+        )
 
     @patch("app.start_local_upload")
     def test_local_image_archive_upload_route_returns_chunk_size(self, start_upload):
@@ -191,7 +193,8 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json(), {"job_id": 42, "status": "queued"})
         finish_upload.assert_called_once_with(
-            app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, app.DATA_DIR, "b" * 32,
+            app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, app.DATA_DIR,
+            app.ARCA_STYLE_SEED_PATH, "b" * 32,
         )
 
     @patch("app.get_arca_style_page")
@@ -271,7 +274,9 @@ class ArcaStyleApiTest(unittest.TestCase):
         resume_job.return_value = 9
         response = self.client.post("/api/arca-styles/collection-jobs/7/resume")
         self.assertEqual(response.get_json(), {"job_id": 9, "status": "running"})
-        resume_job.assert_called_once_with(app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, 7)
+        resume_job.assert_called_once_with(
+            app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, 7, app.ARCA_STYLE_SEED_PATH,
+        )
 
     @patch("app.update_arca_style")
     def test_patch_and_missing(self, update):

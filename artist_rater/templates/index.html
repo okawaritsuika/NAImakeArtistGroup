@@ -448,6 +448,9 @@
         <aside class="arca-collector-panel panel">
           <h2>아카라이브 그림체 수집</h2>
           <p class="notice">그림체 공유 제목만 검색합니다.</p>
+          <details id="arcaImageDownloadOptions" class="arca-image-download-options" open>
+            <summary><span>공유 그림체 이미지 설치·복원</span><span id="arcaImageDownloadSummary">설치 상태 확인 중…</span></summary>
+            <div class="arca-image-download-content">
           <section class="arca-image-restore-card" aria-labelledby="arcaImageArchiveTitle">
             <div>
               <strong id="arcaImageArchiveTitle">공유 그림체 ZIP으로 빠르게 설치</strong>
@@ -472,6 +475,8 @@
               <button id="cancelRestoreArcaImages" class="hidden" type="button">취소</button>
             </div>
           </section>
+            </div>
+          </details>
           <section class="arca-direct-add">
             <label class="field"><span>게시글 링크로 추가</span><input id="arcaDirectUrl" type="url" placeholder="https://arca.live/b/aiart/174457459"></label>
             <button id="collectArcaUrl" type="button">링크로 추가</button>

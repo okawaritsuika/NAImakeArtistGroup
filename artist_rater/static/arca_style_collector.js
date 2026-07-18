@@ -334,6 +334,27 @@ function imageRestoreEstimateText(estimate) {
   return `누락 ${missing.toLocaleString()}장 · 예상 ${formatBytes(estimate?.estimated_download_bytes)} · 약 ${durationText(estimate?.estimated_seconds)} (${basis}, 사이트 제한·인터넷 속도에 따라 달라짐)`;
 }
 
+function imageDownloadSummary(estimate) {
+  const total = Number(estimate?.total_images || 0);
+  const local = Number(estimate?.local_images || 0);
+  const missing = Number(estimate?.missing_images || 0);
+  const completed = total > 0 && missing === 0;
+  return {
+    completed,
+    text: completed
+      ? `이미지 ${local.toLocaleString()}장 준비됨 · 필요할 때 열기`
+      : `누락 ${missing.toLocaleString()}장 · 설치 방법 보기`,
+  };
+}
+
+function updateArcaImageDownloadDisclosure(estimate) {
+  const state = imageDownloadSummary(estimate);
+  const details = arcaEl("arcaImageDownloadOptions");
+  const summary = arcaEl("arcaImageDownloadSummary");
+  if (summary) summary.textContent = state.text;
+  if (details) details.open = !state.completed;
+}
+
 function collectionCountsText(job) {
   if (job?.status === "completed" && job?.skipped_existing) {
     return "이미 수집한 기간 · 새 요청 없음";
@@ -609,6 +630,7 @@ async function loadArcaImageRestoreEstimate() {
     const estimate = await arcaFetch("/api/arca-styles/restore-images/estimate");
     arcaState.imageRestoreEstimate = estimate;
     const hasMissing = Number(estimate.missing_images || 0) > 0;
+    updateArcaImageDownloadDisclosure(estimate);
     if (element) element.textContent = imageRestoreEstimateText(estimate);
     button?.classList.toggle("hidden", hasMissing);
     confirmButton?.classList.toggle("hidden", !hasMissing);
@@ -1486,7 +1508,10 @@ async function refreshArcaStyleData() {
 }
 
 function loadArcaCollectorData() {
-  return arcaState.loaded ? Promise.resolve([]) : loadArcaStyles();
+  return Promise.all([
+    arcaState.loaded ? Promise.resolve([]) : loadArcaStyles(),
+    loadArcaImageRestoreEstimate(),
+  ]);
 }
 
 async function runArcaCollection(payload) {
@@ -1712,7 +1737,7 @@ function bindArcaCollector() {
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", bindArcaCollector);
 if (typeof module !== "undefined") module.exports = {
   normalizeArcaPayload, normalizeArcaUrlPayload, arcaSummaryText, collectionProgress, durationText,
-  etaText, formatBytes, imageRestoreEstimateText, collectionCountsText, groupTitle, promptSection, promptKindClass, imagePromptFields,
+  etaText, formatBytes, imageRestoreEstimateText, imageDownloadSummary, collectionCountsText, groupTitle, promptSection, promptKindClass, imagePromptFields,
   arcaBrowserSessionText, isArcaBrowserSessionPending,
   arcaListQuery, arcaCoverageQuery, arcaCoverageText,
   formatArcaLocalDate, fillMissingArcaDates, arcaBrowserSessionAction,
