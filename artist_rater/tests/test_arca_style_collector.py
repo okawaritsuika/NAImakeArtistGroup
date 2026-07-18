@@ -53,6 +53,7 @@ from arca_style_collector import (
     delete_arca_style,
     get_collection_job,
     get_latest_resumable_collection_job,
+    get_image_restore_estimate,
     get_arca_style_statistics,
     get_arca_style_page,
     get_arca_tag_statistics,
@@ -257,12 +258,12 @@ class ArcaCollectorTest(unittest.TestCase):
         seed = Path(self.temp.name) / "seed.sqlite"
         exported = export_arca_style_seed(self.db_path, seed)
         self.assertEqual((exported["items"], exported["images"]), (1, 1))
-        self.assertEqual((exported["ratings"], exported["artist_cache"]), (1, 1))
+        self.assertEqual((exported["ratings"], exported["artist_cache"]), (0, 1))
         with closing(sqlite3.connect(seed)) as conn:
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertEqual(conn.execute("SELECT representative_image_path FROM arca_style_items").fetchone()[0], "")
             self.assertEqual(conn.execute("SELECT image_path FROM arca_style_images").fetchone()[0], "")
-            self.assertEqual(conn.execute("SELECT representative_thumbnail_path FROM ratings").fetchone()[0], "")
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM ratings").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache").fetchone()[0], 1234)
             self.assertNotIn("settings", tables)
             self.assertNotIn("generated_images", tables)
@@ -275,7 +276,7 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual(first, {"imported": True, "items": 1, "images": 1})
         self.assertEqual(second, {"imported": False, "items": 0, "images": 0})
         with closing(sqlite3.connect(destination)) as conn:
-            self.assertEqual(conn.execute("SELECT artist_tag,score FROM ratings").fetchone(), ("danbooru_artist", 5))
+            self.assertIsNone(conn.execute("SELECT artist_tag,score FROM ratings").fetchone())
             self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache").fetchone()[0], 1234)
 
     def test_image_restore_uses_saved_urls_without_fetching_posts(self):
@@ -292,12 +293,16 @@ class ArcaCollectorTest(unittest.TestCase):
         job_id, missing = create_image_restore_job(self.db_path, image_dir)
         with patch.object(collector_module, "download_image", return_value=(b"png-bytes", "image/png")):
             result = restore_arca_style_images(self.db_path, image_dir, job_id, missing)
-        self.assertEqual(result, {"restored": 1, "failed": 0, "skipped_existing": False})
+        self.assertEqual(result, {"restored": 1, "failed": 0, "downloaded_bytes": 9, "skipped_existing": False})
         with closing(sqlite3.connect(self.db_path)) as conn:
             image_path = conn.execute("SELECT image_path FROM arca_style_images").fetchone()[0]
             representative = conn.execute("SELECT representative_image_path FROM arca_style_items").fetchone()[0]
         self.assertEqual(representative, image_path)
         self.assertEqual((image_dir / image_path).read_bytes(), b"png-bytes")
+
+        estimate = get_image_restore_estimate(self.db_path, image_dir)
+        self.assertEqual((estimate["total_images"], estimate["local_images"], estimate["missing_images"]), (1, 1, 0))
+        self.assertEqual(estimate["local_bytes"], 9)
     def test_collects_one_article_url_without_date_search(self):
         article_url = "https://arca.live/b/aiart/174457459"
         image_url = "https://img.example/direct.png"

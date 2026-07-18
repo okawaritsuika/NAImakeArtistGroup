@@ -35,6 +35,7 @@ class PackagingTest(unittest.TestCase):
         self.assertIn('$staticDir = Join-Path $appDir "static"', script)
         self.assertIn("launcher.py", script)
         self.assertIn("--hidden-import app", script)
+        self.assertIn("--windowed", script)
         self.assertIn('"$templatesDir;templates"', script)
         self.assertIn('"$staticDir;static"', script)
         self.assertIn("export_arca_seed.py", script)

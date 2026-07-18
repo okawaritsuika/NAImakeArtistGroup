@@ -293,6 +293,27 @@ function etaText(seconds) {
   return seconds == null ? "계산 중" : durationText(seconds);
 }
 
+function formatBytes(bytes) {
+  const value = Math.max(0, Number(bytes) || 0);
+  if (value < 1024) return `${Math.round(value)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let scaled = value / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && scaled >= 1024; index += 1) {
+    scaled /= 1024;
+    unit = units[index];
+  }
+  return `${scaled >= 10 ? scaled.toFixed(1) : scaled.toFixed(2)} ${unit}`;
+}
+
+function imageRestoreEstimateText(estimate) {
+  const missing = Number(estimate?.missing_images || 0);
+  const local = Number(estimate?.local_images || 0);
+  if (!missing) return `모든 이미지가 준비되어 있습니다 · 저장됨 ${local.toLocaleString()}장`;
+  const basis = estimate?.estimate_source === "local_average" ? "현재 파일 평균 기준" : "이미지당 4 MB 기준";
+  return `누락 ${missing.toLocaleString()}장 · 예상 ${formatBytes(estimate?.estimated_download_bytes)} · 약 ${durationText(estimate?.estimated_seconds)} (${basis}, 인터넷 속도에 따라 달라짐)`;
+}
+
 function collectionCountsText(job) {
   if (job?.status === "completed" && job?.skipped_existing) {
     return "이미 수집한 기간 · 새 요청 없음";
@@ -302,7 +323,9 @@ function collectionCountsText(job) {
   const posts = progress.posts || [0, null];
   const total = (pair) => pair[1] == null ? "?" : pair[1];
   if (job?.job_type === "image_restore") {
-    return `이미지 확인 ${posts[0] || 0}/${total(posts)} · 복원 ${progress.images || 0}개`;
+    const bytes = progress.bytes || [job?.downloaded_bytes || 0, job?.estimated_bytes ?? null];
+    const byteTotal = bytes[1] == null ? "?" : formatBytes(bytes[1]);
+    return `이미지 확인 ${posts[0] || 0}/${total(posts)} · 복원 ${progress.images || 0}장 · ${formatBytes(bytes[0])}/${byteTotal}`;
   }
   return `페이지 ${pages[0] || 0}/${total(pages)} · 게시글 ${posts[0] || 0}/${total(posts)} · 이미지 ${progress.images || 0}개`;
 }
@@ -538,6 +561,20 @@ async function loadArcaSearchCoverage() {
   }
 }
 
+async function loadArcaImageRestoreEstimate() {
+  const element = arcaEl("arcaImageRestoreEstimate");
+  const button = arcaEl("restoreArcaImages");
+  try {
+    const estimate = await arcaFetch("/api/arca-styles/restore-images/estimate");
+    if (element) element.textContent = imageRestoreEstimateText(estimate);
+    if (button && !isArcaCollectionBusy(arcaState)) button.disabled = Number(estimate.missing_images || 0) === 0;
+    return estimate;
+  } catch (error) {
+    if (element) element.textContent = `예상 용량을 계산하지 못했습니다: ${error.message}`;
+    return null;
+  }
+}
+
 function scheduleArcaSearchCoverage() {
   clearTimeout(arcaState.coverageTimer);
   arcaState.coverageTimer = setTimeout(loadArcaSearchCoverage, 200);
@@ -556,7 +593,7 @@ async function pollArcaCollectionJob(jobId) {
       setArcaCollectionControlsDisabled(false);
       if (job.status === "completed") {
         arcaSetStatus("arcaCollectorStatus", arcaSummaryText(job), job.error ? "error" : "success");
-        await Promise.all([loadArcaStyles(), loadArcaSearchCoverage(), loadArcaStyleStatistics()]);
+        await Promise.all([loadArcaStyles(), loadArcaSearchCoverage(), loadArcaStyleStatistics(), loadArcaImageRestoreEstimate()]);
       }
       return;
     }
@@ -1313,7 +1350,7 @@ async function refreshArcaStyleData() {
 }
 
 function loadArcaCollectorData() {
-  return arcaState.loaded ? Promise.resolve([]) : Promise.all([loadArcaStyles()]);
+  return Promise.all([arcaState.loaded ? Promise.resolve([]) : loadArcaStyles(), loadArcaImageRestoreEstimate()]);
 }
 
 async function runArcaCollection(payload) {
@@ -1348,6 +1385,7 @@ async function restoreArcaImages() {
   if (isArcaCollectionBusy(arcaState)) return;
   arcaState.collecting = true;
   setArcaCollectionControlsDisabled(true);
+  arcaSetStatus("arcaCollectorStatus", "누락 이미지를 병렬로 받기 시작합니다.");
   try {
     const result = await arcaFetch("/api/arca-styles/restore-images", { method: "POST", body: "{}" });
     arcaState.activeJobId = result.job_id;
@@ -1518,13 +1556,14 @@ function bindArcaCollector() {
   });
   loadArcaBrowserSession();
   loadArcaSearchCoverage();
+  loadArcaImageRestoreEstimate();
   loadCurrentArcaCollectionJob();
 }
 
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", bindArcaCollector);
 if (typeof module !== "undefined") module.exports = {
   normalizeArcaPayload, normalizeArcaUrlPayload, arcaSummaryText, collectionProgress, durationText,
-  etaText, collectionCountsText, groupTitle, promptSection, promptKindClass, imagePromptFields,
+  etaText, formatBytes, imageRestoreEstimateText, collectionCountsText, groupTitle, promptSection, promptKindClass, imagePromptFields,
   arcaBrowserSessionText, isArcaBrowserSessionPending,
   arcaListQuery, arcaCoverageQuery, arcaCoverageText,
   formatArcaLocalDate, fillMissingArcaDates, arcaBrowserSessionAction,

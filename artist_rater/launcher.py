@@ -7,7 +7,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, Button, Frame, Label, Tk, Text, messagebox
+from tkinter import BOTH, END, LEFT, BooleanVar, Button, Checkbutton, Frame, Label, Tk, Text, messagebox
 from urllib.request import Request, urlopen
 
 
@@ -17,6 +17,7 @@ GITHUB_LATEST_RELEASE_API = (
     "https://api.github.com/repos/okawaritsuika/NAImakeArtistGroup/releases/latest"
 )
 RELEASE_ASSET_NAME = "DanbooruArtistRater.exe"
+LAUNCHER_SETTINGS_NAME = "launcher_settings.json"
 LAUNCHER_THEME = {
     "window_bg": "#f5f5f7",
     "card_bg": "#ffffff",
@@ -103,6 +104,33 @@ class LauncherController:
         self.executable = Path(executable or sys.executable).resolve()
         self.frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
         self.process = None
+
+    @property
+    def settings_path(self):
+        return self.data_dir / LAUNCHER_SETTINGS_NAME
+
+    def load_settings(self):
+        try:
+            value = json.loads(self.settings_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return {"auto_open_site": False}
+        return {"auto_open_site": bool(value.get("auto_open_site"))} if isinstance(value, dict) else {"auto_open_site": False}
+
+    def set_auto_open_site(self, enabled):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        settings = {"auto_open_site": bool(enabled)}
+        self.settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        return settings["auto_open_site"]
+
+    def wait_for_server(self, timeout_seconds=12, interval_seconds=0.1):
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                with self.urlopen(Request(APP_URL), timeout=1):
+                    return True
+            except Exception:
+                time.sleep(interval_seconds)
+        return False
 
     def is_server_running(self):
         return bool(self.process and self.process.poll() is None)
@@ -266,6 +294,21 @@ class LauncherApp:
         for index, spec in enumerate(launcher_button_specs()):
             button = self.action_button(action_card, spec)
             button.pack(fill="x", padx=16, pady=(0, 8 if index < 1 else 7))
+            if index == 0:
+                self.auto_open_site = BooleanVar(value=self.controller.load_settings()["auto_open_site"])
+                Checkbutton(
+                    action_card,
+                    text="서버를 켜면 웹사이트 자동으로 열기",
+                    variable=self.auto_open_site,
+                    command=self.save_auto_open_site,
+                    bg=LAUNCHER_THEME["card_bg"],
+                    fg=LAUNCHER_THEME["text"],
+                    activebackground=LAUNCHER_THEME["card_bg"],
+                    activeforeground=LAUNCHER_THEME["text"],
+                    selectcolor=LAUNCHER_THEME["card_bg"],
+                    font=("Segoe UI", 10),
+                    anchor="w",
+                ).pack(fill="x", padx=16, pady=(0, 10))
 
         notes_card = self.card(shell)
         notes_card.pack(fill=BOTH, expand=True)
@@ -362,8 +405,25 @@ class LauncherApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def save_auto_open_site(self):
+        try:
+            self.controller.set_auto_open_site(self.auto_open_site.get())
+        except OSError as exc:
+            self.set_status(f"오류: 자동 열기 설정을 저장하지 못했습니다: {exc}")
+
     def start_server(self):
-        self.set_status(self.controller.start_server())
+        auto_open = bool(self.auto_open_site.get())
+        self.set_status("서버를 시작하는 중입니다...")
+
+        def action():
+            message = self.controller.start_server()
+            if not auto_open:
+                return message
+            if not self.controller.wait_for_server():
+                return f"{message} 웹사이트가 준비되지 않아 자동으로 열지 못했습니다."
+            return f"{message} {self.controller.open_site()}"
+
+        self.run_background(action, self.set_status)
 
     def stop_server(self):
         self.set_status(self.controller.stop_server())

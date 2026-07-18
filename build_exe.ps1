@@ -18,6 +18,7 @@ try {
         --noconfirm `
         --clean `
         --onefile `
+        --windowed `
         --name DanbooruArtistRater `
         --distpath $releaseDir `
         --workpath $workDir `

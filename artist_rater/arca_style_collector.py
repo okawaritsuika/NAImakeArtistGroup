@@ -38,6 +38,8 @@ SEARCH_SCOPE = "title-category-session-v6"
 MAX_ARCHIVE_SEARCH_PAGE = 4096
 COLLECTION_WORKERS = 6
 IMAGE_RESTORE_WORKERS = 16
+DEFAULT_IMAGE_ESTIMATE_BYTES = 4 * 1024 * 1024
+IMAGE_RESTORE_ESTIMATE_BYTES_PER_SECOND = 8 * 1024 * 1024
 GENERATION_KEYS = {"seed", "sampler", "steps", "scale", "noise_schedule", "model", "width", "height"}
 STYLE_SIMILARITY_THRESHOLD = 0.55
 TRANSIENT_TAG = re.compile(r"^(?:\d+(?:girl|boy)s?|solo|multiple girls|portrait|upper body|full body|looking at.*|smile|open mouth|.*hair|.*eyes|robot)$", re.I)
@@ -230,6 +232,8 @@ def init_arca_style_tables(db_path):
             total_pages INTEGER, scanned_pages INTEGER NOT NULL DEFAULT 0,
             total_posts INTEGER, scanned_posts INTEGER NOT NULL DEFAULT 0,
             downloaded_images INTEGER NOT NULL DEFAULT 0,
+            downloaded_bytes INTEGER NOT NULL DEFAULT 0,
+            estimated_bytes INTEGER,
             saved INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
             average_post_seconds REAL, skipped_existing INTEGER NOT NULL DEFAULT 0,
             error TEXT NOT NULL DEFAULT '', started_at TEXT, finished_at TEXT,
@@ -271,6 +275,8 @@ def init_arca_style_tables(db_path):
             conn.execute("ALTER TABLE arca_collection_runs ADD COLUMN search_scope TEXT NOT NULL DEFAULT 'all'")
         _ensure_column(conn, "arca_collection_runs", "job_id", "INTEGER REFERENCES arca_collection_jobs(id)")
         _ensure_column(conn, "arca_collection_jobs", "job_type", "TEXT NOT NULL DEFAULT 'collection'")
+        _ensure_column(conn, "arca_collection_jobs", "downloaded_bytes", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "arca_collection_jobs", "estimated_bytes", "INTEGER")
         _ensure_column(conn, "arca_style_images", "base_prompt", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "arca_style_images", "character_prompts_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "arca_style_items", "recommendation_count", "INTEGER")
@@ -353,13 +359,6 @@ def export_arca_style_seed(source_db, seed_db):
             "INSERT OR IGNORE INTO arca_collection_invalidations "
             "SELECT * FROM source.arca_collection_invalidations"
         )
-        if "ratings" in source_tables:
-            rating_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(ratings)")]
-            rating_select = ["''" if name == "representative_thumbnail_path" else name for name in rating_columns]
-            conn.execute(
-                f"INSERT INTO ratings ({','.join(rating_columns)}) "
-                f"SELECT {','.join(rating_select)} FROM source.ratings"
-            )
         if "artist_cache" in source_tables:
             conn.execute("INSERT INTO artist_cache SELECT * FROM source.artist_cache")
     with closing(sqlite3.connect(target)) as conn:
@@ -527,7 +526,7 @@ def create_collection_job(db_path, payload):
 def update_collection_job(db_path, job_id, **changes):
     allowed = {
         "status", "stage", "total_pages", "scanned_pages", "total_posts",
-        "scanned_posts", "downloaded_images", "saved", "updated",
+        "scanned_posts", "downloaded_images", "downloaded_bytes", "estimated_bytes", "saved", "updated",
         "average_post_seconds", "skipped_existing", "error", "started_at", "finished_at",
     }
     values = {key: value for key, value in changes.items() if key in allowed}
@@ -567,6 +566,8 @@ def get_collection_job(db_path, job_id):
         "posts": [job["scanned_posts"], job["total_posts"]],
         "images": job["downloaded_images"],
     }
+    if job.get("job_type") == "image_restore":
+        job["progress"]["bytes"] = [job.get("downloaded_bytes") or 0, job.get("estimated_bytes")]
     return job
 
 
@@ -707,6 +708,19 @@ def _local_image_exists(image_root, value):
     return root in path.parents and path.is_file()
 
 
+def _local_image_size(image_root, value):
+    if not value:
+        return 0
+    root = Path(image_root).resolve()
+    path = (root / str(value)).resolve()
+    if root not in path.parents or not path.is_file():
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def _reusable_direct_item_id(db_path, image_dir, source_url):
     with closing(_connect(db_path)) as conn:
         item = conn.execute(
@@ -781,12 +795,16 @@ def start_url_collection_job(db_path, image_dir, source_url):
 def create_image_restore_job(db_path, image_dir):
     init_arca_style_tables(db_path)
     missing = _missing_image_rows(db_path, image_dir)
+    estimate = get_image_restore_estimate(db_path, image_dir)
     now = datetime.now().isoformat(timespec="seconds")
     with closing(_connect(db_path)) as conn, conn:
         job_id = conn.execute(
-            "INSERT INTO arca_collection_jobs(request_json,job_type,status,stage,total_pages,total_posts,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (json.dumps({"mode": "image_restore"}), "image_restore", "queued", "queued", 0, len(missing), now, now),
+            "INSERT INTO arca_collection_jobs(request_json,job_type,status,stage,total_pages,total_posts,estimated_bytes,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                json.dumps({"mode": "image_restore"}), "image_restore", "queued", "queued",
+                0, len(missing), estimate["estimated_download_bytes"], now, now,
+            ),
         ).lastrowid
     return job_id, missing
 
@@ -800,12 +818,44 @@ def _missing_image_rows(db_path, image_dir):
     return [dict(row) for row in rows if not _local_image_exists(image_dir, row["image_path"])]
 
 
+def get_image_restore_estimate(db_path, image_dir):
+    """Estimate a one-time image restore from local samples without slow network probes."""
+    init_arca_style_tables(db_path)
+    with closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT image_path FROM arca_style_images "
+            "WHERE metadata_status='ok' AND TRIM(COALESCE(image_url,''))<>''"
+        ).fetchall()
+    local_sizes = [size for row in rows if (size := _local_image_size(image_dir, row["image_path"]))]
+    total_images = len(rows)
+    local_images = len(local_sizes)
+    missing_images = total_images - local_images
+    average_bytes = (
+        round(sum(local_sizes) / local_images)
+        if local_images
+        else DEFAULT_IMAGE_ESTIMATE_BYTES
+    )
+    estimated_bytes = average_bytes * missing_images
+    return {
+        "total_images": total_images,
+        "local_images": local_images,
+        "missing_images": missing_images,
+        "local_bytes": sum(local_sizes),
+        "average_image_bytes": average_bytes,
+        "estimated_download_bytes": estimated_bytes,
+        "estimated_seconds": round(estimated_bytes / IMAGE_RESTORE_ESTIMATE_BYTES_PER_SECOND),
+        "estimate_source": "local_average" if local_images else "default_average",
+        "parallel_workers": IMAGE_RESTORE_WORKERS,
+    }
+
+
 def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
     rows = list(missing if missing is not None else _missing_image_rows(db_path, image_dir))
     total = len(rows)
     update_collection_job(
         db_path, job_id, status="running", stage="restoring_images", total_pages=0,
         scanned_pages=0, total_posts=total, scanned_posts=0, downloaded_images=0,
+        downloaded_bytes=0,
     )
     if not rows:
         update_collection_job(db_path, job_id, status="completed", stage="completed", skipped_existing=1)
@@ -821,7 +871,7 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
         except (requests.RequestException, ArcaCollectorError):
             return row, None, ""
 
-    restored = failed = processed = 0
+    restored = failed = processed = downloaded_bytes = 0
     started = time.monotonic()
     workers = min(IMAGE_RESTORE_WORKERS, total)
     pending_rows = iter(rows)
@@ -847,6 +897,7 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
                     failed += 1
                 else:
                     restored += 1
+                    downloaded_bytes += len(data)
                     with closing(_connect(db_path)) as conn, conn:
                         conn.execute(
                             "UPDATE arca_style_images SET image_path=?,content_type=? WHERE id=?",
@@ -860,7 +911,8 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
             average = (time.monotonic() - started) / processed
             update_collection_job(
                 db_path, job_id, stage="restoring_images", scanned_posts=processed,
-                downloaded_images=restored, updated=restored, average_post_seconds=average,
+                downloaded_images=restored, downloaded_bytes=downloaded_bytes,
+                updated=restored, average_post_seconds=average,
             )
             row = next(pending_rows, None)
             if row is not None:
@@ -868,9 +920,13 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
     error = f"{failed}개 이미지를 받지 못했습니다. 다시 실행하면 실패한 이미지만 재시도합니다." if failed else ""
     update_collection_job(
         db_path, job_id, status="completed", stage="completed", scanned_posts=processed,
-        downloaded_images=restored, updated=restored, error=error,
+        downloaded_images=restored, downloaded_bytes=downloaded_bytes,
+        updated=restored, error=error,
     )
-    return {"restored": restored, "failed": failed, "skipped_existing": False}
+    return {
+        "restored": restored, "failed": failed,
+        "downloaded_bytes": downloaded_bytes, "skipped_existing": False,
+    }
 
 
 def _run_image_restore_job(db_path, image_dir, job_id, missing):

@@ -448,6 +448,14 @@
         <aside class="arca-collector-panel panel">
           <h2>아카라이브 그림체 수집</h2>
           <p class="notice">그림체 공유 제목만 검색합니다.</p>
+          <section class="arca-image-restore-card" aria-labelledby="arcaImageRestoreTitle">
+            <div>
+              <strong id="arcaImageRestoreTitle">공유 그림체 이미지 한 번에 받기</strong>
+              <p>배포 DB에 저장된 아카라이브 원본 이미지 URL에서 EXE 옆 <code>data\arca_style_images</code>로 받습니다. 처음 한 번만 실행하면 되며, 최대 16개를 동시에 받습니다.</p>
+            </div>
+            <p id="arcaImageRestoreEstimate" class="arca-image-restore-estimate" aria-live="polite">누락 이미지와 예상 용량을 계산하는 중…</p>
+            <button id="restoreArcaImages" class="primary" type="button">누락 이미지 빠르게 받기</button>
+          </section>
           <section class="arca-direct-add">
             <label class="field"><span>게시글 링크로 추가</span><input id="arcaDirectUrl" type="url" placeholder="https://arca.live/b/aiart/174457459"></label>
             <button id="collectArcaUrl" type="button">링크로 추가</button>
@@ -472,7 +480,7 @@
           </section>
           <div class="check-row"><label><input id="arcaTabNai" type="checkbox" checked> NAI</label><label><input id="arcaTabR18Nai" type="checkbox" checked> 🔞 NAI</label></div>
           <label class="field"><span>시작일</span><input id="arcaStartDate" type="date"></label><label class="field"><span>종료일</span><input id="arcaEndDate" type="date"></label>
-          <div id="arcaSearchCoverage" class="status"></div><button id="collectArcaStyles" class="primary" type="button">수집 시작</button><button id="restoreArcaImages" type="button">이미지만 빠르게 받기</button><button id="refreshArcaStyles" type="button">목록 새로고침</button><div id="arcaCollectorStatus" class="status"></div>
+          <div id="arcaSearchCoverage" class="status"></div><button id="collectArcaStyles" class="primary" type="button">수집 시작</button><button id="refreshArcaStyles" type="button">목록 새로고침</button><div id="arcaCollectorStatus" class="status"></div>
         </aside>
         <section class="arca-style-main">
           <section class="panel arca-style-filters">

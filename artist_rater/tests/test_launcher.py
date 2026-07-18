@@ -86,6 +86,27 @@ class LauncherControllerTest(unittest.TestCase):
 
         self.assertEqual(launched[0], [str(Path("C:/App/DanbooruArtistRater.exe")), "--server"])
 
+    def test_auto_open_setting_is_saved_in_data_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            controller = launcher.LauncherController(data_dir=data_dir)
+
+            self.assertEqual(controller.load_settings(), {"auto_open_site": False})
+            self.assertTrue(controller.set_auto_open_site(True))
+            self.assertEqual(controller.load_settings(), {"auto_open_site": True})
+            self.assertEqual(json.loads((data_dir / launcher.LAUNCHER_SETTINGS_NAME).read_text(encoding="utf-8")), {"auto_open_site": True})
+
+    def test_wait_for_server_uses_local_app_url(self):
+        requested = []
+
+        def open_local(request, timeout=0):
+            requested.append(request.full_url)
+            return FakeResponse(b"ok")
+
+        controller = launcher.LauncherController(urlopen=open_local)
+        self.assertTrue(controller.wait_for_server(timeout_seconds=1))
+        self.assertEqual(requested, [launcher.APP_URL])
+
     def test_release_check_finds_newer_github_asset_and_notes(self):
         release = {
             "tag_name": "v0.2.0",
