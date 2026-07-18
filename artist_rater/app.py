@@ -14,6 +14,11 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
+from arca_chrome_extension import (
+    ArcaChromeExtensionError,
+    extension_payload_to_cookie_jar,
+    install_arca_session_bridge,
+)
 from arca_login_window import ArcaLoginWindowManager
 
 from arca_style_collector import (
@@ -21,18 +26,29 @@ from arca_style_collector import (
     connect_arca_cookie_jar,
     delete_arca_style,
     get_collection_job,
+    get_latest_resumable_collection_job,
     get_arca_browser_session_status,
     get_arca_style_detail,
+    get_arca_style_page,
+    get_arca_style_statistics,
+    get_arca_tag_statistics,
+    get_arca_quality_sequence_statistics,
+    get_style_maker_prompt_presets,
+    get_shared_style_artist_pool,
     get_completed_coverage,
     init_arca_style_tables,
     import_arca_browser_session,
-    list_arca_styles,
+    import_arca_style_seed,
     mark_interrupted_collection_jobs,
     normalize_collect_payload,
     normalize_arca_article_url,
+    pause_collection_job,
     revalidate_stored_metadata,
     start_collection_job,
+    start_image_restore_job,
     start_url_collection_job,
+    resume_collection_job,
+    stop_collection_job,
     update_arca_style,
 )
 
@@ -88,8 +104,10 @@ BASE_DIR = RESOURCE_DIR
 THUMBNAIL_DIR = DATA_DIR / "thumbnails"
 GENERATED_DIR = DATA_DIR / "generated"
 ARCA_STYLE_IMAGE_DIR = DATA_DIR / "arca_style_images"
+ARCA_STYLE_SEED_PATH = RESOURCE_DIR / "arca_style_seed.sqlite"
 SETTINGS_JSON_PATH = DATA_DIR / "settings.json"
 DB_PATH = DATA_DIR / "artist_rater.sqlite"
+ARCA_SESSION_BRIDGE_SOURCE_DIR = RESOURCE_DIR / "static" / "arca_session_bridge"
 DANBOORU_BASE_URL = "https://danbooru.donmai.us"
 CUTOFF = datetime(2025, 1, 31, 23, 59, 59, tzinfo=timezone.utc)
 DATE_TAG = "date:<=2025-01-31"
@@ -227,6 +245,7 @@ def init_db():
 
     reconcile_generated_storage(DB_PATH, GENERATED_DIR)
     init_arca_style_tables(DB_PATH)
+    import_arca_style_seed(DB_PATH, ARCA_STYLE_SEED_PATH)
     revalidate_stored_metadata(DB_PATH)
     mark_interrupted_collection_jobs(DB_PATH)
 
@@ -835,6 +854,9 @@ def api_style_maker_artists():
         ):
             raise ValueError("평점 우선 여부는 JSON 불리언이어야 합니다.")
         prefer_high_scores = payload.get("prefer_high_scores", False)
+        shared_artist_max = payload.get("shared_artist_max", 0)
+        if type(shared_artist_max) is not int or shared_artist_max < 0 or shared_artist_max > 50:
+            raise ValueError("공유 그림체 작가 최대 인원은 0부터 50 사이의 정수여야 합니다.")
         if "ranges" in payload and not isinstance(payload["ranges"], list):
             raise ValueError("가중치 구간은 JSON 배열이어야 합니다.")
         ranges = payload.get("ranges", [])
@@ -867,12 +889,30 @@ def api_style_maker_artists():
             if reroll == "artists":
                 current_names = {item["artist"] for item in current_artists}
                 pool = [item for item in pool if item["artist"] not in current_names]
-            artists = select_artists(
+            target_count = len(current_artists) if reroll == "artists" else payload.get("count", 12)
+            target_count = int(target_count)
+            rng = random.Random(rng_seed)
+            shared_pool = get_shared_style_artist_pool(DB_PATH) if shared_artist_max else []
+            current_names = {item["artist"].replace("_", " ").casefold() for item in (current_artists or [])}
+            shared_pool = [
+                item for item in shared_pool
+                if item["artist"].replace("_", " ").casefold() not in current_names
+            ]
+            shared_count = rng.randint(0, min(shared_artist_max, target_count, len(shared_pool))) if shared_pool else 0
+            shared_artists = [
+                {"artist": item["artist"], "shared_style": True}
+                for item in rng.sample(shared_pool, shared_count)
+            ]
+            shared_names = {item["artist"].replace("_", " ").casefold() for item in shared_artists}
+            pool = [item for item in pool if item["artist"].replace("_", " ").casefold() not in shared_names]
+            rated_artists = select_artists(
                 pool,
-                len(current_artists) if reroll == "artists" else payload.get("count", 12),
+                target_count - shared_count,
                 scores,
                 rng_seed=rng_seed,
-            )
+            ) if target_count > shared_count else []
+            artists = rated_artists + shared_artists
+            rng.shuffle(artists)
 
         if reroll == "artists":
             weighted = [
@@ -902,6 +942,22 @@ def api_style_maker_artists():
             }
         )
     except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"ok": False, "error": str(exc)}, 400)
+
+
+@app.route("/api/style-maker/prompt-presets", methods=["POST"])
+def api_style_maker_prompt_presets():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response({"ok": False, "error": "요청 내용을 확인해 주세요."}, 400)
+    try:
+        result = get_style_maker_prompt_presets(
+            DB_PATH,
+            payload.get("artists", []),
+            payload.get("limit", 30),
+        )
+        return json_response({"ok": True, **result})
+    except ArcaCollectorError as exc:
         return json_response({"ok": False, "error": str(exc)}, 400)
 
 
@@ -982,15 +1038,16 @@ def validate_supplied_style_artists(supplied, require_weights=False):
         if not isinstance(item, dict):
             raise ValueError("작가 목록 형식을 확인하세요.")
         artist = str(item.get("artist") or "").strip()
-        score = exact_score(
-            item.get("score"),
-            "작가 평점은 1부터 5 사이의 정수여야 합니다.",
-        )
         if not artist:
             raise ValueError("작가 태그를 확인하세요.")
         if artist in seen:
             raise ValueError("중복된 작가는 사용할 수 없습니다.")
-        normalized = {"artist": artist, "score": score}
+        normalized = {"artist": artist}
+        if item.get("score") is not None:
+            normalized["score"] = exact_score(
+                item.get("score"),
+                "작가 평점은 1부터 5 사이의 정수여야 합니다.",
+            )
         if "weight" in item:
             normalized["weight"] = normalize_style_artists([item])[0]["weight"]
         elif require_weights:
@@ -998,18 +1055,6 @@ def validate_supplied_style_artists(supplied, require_weights=False):
         artists.append(normalized)
         seen.add(artist)
 
-    placeholders = ", ".join("?" for _ in artists)
-    with closing(db()) as conn:
-        rows = conn.execute(
-            f"SELECT artist_tag, score FROM ratings WHERE artist_tag IN ({placeholders})",
-            [item["artist"] for item in artists],
-        ).fetchall()
-    ratings = {row["artist_tag"]: int(row["score"]) for row in rows}
-    for item in artists:
-        if item["artist"] not in ratings:
-            raise ValueError(f"평가되지 않은 작가입니다: {item['artist']}")
-        if ratings[item["artist"]] != item["score"]:
-            raise ValueError(f"저장된 평점과 일치하지 않습니다: {item['artist']}")
     return artists
 
 
@@ -1043,20 +1088,6 @@ def _validate_generation_request(payload):
     normalized["request_id"] = request_id
     normalized["seed_provided"] = "seed" in payload
     normalized_artists = normalize_style_artists(payload.get("artists"))
-    placeholders = ", ".join("?" for _ in normalized_artists)
-    with closing(db()) as conn:
-        rows = conn.execute(
-            f"SELECT artist_tag, score FROM ratings WHERE artist_tag IN ({placeholders})",
-            [item["artist"] for item in normalized_artists],
-        ).fetchall()
-    ratings = {row["artist_tag"]: int(row["score"]) for row in rows}
-    for item in normalized_artists:
-        stored_score = ratings.get(item["artist"])
-        if stored_score is None:
-            raise ValueError(f"Artist is not present in ratings: {item['artist']}")
-        if item["score"] != stored_score:
-            raise ValueError(f"Artist score does not match ratings: {item['artist']}")
-        item["score"] = stored_score
     normalized["artists"] = normalized_artists
     return normalized
 
@@ -1184,16 +1215,24 @@ def api_art_style_detail(style_id):
 
 
 def _add_arca_urls(item):
+    def add_image_url(image):
+        if not image:
+            return
+        image_path = image.get("image_path") or ""
+        image["image_url"] = f"/arca-style-images/{image_path}" if image_path else ""
+        image["image_available"] = bool(image_path)
+
     representative = item.get("representative_image_path") or ""
-    if representative:
-        item["representative_image_url"] = f"/arca-style-images/{representative}"
+    item["representative_image_url"] = f"/arca-style-images/{representative}" if representative else ""
+    item["representative_image_available"] = bool(representative)
     for image in item.get("images", []):
-        if image.get("image_path"):
-            image["image_url"] = f"/arca-style-images/{image['image_path']}"
+        add_image_url(image)
+    for collection_name in ("artists", "quality_tags", "quality_sequences"):
+        for entry in item.get(collection_name, []):
+            add_image_url(entry.get("representative_image"))
     for group in item.get("style_groups", []):
         for image in group.get("images", []):
-            if image.get("image_path"):
-                image["image_url"] = f"/arca-style-images/{image['image_path']}"
+            add_image_url(image)
     return item
 
 
@@ -1215,12 +1254,41 @@ def api_collect_arca_styles():
         return json_response({"error": "수집 중 오류가 발생했습니다."}, 500)
 
 
+@app.route("/api/arca-styles/restore-images", methods=["POST"])
+def api_restore_arca_style_images():
+    try:
+        job_id = start_image_restore_job(DB_PATH, ARCA_STYLE_IMAGE_DIR)
+        return json_response({"job_id": job_id, "status": "queued"}, 202)
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
 @app.route("/api/arca-styles/collection-jobs/<int:job_id>")
 def api_arca_collection_job(job_id):
     job = get_collection_job(DB_PATH, job_id)
     if job is None:
         return json_response({"error": "수집 작업을 찾을 수 없습니다."}, 404)
     return json_response(job)
+
+
+@app.route("/api/arca-styles/collection-jobs/current")
+def api_current_arca_collection_job():
+    return json_response(get_latest_resumable_collection_job(DB_PATH) or {})
+
+
+@app.route("/api/arca-styles/collection-jobs/<int:job_id>/<action>", methods=["POST"])
+def api_control_arca_collection_job(job_id, action):
+    try:
+        if action == "pause":
+            return json_response(pause_collection_job(DB_PATH, job_id))
+        if action == "resume":
+            resumed_job_id = resume_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, job_id)
+            return json_response({"job_id": resumed_job_id, "status": "running"})
+        if action == "stop":
+            return json_response(stop_collection_job(DB_PATH, job_id))
+        return json_response({"error": "지원하지 않는 수집 제어입니다."}, 404)
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
 
 
 @app.route("/api/arca-styles/collect-url", methods=["POST"])
@@ -1267,12 +1335,102 @@ def api_import_arca_browser_session():
     return json_response(_safe_arca_browser_status(imported, ARCA_LOGIN_MANAGER.start()), 202)
 
 
+@app.route("/api/arca-styles/browser-session/extension", methods=["POST"])
+def api_connect_arca_browser_extension():
+    if request.headers.get("X-Arca-Session-Bridge") != "1":
+        return json_response({"error": "Chrome 브리지 요청을 확인할 수 없습니다."}, 403)
+    try:
+        cookie_jar = extension_payload_to_cookie_jar(request.get_json(silent=True))
+    except ArcaChromeExtensionError as exc:
+        return json_response({"error": str(exc)}, 400)
+    connected = connect_arca_cookie_jar(cookie_jar, "현재 Chrome")
+    if connected.get("connected"):
+        return json_response(_safe_arca_browser_status(connected))
+    error = str(connected.get("error") or "아카라이브 로그인을 확인하지 못했습니다.")
+    return json_response({
+        "connected": False,
+        "browser": "",
+        "error": error,
+        "state": "failed",
+        "message": error,
+    }, 401)
+
+
+@app.route("/api/arca-styles/browser-session/extension/setup", methods=["POST"])
+def api_setup_arca_browser_extension():
+    if request.mimetype != "application/json":
+        return json_response({"error": "JSON 요청이 필요합니다."}, 415)
+    try:
+        path = install_arca_session_bridge(DATA_DIR, source_dir=ARCA_SESSION_BRIDGE_SOURCE_DIR)
+        return json_response({"ok": True, "path": str(path)})
+    except (ArcaChromeExtensionError, OSError):
+        return json_response({"error": "Chrome 연동 확장 폴더를 준비하지 못했습니다."}, 500)
+
+
 @app.route("/api/arca-styles", methods=["GET"])
 def api_arca_styles():
-    filters = {key: request.args.get(key) for key in ("q", "tab", "metadata", "start_date", "end_date", "limit", "sort") if request.args.get(key) is not None}
+    filters = {
+        key: request.args.get(key)
+        for key in ("q", "tab", "metadata", "start_date", "end_date", "sort", "page", "per_page", "recommendation_min")
+        if request.args.get(key) is not None
+    }
     try:
-        return json_response([_add_arca_urls(item) for item in list_arca_styles(DB_PATH, filters)])
+        result = get_arca_style_page(DB_PATH, filters)
+        result["items"] = [_add_arca_urls(item) for item in result["items"]]
+        return json_response(result)
     except (ValueError, ArcaCollectorError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/statistics", methods=["GET"])
+def api_arca_style_statistics():
+    filters = {
+        key: request.args.get(key)
+        for key in ("recommendation_min", "recommendation_max")
+        if request.args.get(key) not in (None, "")
+    }
+    try:
+        return json_response(_add_arca_urls(get_arca_style_statistics(DB_PATH, filters)))
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/statistics/tag", methods=["GET"])
+def api_arca_tag_statistics():
+    try:
+        filters = {
+            key: request.args.get(key)
+            for key in ("recommendation_min", "recommendation_max")
+            if request.args.get(key) not in (None, "")
+        }
+        result = get_arca_tag_statistics(
+            DB_PATH,
+            request.args.get("kind"),
+            request.args.get("tag"),
+            request.args.get("limit", 24),
+            filters,
+        )
+        return json_response(_add_arca_urls(result))
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/arca-styles/statistics/sequence", methods=["GET"])
+def api_arca_quality_sequence_statistics():
+    try:
+        filters = {
+            key: request.args.get(key)
+            for key in ("recommendation_min", "recommendation_max")
+            if request.args.get(key) not in (None, "")
+        }
+        result = get_arca_quality_sequence_statistics(
+            DB_PATH,
+            request.args.getlist("tag"),
+            request.args.get("limit", 40),
+            filters,
+        )
+        return json_response(_add_arca_urls(result))
+    except ArcaCollectorError as exc:
         return json_response({"error": str(exc)}, 400)
 
 

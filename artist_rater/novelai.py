@@ -10,7 +10,7 @@ import urllib.request
 
 from png_validator import validate_png
 
-SUBSCRIPTION_URL = "https://api.novelai.net/user/subscription"
+SUBSCRIPTION_URL = "https://image.novelai.net/user/subscription"
 GENERATION_URL = "https://image.novelai.net/ai/generate-image"
 REQUEST_TIMEOUT = 30
 USER_AGENT = "Mozilla/5.0"

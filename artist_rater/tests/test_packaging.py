@@ -33,8 +33,12 @@ class PackagingTest(unittest.TestCase):
         script = (root / "build_exe.ps1").read_text(encoding="utf-8")
         self.assertIn('$templatesDir = Join-Path $appDir "templates"', script)
         self.assertIn('$staticDir = Join-Path $appDir "static"', script)
+        self.assertIn("launcher.py", script)
+        self.assertIn("--hidden-import app", script)
         self.assertIn('"$templatesDir;templates"', script)
         self.assertIn('"$staticDir;static"', script)
+        self.assertIn("export_arca_seed.py", script)
+        self.assertIn('"$seedDb;."', script)
         self.assertNotIn("data;data", script)
 
     def test_gitignore_excludes_release_secrets_and_generated_state(self):
@@ -42,6 +46,8 @@ class PackagingTest(unittest.TestCase):
         ignore = (root / ".gitignore").read_text(encoding="utf-8")
         for marker in ("settings.json", "arca_login_profile", "*.sqlite*", "release/"):
             self.assertIn(marker, ignore)
+        self.assertIn("artist_rater/data/", ignore)
+        self.assertIn("!artist_rater/arca_style_seed.sqlite", ignore)
 
 
 if __name__ == "__main__":

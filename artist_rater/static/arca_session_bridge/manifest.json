@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Arca Session Bridge",
+  "version": "1.0.0",
+  "description": "현재 Chrome의 Arca Live 로그인 세션을 로컬 앱에 연결합니다.",
+  "permissions": [
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://arca.live/*",
+    "https://*.arca.live/*",
+    "http://127.0.0.1/*"
+  ],
+  "action": {
+    "default_title": "Arca 로그인 연결",
+    "default_popup": "popup.html"
+  }
+}

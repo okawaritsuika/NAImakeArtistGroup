@@ -7,6 +7,7 @@ class RunScriptTest(unittest.TestCase):
         script = (Path(__file__).resolve().parents[1] / "run.bat").read_text(encoding="utf-8")
         self.assertIn('python -c "import flask, requests, PIL, browser_cookie3, playwright"', script)
         self.assertIn("if errorlevel 1", script.lower())
+        self.assertIn("python launcher.py", script)
 
 
 if __name__ == "__main__":

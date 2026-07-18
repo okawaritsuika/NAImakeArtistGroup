@@ -14,17 +14,31 @@ Danbooru 작가를 평가하고, 평가 결과로 NovelAI용 그림체 프롬프
 ## EXE 사용
 
 1. GitHub Releases에서 `DanbooruArtistRater.exe`를 받습니다.
-2. EXE를 실행한 뒤 콘솔에 표시되는 `http://127.0.0.1:5001`을 브라우저에서 엽니다.
-3. 설정, DB, 썸네일, 생성 이미지와 로그인 프로필은 EXE 옆 `data` 폴더에 저장됩니다.
+2. EXE를 실행하면 작은 리모콘 창이 열립니다.
+3. `서버 켜기`를 누른 뒤 `웹사이트 열기`로 `http://127.0.0.1:5001`을 엽니다.
+4. 리모콘에서 서버를 끄거나 GitHub 최신 릴리스 기준 업데이트를 확인할 수 있습니다.
+5. 설정, DB, 썸네일, 생성 이미지와 로그인 프로필은 EXE 옆 `data` 폴더에 저장됩니다.
 
-아카라이브 성인 게시판 로그인 연결에는 로컬 Chrome이 필요합니다. NovelAI App Key는 GitHub나 EXE에 포함되지 않으며 사용자 PC의 `data/settings.json`에만 저장됩니다.
+아카라이브 성인 게시판 로그인 연결에는 로컬 Chrome이 필요합니다. 화면의 `자동 연결 / 전용 로그인 창`은 Chrome·Edge 쿠키 자동 확인 후 앱 전용 로그인 창으로 이어집니다.
+
+이미 로그인한 평소 Chrome을 그대로 쓰려면 수집 화면에서 `지금 쓰는 Chrome 로그인 그대로 연결하기`를 펼치고 다음 과정을 처음 한 번만 진행합니다.
+
+1. `설치 폴더 열기`를 누릅니다.
+2. Chrome의 `chrome://extensions`에서 개발자 모드를 켜고 `압축해제된 확장 프로그램을 로드`합니다.
+3. 열린 `arca_session_bridge` 폴더를 선택한 뒤 확장 버튼의 `현재 로그인 연결`을 누릅니다.
+
+확장은 `arca.live` 쿠키 읽기와 `127.0.0.1` 로컬 앱 연결 권한만 사용합니다. 전달된 Arca 쿠키는 앱 프로세스 메모리에만 있고 응답·로그·설정 파일에는 저장되지 않습니다. NovelAI App Key도 GitHub나 EXE에 포함되지 않으며 사용자 PC의 `data/settings.json`에만 저장됩니다.
+
+그림체 수집은 NovelAI PNG 프롬프트 메타데이터 정리가 목적입니다. 메타데이터를 추출할 수 없는 JPEG·WebP·SVG 샘플 원본은 내려받아 보관하지 않고, 게시글 정보와 재확인 방지 기록만 남깁니다.
+
+배포본에는 빌드 시점의 공유 그림체 게시글·프롬프트·이미지 원본 URL만 기본 데이터로 포함되며 이미지 파일은 포함되지 않습니다. 로컬 이미지가 없는 동안 원본 URL도 화면에 노출하지 않습니다. 사용자가 수집 화면의 `이미지만 빠르게 받기`를 누르면 저장된 URL에서 NovelAI PNG만 병렬로 복원하며, 중단 후 다시 실행하면 남은 이미지만 받습니다.
 
 ## 소스 실행
 
 ```powershell
 cd artist_rater
 python -m pip install -r requirements.txt
-python app.py
+python launcher.py
 ```
 
 ## EXE 빌드
@@ -34,5 +48,4 @@ python -m pip install pyinstaller
 .\build_exe.ps1
 ```
 
-빌드 결과는 `release/DanbooruArtistRater.exe`에 생성됩니다. 로컬 설정과 사용자 데이터는 빌드에 포함되지 않습니다.
-
+빌드 결과는 `release/DanbooruArtistRater.exe`에 생성됩니다. App Key·로컬 설정·생성 이미지·로그인 정보는 포함되지 않고, 공유 그림체 메타데이터와 Danbooru 작가 평가·캐시만 로컬 이미지 경로를 제거한 전용 시드 DB로 포함됩니다.

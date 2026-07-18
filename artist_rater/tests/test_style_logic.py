@@ -540,12 +540,14 @@ class ArtistStyleEndpointTest(unittest.TestCase):
             app.GENERATED_DIR,
             app.SETTINGS_JSON_PATH,
             app.DB_PATH,
+            app.ARCA_STYLE_SEED_PATH,
         )
         app.DATA_DIR = self.data_dir
         app.THUMBNAIL_DIR = self.data_dir / "thumbnails"
         app.GENERATED_DIR = self.data_dir / "generated"
         app.SETTINGS_JSON_PATH = self.data_dir / "settings.json"
         app.DB_PATH = self.data_dir / "artist_rater.sqlite"
+        app.ARCA_STYLE_SEED_PATH = self.data_dir / "missing-seed.sqlite"
         app.init_db()
         self.client = app.app.test_client()
         with closing(app.db()) as conn, conn:
@@ -566,6 +568,7 @@ class ArtistStyleEndpointTest(unittest.TestCase):
             app.GENERATED_DIR,
             app.SETTINGS_JSON_PATH,
             app.DB_PATH,
+            app.ARCA_STYLE_SEED_PATH,
         ) = self.originals
         self.temp_dir.cleanup()
 
@@ -589,6 +592,26 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         self.assertEqual({item["artist"] for item in data["artists"]}, {"alpha", "beta"})
         self.assertIn("artist_prompt", data)
         self.assertIn("style_hash", data)
+
+    @patch("app.get_shared_style_artist_pool")
+    def test_endpoint_can_fill_zero_to_max_slots_from_shared_styles(self, shared_pool):
+        shared_pool.return_value = [
+            {"artist": "shared_alpha", "sample_count": 8},
+            {"artist": "shared_beta", "sample_count": 5},
+        ]
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 2,
+                "scores": [1, 2, 3, 4, 5],
+                "shared_artist_max": 2,
+                "rng_seed": 5,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual({item["artist"] for item in artists}, {"shared_alpha", "shared_beta"})
+        self.assertTrue(all(item["shared_style"] for item in artists))
 
     def test_optional_artists_preserve_order_and_only_reroll_weights(self):
         supplied = [
@@ -685,6 +708,29 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         )
         self.assertNotEqual([item["weight"] for item in artists], original_weights)
 
+    def test_supplied_artists_do_not_require_scores_or_saved_ratings(self):
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "reroll": "weights",
+                "artists": [
+                    {"artist": "unrated_artist_a", "weight": 1.7},
+                    {"artist": "unrated_artist_b", "weight": 0.4},
+                ],
+                "weight_mode": "random",
+                "rng_seed": 11,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual(
+            [item["artist"] for item in artists],
+            ["unrated_artist_a", "unrated_artist_b"],
+        )
+        self.assertNotIn("score", artists[0])
+        self.assertIn("artist_prompt", response.get_json())
+
     def test_artist_reroll_selects_new_unique_artists_and_preserves_positional_weights(self):
         with closing(app.db()) as conn, conn:
             for artist, score in (("delta", 4), ("epsilon", 3)):
@@ -727,9 +773,9 @@ class ArtistStyleEndpointTest(unittest.TestCase):
                     {"artist": "alpha", "score": 5},
                 ]
             },
-            {"artists": [{"artist": "alpha", "score": 1}]},
-            {"artists": [{"artist": "missing", "score": 5}]},
             {"count": 1, "scores": [5], "weight_mode": "unknown"},
+            {"count": 1, "scores": [5], "shared_artist_max": -1},
+            {"count": 1, "scores": [5], "shared_artist_max": True},
         )
         for payload in invalid_payloads:
             with self.subTest(payload=payload):

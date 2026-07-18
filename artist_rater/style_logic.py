@@ -225,7 +225,8 @@ def assign_weights(
     items = []
     for index, item in enumerate(artists or []):
         normalized = dict(item)
-        normalized["score"] = exact_score(item.get("score"))
+        if item.get("score") is not None:
+            normalized["score"] = exact_score(item.get("score"))
         normalized["_index"] = index
         items.append(normalized)
     if mode == "profile":
@@ -256,7 +257,7 @@ def assign_weights(
     if prefer_high_scores:
         ranked = sorted(
             items,
-            key=lambda item: float(item.get("score") or 0) + rng.random() * 4,
+            key=lambda item: float(item.get("score") or 3) + rng.random() * 4,
             reverse=True,
         )
     else:

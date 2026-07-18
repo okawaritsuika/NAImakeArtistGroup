@@ -8,13 +8,16 @@ import sqlite3
 import struct
 import time
 import zlib
-from concurrent.futures import ThreadPoolExecutor
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from http.cookiejar import CookieJar
+from itertools import combinations
 from pathlib import Path
-from threading import RLock, Thread
+from statistics import median
+from threading import Event, RLock, Thread
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import requests
@@ -31,10 +34,19 @@ IMAGE_TIMEOUT = 20
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
 EDITABLE_LIMIT = 100_000
-SEARCH_SCOPE = "title-category-session-v5"
+SEARCH_SCOPE = "title-category-session-v6"
+MAX_ARCHIVE_SEARCH_PAGE = 4096
+COLLECTION_WORKERS = 6
+IMAGE_RESTORE_WORKERS = 16
 GENERATION_KEYS = {"seed", "sampler", "steps", "scale", "noise_schedule", "model", "width", "height"}
 STYLE_SIMILARITY_THRESHOLD = 0.55
 TRANSIENT_TAG = re.compile(r"^(?:\d+(?:girl|boy)s?|solo|multiple girls|portrait|upper body|full body|looking at.*|smile|open mouth|.*hair|.*eyes|robot)$", re.I)
+NON_PNG_IMAGE_TYPES = {
+    ".avif": "image/avif", ".bmp": "image/bmp", ".gif": "image/gif",
+    ".ico": "image/x-icon", ".jfif": "image/jpeg", ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg", ".svg": "image/svg+xml", ".tif": "image/tiff",
+    ".tiff": "image/tiff", ".webp": "image/webp",
+}
 
 
 class ArcaCollectorError(Exception):
@@ -45,9 +57,15 @@ class ArcaBrowserSessionRequired(ArcaCollectorError):
     pass
 
 
+class ArcaCollectionStopped(ArcaCollectorError):
+    pass
+
+
 _ARCA_BROWSER_LOCK = RLock()
 _ARCA_BROWSER_COOKIES = CookieJar()
 _ARCA_BROWSER_STATUS = {"connected": False, "browser": "", "error": ""}
+_COLLECTION_CONTROL_LOCK = RLock()
+_COLLECTION_CONTROLS = {}
 
 
 def create_arca_session():
@@ -234,16 +252,206 @@ def init_arca_style_tables(db_path):
         CREATE INDEX IF NOT EXISTS idx_arca_items_tab ON arca_style_items(board_tab);
         CREATE INDEX IF NOT EXISTS idx_arca_items_metadata ON arca_style_items(metadata_status);
         CREATE INDEX IF NOT EXISTS idx_arca_images_item ON arca_style_images(item_id);
+        CREATE INDEX IF NOT EXISTS idx_arca_items_metadata_tab ON arca_style_items(metadata_status,board_tab);
+        CREATE INDEX IF NOT EXISTS idx_arca_images_metadata_item ON arca_style_images(metadata_status,item_id);
         CREATE INDEX IF NOT EXISTS idx_arca_runs_lookup ON arca_collection_runs(keyword,tabs,max_pages,max_posts,status);
+        CREATE TABLE IF NOT EXISTS arca_prompt_preset_index (
+            image_id INTEGER PRIMARY KEY, source_hash TEXT NOT NULL,
+            base_prompt TEXT NOT NULL, negative_prompt TEXT NOT NULL,
+            excluded_tags_json TEXT NOT NULL DEFAULT '[]', artists_json TEXT NOT NULL DEFAULT '[]',
+            recommendation_count INTEGER,
+            FOREIGN KEY(image_id) REFERENCES arca_style_images(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS arca_seed_imports (
+            seed_hash TEXT PRIMARY KEY, imported_at TEXT NOT NULL
+        );
         """)
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(arca_collection_runs)")}
         if "search_scope" not in run_columns:
             conn.execute("ALTER TABLE arca_collection_runs ADD COLUMN search_scope TEXT NOT NULL DEFAULT 'all'")
         _ensure_column(conn, "arca_collection_runs", "job_id", "INTEGER REFERENCES arca_collection_jobs(id)")
+        _ensure_column(conn, "arca_collection_jobs", "job_type", "TEXT NOT NULL DEFAULT 'collection'")
         _ensure_column(conn, "arca_style_images", "base_prompt", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "arca_style_images", "character_prompts_json", "TEXT NOT NULL DEFAULT '[]'")
         _ensure_column(conn, "arca_style_items", "recommendation_count", "INTEGER")
         _ensure_column(conn, "arca_style_items", "view_count", "INTEGER")
+
+
+def _init_danbooru_seed_tables(conn):
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS ratings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist_tag TEXT NOT NULL UNIQUE,
+            score INTEGER NOT NULL,
+            memo TEXT DEFAULT '',
+            favorite INTEGER DEFAULT 0,
+            blocked INTEGER DEFAULT 0,
+            mode TEXT NOT NULL,
+            query_text TEXT DEFAULT '',
+            query_tags_json TEXT DEFAULT '[]',
+            matched_post_count INTEGER DEFAULT 0,
+            artist_post_count INTEGER DEFAULT 0,
+            representative_post_id INTEGER,
+            representative_thumbnail_path TEXT DEFAULT '',
+            representative_preview_url TEXT DEFAULT '',
+            sample_post_ids_json TEXT DEFAULT '[]',
+            prompt_text TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS artist_cache (
+            artist_tag TEXT PRIMARY KEY,
+            artist_post_count INTEGER DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        """)
+
+
+def export_arca_style_seed(source_db, seed_db):
+    """Create a distributable archive and Danbooru DB without local files or generated results."""
+    source, target = Path(source_db).resolve(), Path(seed_db).resolve()
+    if source == target:
+        raise ValueError("Seed output must be different from the source database.")
+    if not source.is_file():
+        raise FileNotFoundError(f"Shared-style database not found: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    init_arca_style_tables(target)
+    with closing(_connect(target)) as conn, conn:
+        _init_danbooru_seed_tables(conn)
+        conn.execute("ATTACH DATABASE ? AS source", (str(source),))
+        source_tables = {
+            row[0] for row in conn.execute("SELECT name FROM source.sqlite_master WHERE type='table'")
+        }
+        item_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_items)")]
+        image_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_images)")]
+        item_select = ["''" if name == "representative_image_path" else name for name in item_columns]
+        image_select = ["''" if name == "image_path" else name for name in image_columns]
+        conn.execute(
+            f"INSERT INTO arca_style_items ({','.join(item_columns)}) "
+            f"SELECT {','.join(item_select)} FROM source.arca_style_items"
+        )
+        conn.execute(
+            f"INSERT INTO arca_style_images ({','.join(image_columns)}) "
+            f"SELECT {','.join(image_select)} FROM source.arca_style_images"
+        )
+        run_columns = [
+            row[1] for row in conn.execute("PRAGMA main.table_info(arca_collection_runs)")
+            if row[1] != "job_id"
+        ]
+        conn.execute(
+            f"INSERT INTO arca_collection_runs ({','.join(run_columns)}) "
+            f"SELECT {','.join(run_columns)} FROM source.arca_collection_runs WHERE status='completed'"
+        )
+        conn.execute(
+            "INSERT INTO arca_collection_run_items(run_id,item_id) "
+            "SELECT ri.run_id,ri.item_id FROM source.arca_collection_run_items ri "
+            "JOIN arca_collection_runs run ON run.id=ri.run_id "
+            "JOIN arca_style_items item ON item.id=ri.item_id"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO arca_collection_invalidations "
+            "SELECT * FROM source.arca_collection_invalidations"
+        )
+        if "ratings" in source_tables:
+            rating_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(ratings)")]
+            rating_select = ["''" if name == "representative_thumbnail_path" else name for name in rating_columns]
+            conn.execute(
+                f"INSERT INTO ratings ({','.join(rating_columns)}) "
+                f"SELECT {','.join(rating_select)} FROM source.ratings"
+            )
+        if "artist_cache" in source_tables:
+            conn.execute("INSERT INTO artist_cache SELECT * FROM source.artist_cache")
+    with closing(sqlite3.connect(target)) as conn:
+        conn.execute("VACUUM")
+    return {
+        "items": _table_count(target, "arca_style_items"),
+        "images": _table_count(target, "arca_style_images"),
+        "ratings": _table_count(target, "ratings"),
+        "artist_cache": _table_count(target, "artist_cache"),
+        "bytes": target.stat().st_size,
+    }
+
+
+def _table_count(db_path, table):
+    with closing(_connect(db_path)) as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+def import_arca_style_seed(db_path, seed_db):
+    """Merge a bundled metadata-only seed once, preserving existing local rows and image files."""
+    seed = Path(seed_db)
+    if not seed.is_file():
+        return {"imported": False, "items": 0, "images": 0}
+    seed_hash = hashlib.sha256(seed.read_bytes()).hexdigest()
+    init_arca_style_tables(db_path)
+    with closing(_connect(db_path)) as conn, conn:
+        _init_danbooru_seed_tables(conn)
+        if conn.execute("SELECT 1 FROM arca_seed_imports WHERE seed_hash=?", (seed_hash,)).fetchone():
+            return {"imported": False, "items": 0, "images": 0}
+        before_items = conn.execute("SELECT COUNT(*) FROM arca_style_items").fetchone()[0]
+        before_images = conn.execute("SELECT COUNT(*) FROM arca_style_images").fetchone()[0]
+        conn.execute("ATTACH DATABASE ? AS seed", (str(seed.resolve()),))
+        seed_tables = {
+            row[0] for row in conn.execute("SELECT name FROM seed.sqlite_master WHERE type='table'")
+        }
+        if "ratings" in seed_tables:
+            rating_columns = [
+                row[1] for row in conn.execute("PRAGMA main.table_info(ratings)") if row[1] != "id"
+            ]
+            conn.execute(
+                f"INSERT OR IGNORE INTO ratings ({','.join(rating_columns)}) "
+                f"SELECT {','.join(rating_columns)} FROM seed.ratings"
+            )
+        if "artist_cache" in seed_tables:
+            conn.execute("INSERT OR IGNORE INTO artist_cache SELECT * FROM seed.artist_cache")
+        item_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_items)") if row[1] != "id"]
+        conn.execute(
+            f"INSERT OR IGNORE INTO arca_style_items ({','.join(item_columns)}) "
+            f"SELECT {','.join(item_columns)} FROM seed.arca_style_items"
+        )
+        image_columns = [
+            row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_images)")
+            if row[1] not in {"id", "item_id"}
+        ]
+        conn.execute(
+            f"INSERT OR IGNORE INTO arca_style_images (item_id,{','.join(image_columns)}) "
+            f"SELECT target.id,{','.join(f'image.{name}' for name in image_columns)} "
+            "FROM seed.arca_style_images image "
+            "JOIN seed.arca_style_items source ON source.id=image.item_id "
+            "JOIN arca_style_items target ON target.source_url=source.source_url"
+        )
+        run_map = {}
+        run_columns = [
+            row[1] for row in conn.execute("PRAGMA main.table_info(arca_collection_runs)")
+            if row[1] not in {"id", "job_id"}
+        ]
+        for row in conn.execute(f"SELECT id,{','.join(run_columns)} FROM seed.arca_collection_runs WHERE status='completed'"):
+            cursor = conn.execute(
+                f"INSERT INTO arca_collection_runs ({','.join(run_columns)}) VALUES ({','.join('?' for _ in run_columns)})",
+                tuple(row[name] for name in run_columns),
+            )
+            run_map[row["id"]] = cursor.lastrowid
+        for seed_run_id, run_id in run_map.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO arca_collection_run_items(run_id,item_id) "
+                "SELECT ?,target.id FROM seed.arca_collection_run_items link "
+                "JOIN seed.arca_style_items source ON source.id=link.item_id "
+                "JOIN arca_style_items target ON target.source_url=source.source_url "
+                "WHERE link.run_id=?",
+                (run_id, seed_run_id),
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO arca_collection_invalidations "
+            "SELECT * FROM seed.arca_collection_invalidations"
+        )
+        conn.execute(
+            "INSERT INTO arca_seed_imports(seed_hash,imported_at) VALUES(?,?)",
+            (seed_hash, datetime.now().isoformat(timespec="seconds")),
+        )
+        items = conn.execute("SELECT COUNT(*) FROM arca_style_items").fetchone()[0] - before_items
+        images = conn.execute("SELECT COUNT(*) FROM arca_style_images").fetchone()[0] - before_images
+    return {"imported": True, "items": items, "images": images}
 
 
 def _iso_date(value, name):
@@ -264,10 +472,10 @@ def normalize_collect_payload(payload):
     if not tabs or any(tab not in {"NAI", "R18_NAI"} for tab in tabs):
         raise ArcaCollectorError("NAI 또는 R18_NAI 탭을 선택해 주세요.")
     try:
-        max_pages, max_posts = int(payload.get("max_pages", 5)), int(payload.get("max_posts", 80))
+        max_pages, max_posts = int(payload.get("max_pages", 0)), int(payload.get("max_posts", 0))
     except (TypeError, ValueError):
         raise ArcaCollectorError("페이지와 글 수는 숫자여야 합니다.")
-    if not 1 <= max_pages <= 30 or not 1 <= max_posts <= 300:
+    if not 0 <= max_pages <= MAX_ARCHIVE_SEARCH_PAGE or max_posts < 0:
         raise ArcaCollectorError("페이지 또는 글 수 제한이 범위를 벗어났습니다.")
     keyword = str(payload.get("keyword") or DEFAULT_KEYWORD).strip()
     if not keyword or len(keyword) > 200:
@@ -308,7 +516,11 @@ def create_collection_job(db_path, payload):
     with closing(_connect(db_path)) as conn, conn:
         return conn.execute(
             "INSERT INTO arca_collection_jobs(request_json,status,stage,total_pages,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (json.dumps(params, ensure_ascii=False), "queued", "queued", params["max_pages"], now, now),
+            (
+                json.dumps(params, ensure_ascii=False), "queued", "queued",
+                params["max_pages"] * len(params["tabs"]) if params["max_pages"] else None,
+                now, now,
+            ),
         ).lastrowid
 
 
@@ -358,11 +570,100 @@ def get_collection_job(db_path, job_id):
     return job
 
 
+def get_latest_resumable_collection_job(db_path):
+    with closing(_connect(db_path)) as conn:
+        row = conn.execute("SELECT id,status FROM arca_collection_jobs ORDER BY id DESC LIMIT 1").fetchone()
+    resumable = {"queued", "running", "pause_requested", "paused", "stop_requested", "interrupted", "stopped", "failed"}
+    return get_collection_job(db_path, row[0]) if row and row[1] in resumable else None
+
+
+def _register_collection_control(job_id):
+    control = {"pause": Event(), "stop": Event()}
+    with _COLLECTION_CONTROL_LOCK:
+        _COLLECTION_CONTROLS[job_id] = control
+    return control
+
+
+def _collection_control(job_id):
+    with _COLLECTION_CONTROL_LOCK:
+        return _COLLECTION_CONTROLS.get(job_id)
+
+
+def _remove_collection_control(job_id):
+    with _COLLECTION_CONTROL_LOCK:
+        _COLLECTION_CONTROLS.pop(job_id, None)
+
+
+def _wait_for_collection_control(db_path, job_id, resume_stage):
+    if not job_id:
+        return
+    control = _collection_control(job_id)
+    if not control:
+        return
+    if control["stop"].is_set():
+        raise ArcaCollectionStopped("사용자가 수집을 중지했습니다.")
+    paused = False
+    while control["pause"].is_set():
+        if not paused:
+            update_collection_job(db_path, job_id, status="paused", stage="paused")
+            paused = True
+        if control["stop"].wait(0.25):
+            raise ArcaCollectionStopped("사용자가 수집을 중지했습니다.")
+    if paused:
+        update_collection_job(db_path, job_id, status="running", stage=resume_stage)
+
+
+def pause_collection_job(db_path, job_id):
+    job = get_collection_job(db_path, job_id)
+    if not job:
+        raise ArcaCollectorError("수집 작업을 찾을 수 없습니다.")
+    control = _collection_control(job_id)
+    if not control or job["status"] not in {"queued", "running", "pause_requested", "paused"}:
+        raise ArcaCollectorError("현재 작업은 일시정지할 수 없습니다.")
+    control["pause"].set()
+    update_collection_job(db_path, job_id, status="pause_requested", stage="pause_requested")
+    return get_collection_job(db_path, job_id)
+
+
+def stop_collection_job(db_path, job_id):
+    job = get_collection_job(db_path, job_id)
+    if not job:
+        raise ArcaCollectorError("수집 작업을 찾을 수 없습니다.")
+    control = _collection_control(job_id)
+    if not control or job["status"] not in {"queued", "running", "pause_requested", "paused", "stop_requested"}:
+        raise ArcaCollectorError("현재 작업은 중지할 수 없습니다.")
+    control["stop"].set()
+    control["pause"].clear()
+    update_collection_job(db_path, job_id, status="stop_requested", stage="stop_requested")
+    return get_collection_job(db_path, job_id)
+
+
+def resume_collection_job(db_path, image_dir, job_id):
+    job = get_collection_job(db_path, job_id)
+    if not job:
+        raise ArcaCollectorError("수집 작업을 찾을 수 없습니다.")
+    control = _collection_control(job_id)
+    if control and job["status"] in {"pause_requested", "paused"}:
+        control["pause"].clear()
+        update_collection_job(db_path, job_id, status="running", stage="resuming")
+        return job_id
+    if job["status"] not in {"interrupted", "stopped", "failed"}:
+        raise ArcaCollectorError("현재 작업은 이어서 시작할 수 없습니다.")
+    if job.get("job_type") == "image_restore":
+        return start_image_restore_job(db_path, image_dir)
+    try:
+        payload = json.loads(job["request_json"])
+    except (TypeError, json.JSONDecodeError):
+        raise ArcaCollectorError("이전 수집 조건을 읽지 못했습니다.")
+    return start_collection_job(db_path, image_dir, payload)
+
+
 def mark_interrupted_collection_jobs(db_path):
     now = datetime.now().isoformat(timespec="seconds")
     with closing(_connect(db_path)) as conn, conn:
         conn.execute(
-            "UPDATE arca_collection_jobs SET status='interrupted',stage='interrupted',error=?,finished_at=?,updated_at=? WHERE status IN ('queued','running')",
+            "UPDATE arca_collection_jobs SET status='interrupted',stage='interrupted',error=?,finished_at=?,updated_at=? "
+            "WHERE status IN ('queued','running','pause_requested','paused','stop_requested')",
             ("앱이 종료되어 수집이 중단되었습니다.", now, now),
         )
 
@@ -371,13 +672,18 @@ def _run_collection_job(db_path, image_dir, params, job_id):
     try:
         update_collection_job(db_path, job_id, status="running", stage="searching")
         collect_arca_styles(db_path, image_dir, params, job_id=job_id)
+    except ArcaCollectionStopped as exc:
+        update_collection_job(db_path, job_id, status="stopped", stage="stopped", error=str(exc))
     except Exception as exc:
         update_collection_job(db_path, job_id, status="failed", stage="failed", error=str(exc)[:1000])
+    finally:
+        _remove_collection_control(job_id)
 
 
 def start_collection_job(db_path, image_dir, payload):
     params = normalize_collect_payload(payload)
     job_id = create_collection_job(db_path, params)
+    _register_collection_control(job_id)
     worker = Thread(target=_run_collection_job, args=(db_path, image_dir, params, job_id), daemon=True)
     worker.start()
     return job_id
@@ -393,10 +699,48 @@ def create_url_collection_job(db_path, source_url):
         ).lastrowid
 
 
+def _local_image_exists(image_root, value):
+    if not value:
+        return False
+    root = Path(image_root).resolve()
+    path = (root / str(value)).resolve()
+    return root in path.parents and path.is_file()
+
+
+def _reusable_direct_item_id(db_path, image_dir, source_url):
+    with closing(_connect(db_path)) as conn:
+        item = conn.execute(
+            "SELECT id,representative_image_path FROM arca_style_items WHERE source_url=? AND metadata_status='ok'",
+            (source_url,),
+        ).fetchone()
+        if not item or not _local_image_exists(image_dir, item["representative_image_path"]):
+            return None
+        rows = conn.execute(
+            "SELECT image_path FROM arca_style_images WHERE item_id=? AND metadata_status='ok' AND TRIM(COALESCE(image_path,''))<>''",
+            (item["id"],),
+        ).fetchall()
+    return item["id"] if any(_local_image_exists(image_dir, row["image_path"]) for row in rows) else None
+
+
 def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=None):
     canonical = normalize_arca_article_url(source_url)
     init_arca_style_tables(db_path)
-    session = session or create_arca_session()
+    reusable_item_id = _reusable_direct_item_id(db_path, image_dir, canonical)
+    if reusable_item_id is not None:
+        if job_id:
+            update_collection_job(
+                db_path, job_id, status="completed", stage="completed", total_pages=1,
+                scanned_pages=0, total_posts=1, scanned_posts=0, downloaded_images=0,
+                saved=0, updated=0, skipped_existing=1,
+            )
+        return {
+            "ok": True, "item_id": reusable_item_id, "saved": 0, "updated": 0,
+            "downloaded_images": 0, "skipped_existing": True,
+        }
+    if session is None:
+        session = create_arca_session()
+        if get_arca_browser_session_status()["connected"]:
+            _apply_imported_arca_cookies(session)
     if job_id:
         update_collection_job(db_path, job_id, status="running", stage="fetching_posts", total_pages=1, scanned_pages=0, total_posts=1, scanned_posts=0)
     html = fetch_html(session, canonical)
@@ -431,6 +775,119 @@ def start_url_collection_job(db_path, image_dir, source_url):
     canonical = normalize_arca_article_url(source_url)
     job_id = create_url_collection_job(db_path, canonical)
     Thread(target=_run_url_collection_job, args=(db_path, image_dir, canonical, job_id), daemon=True).start()
+    return job_id
+
+
+def create_image_restore_job(db_path, image_dir):
+    init_arca_style_tables(db_path)
+    missing = _missing_image_rows(db_path, image_dir)
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect(db_path)) as conn, conn:
+        job_id = conn.execute(
+            "INSERT INTO arca_collection_jobs(request_json,job_type,status,stage,total_pages,total_posts,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (json.dumps({"mode": "image_restore"}), "image_restore", "queued", "queued", 0, len(missing), now, now),
+        ).lastrowid
+    return job_id, missing
+
+
+def _missing_image_rows(db_path, image_dir):
+    with closing(_connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT id,item_id,image_url,image_path,content_type FROM arca_style_images "
+            "WHERE metadata_status='ok' AND TRIM(COALESCE(image_url,''))<>'' ORDER BY id"
+        ).fetchall()
+    return [dict(row) for row in rows if not _local_image_exists(image_dir, row["image_path"])]
+
+
+def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
+    rows = list(missing if missing is not None else _missing_image_rows(db_path, image_dir))
+    total = len(rows)
+    update_collection_job(
+        db_path, job_id, status="running", stage="restoring_images", total_pages=0,
+        scanned_pages=0, total_posts=total, scanned_posts=0, downloaded_images=0,
+    )
+    if not rows:
+        update_collection_job(db_path, job_id, status="completed", stage="completed", skipped_existing=1)
+        return {"restored": 0, "failed": 0, "skipped_existing": True}
+    session = create_arca_session()
+    if get_arca_browser_session_status()["connected"]:
+        _apply_imported_arca_cookies(session)
+
+    def fetch_one(row):
+        try:
+            data, content_type = download_image(session, row["image_url"])
+            return row, data, content_type
+        except (requests.RequestException, ArcaCollectorError):
+            return row, None, ""
+
+    restored = failed = processed = 0
+    started = time.monotonic()
+    workers = min(IMAGE_RESTORE_WORKERS, total)
+    pending_rows = iter(rows)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+        for _ in range(workers):
+            row = next(pending_rows, None)
+            if row is None:
+                break
+            pending[executor.submit(fetch_one, row)] = row
+        while pending:
+            _wait_for_collection_control(db_path, job_id, "restoring_images")
+            future = next(as_completed(tuple(pending)))
+            pending.pop(future)
+            row, data, content_type = future.result()
+            processed += 1
+            if data is None:
+                failed += 1
+            else:
+                try:
+                    path = save_image_bytes(image_dir, row["image_url"], data, content_type)
+                except OSError:
+                    failed += 1
+                else:
+                    restored += 1
+                    with closing(_connect(db_path)) as conn, conn:
+                        conn.execute(
+                            "UPDATE arca_style_images SET image_path=?,content_type=? WHERE id=?",
+                            (path, content_type, row["id"]),
+                        )
+                        conn.execute(
+                            "UPDATE arca_style_items SET representative_image_path=? "
+                            "WHERE id=? AND representative_image_url=?",
+                            (path, row["item_id"], row["image_url"]),
+                        )
+            average = (time.monotonic() - started) / processed
+            update_collection_job(
+                db_path, job_id, stage="restoring_images", scanned_posts=processed,
+                downloaded_images=restored, updated=restored, average_post_seconds=average,
+            )
+            row = next(pending_rows, None)
+            if row is not None:
+                pending[executor.submit(fetch_one, row)] = row
+    error = f"{failed}개 이미지를 받지 못했습니다. 다시 실행하면 실패한 이미지만 재시도합니다." if failed else ""
+    update_collection_job(
+        db_path, job_id, status="completed", stage="completed", scanned_posts=processed,
+        downloaded_images=restored, updated=restored, error=error,
+    )
+    return {"restored": restored, "failed": failed, "skipped_existing": False}
+
+
+def _run_image_restore_job(db_path, image_dir, job_id, missing):
+    try:
+        restore_arca_style_images(db_path, image_dir, job_id, missing)
+    except ArcaCollectionStopped as exc:
+        update_collection_job(db_path, job_id, status="stopped", stage="stopped", error=str(exc))
+    except Exception as exc:
+        update_collection_job(db_path, job_id, status="failed", stage="failed", error=str(exc)[:1000])
+    finally:
+        _remove_collection_control(job_id)
+
+
+def start_image_restore_job(db_path, image_dir):
+    job_id, missing = create_image_restore_job(db_path, image_dir)
+    _register_collection_control(job_id)
+    Thread(target=_run_image_restore_job, args=(db_path, image_dir, job_id, missing), daemon=True).start()
     return job_id
 
 
@@ -844,6 +1301,244 @@ def split_prompt_tags(prompt):
     return tags
 
 
+QUALITY_TAG_ALIASES = {
+    "quality": "quality",
+    "masterpiece": "masterpiece",
+    "best quality": "best quality",
+    "amazing quality": "amazing quality",
+    "high quality": "high quality",
+    "very aesthetic": "very aesthetic",
+    "great aesthetic": "great aesthetic",
+    "aesthetic": "aesthetic",
+    "highres": "highres",
+    "hires": "highres",
+    "high res": "highres",
+    "absurdres": "absurdres",
+    "incredibly absurdres": "incredibly absurdres",
+    "newest": "newest",
+    "detailed": "detailed",
+    "highly detailed": "highly detailed",
+    "ultra detailed": "ultra detailed",
+    "very detailed": "very detailed",
+    "extremely detailed": "extremely detailed",
+    "high detail": "high detail",
+    "hyper detail": "hyper detail",
+}
+CHARACTER_CONTENT_TAGS = {
+    "solo", "solo focus", "group", "couple", "multiple girls", "multiple boys",
+    "female", "male", "woman", "man", "girl", "boy", "child", "adult", "teenager",
+    "full body", "upper body", "lower body", "cowboy shot", "close-up", "headshot", "portrait",
+    "feet out of frame", "cropped torso", "from above", "from below", "from behind", "from side",
+    "looking at viewer", "looking away", "looking back", "eye contact", "profile",
+    "standing", "sitting", "kneeling", "lying", "walking", "running", "jumping", "squatting",
+    "arms up", "arms behind back", "arms crossed", "crossed legs", "spread legs", "hand on hip",
+    "smile", "frown", "open mouth", "closed mouth", "blush", "tears", "expressionless",
+    "school uniform", "military uniform", "maid", "nude", "topless", "bottomless", "barefoot",
+}
+CHARACTER_CONTENT_PATTERNS = tuple(re.compile(pattern) for pattern in (
+    r"^(?:\d+|multiple)[ _]?(?:girls?|boys?|women|men|people|persons?|others?)$",
+    r"^(?:young|old|mature|petite|tall|short|fat|thin|slim|muscular)\b",
+    r"\b(?:hair|bangs|eyes?|eyebrows?|eyelashes|face|head|ears?|nose|mouth|lips|teeth|tongue)\b",
+    r"\b(?:neck|shoulders?|arms?|elbows?|wrists?|hands?|fingers?|chest|breasts?|waist|stomach|navel)\b",
+    r"\b(?:hips?|buttocks|thighs?|legs?|knees?|ankles?|feet|toes?|skin|body|torso)\b",
+    r"\b(?:dress|skirt|shirt|blouse|jacket|coat|pants|shorts|uniform|swimsuit|underwear|bra|panties)\b",
+    r"\b(?:socks?|stockings|gloves?|boots?|shoes?|heels?|hat|cap|ribbon|bowtie|necktie|collar)\b",
+    r"\b(?:standing|sitting|kneeling|lying|walking|running|jumping|leaning|reaching|holding|posing)\b",
+    r"^(?:view|viewing|focus)\b|\b(?:shot|view|focus|pose)$",
+))
+PROMPT_PRESET_INDEX_VERSION = "2"
+_ARTIST_TAG_PATTERN = re.compile(r"^(?:artist|artists)\s*:\s*(.+)$", re.I)
+_WEIGHT_PREFIX_PATTERN = re.compile(r"^(?:[+-]?\d+(?:\.\d+)?)?::\s*")
+_WEIGHT_SUFFIX_PATTERN = re.compile(r"::(?:\s*[+-]?\d+(?:\.\d+)?)?$")
+_SINGLE_WEIGHT_SUFFIX_PATTERN = re.compile(r":\s*[+-]?\d+(?:\.\d+)?$")
+_EXPLICIT_WEIGHT_PREFIX_PATTERN = re.compile(r"[+-]?\d+(?:\.\d+)?::")
+_EXPLICIT_WEIGHT_GROUP_PATTERN = re.compile(r"^([+-]?\d+(?:\.\d+)?)::([\s\S]*)::$")
+_EXPLICIT_WEIGHT_PREFIX_ONLY_PATTERN = re.compile(r"^([+-]?\d+(?:\.\d+)?)::([\s\S]+)$")
+_NUMERIC_TAG_SUFFIX_PATTERN = re.compile(r"^(.+?):\s*([+-]?\d+(?:\.\d+)?)$")
+WEIGHT_RANGE_LABELS = (
+    "0 미만", "0.00–0.49", "0.50–0.79", "0.80–0.99", "1.00",
+    "1.01–1.19", "1.20–1.49", "1.50–1.99", "2.00 이상",
+)
+
+
+def _unwrap_prompt_group(value):
+    value = str(value or "").strip()
+    pairs = {"{": "}", "[": "]", "(": ")"}
+    if len(value) < 2 or value[0] not in pairs or value[-1] != pairs[value[0]]:
+        return value
+    stack = []
+    for index, char in enumerate(value):
+        if char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+        if not stack and index < len(value) - 1:
+            return value
+    return value[1:-1].strip() if not stack else value
+
+
+def _expanded_prompt_tags(prompt):
+    for tag in split_prompt_tags(prompt):
+        inner = _unwrap_prompt_group(tag)
+        if inner != tag:
+            yield from _expanded_prompt_tags(inner)
+        else:
+            yield tag
+
+
+def _split_weighted_prompt_units(prompt):
+    units, current, stack = [], [], []
+    pairs = {"{": "}", "[": "]", "(": ")"}
+    explicit_weight = False
+    text = str(prompt or "")
+    index = 0
+    while index < len(text):
+        if explicit_weight and text.startswith("::", index):
+            current.append("::")
+            explicit_weight = False
+            index += 2
+            continue
+        if not explicit_weight:
+            match = _EXPLICIT_WEIGHT_PREFIX_PATTERN.match(text, index)
+            previous = text[index - 1] if index else ""
+            closing = text.find("::", match.end()) if match else -1
+            if match and closing >= 0 and (not previous or not (previous.isalnum() or previous in "_.")):
+                current.append(match.group(0))
+                explicit_weight = True
+                index = match.end()
+                continue
+            char = text[index]
+            if char in pairs:
+                stack.append(pairs[char])
+            elif stack and char == stack[-1]:
+                stack.pop()
+            elif char == "," and not stack:
+                value = "".join(current).strip()
+                if value:
+                    units.append(value)
+                current = []
+                index += 1
+                continue
+        current.append(text[index])
+        index += 1
+    value = "".join(current).strip()
+    if value:
+        units.append(value)
+    return units
+
+
+def _outer_prompt_group(value):
+    value = str(value or "").strip()
+    pairs = {"{": "}", "[": "]", "(": ")"}
+    if len(value) < 2 or value[0] not in pairs or value[-1] != pairs[value[0]]:
+        return None
+    stack = []
+    for index, char in enumerate(value):
+        if char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+        if not stack and index < len(value) - 1:
+            return None
+    if stack:
+        return None
+    factor = 1.05 if value[0] == "{" else 1 / 1.05 if value[0] == "[" else 1.0
+    return value[1:-1].strip(), factor
+
+
+def parse_weighted_prompt_tags(prompt, base_weight=1.0):
+    parsed = []
+
+    def visit(value, inherited_weight):
+        for unit in _split_weighted_prompt_units(value):
+            wrapper = _outer_prompt_group(unit)
+            if wrapper:
+                inner, factor = wrapper
+                visit(inner, inherited_weight * factor)
+                continue
+            explicit = _EXPLICIT_WEIGHT_GROUP_PATTERN.fullmatch(unit)
+            if explicit:
+                visit(explicit.group(2), inherited_weight * float(explicit.group(1)))
+                continue
+            prefix_only = _EXPLICIT_WEIGHT_PREFIX_ONLY_PATTERN.fullmatch(unit)
+            if prefix_only:
+                visit(prefix_only.group(2), inherited_weight * float(prefix_only.group(1)))
+                continue
+            weight = inherited_weight
+            numeric_suffix = _NUMERIC_TAG_SUFFIX_PATTERN.fullmatch(unit)
+            if numeric_suffix:
+                unit = numeric_suffix.group(1).strip()
+                weight *= float(numeric_suffix.group(2))
+            unit = _strip_prompt_weight(unit)
+            if unit:
+                parsed.append({"tag": unit, "weight": round(weight, 6), "order": len(parsed)})
+
+    visit(prompt, float(base_weight))
+    return parsed
+
+
+def _weight_range_label(weight):
+    value = float(weight)
+    if value < 0:
+        return WEIGHT_RANGE_LABELS[0]
+    if value < 0.5:
+        return WEIGHT_RANGE_LABELS[1]
+    if value < 0.8:
+        return WEIGHT_RANGE_LABELS[2]
+    if value < 1.0 - 1e-6:
+        return WEIGHT_RANGE_LABELS[3]
+    if abs(value - 1.0) <= 1e-6:
+        return WEIGHT_RANGE_LABELS[4]
+    if value < 1.2:
+        return WEIGHT_RANGE_LABELS[5]
+    if value < 1.5:
+        return WEIGHT_RANGE_LABELS[6]
+    if value < 2.0:
+        return WEIGHT_RANGE_LABELS[7]
+    return WEIGHT_RANGE_LABELS[8]
+
+
+def _weight_summary(weights):
+    values = [float(value) for value in weights]
+    counts = {label: 0 for label in WEIGHT_RANGE_LABELS}
+    for value in values:
+        counts[_weight_range_label(value)] += 1
+    total = len(values)
+    bins = [
+        {"label": label, "count": counts[label], "percentage": round(counts[label] * 100 / total, 1) if total else 0.0}
+        for label in WEIGHT_RANGE_LABELS
+    ]
+    dominant = max(bins, key=lambda entry: entry["count"])["label"] if total else ""
+    return {
+        "count": total,
+        "average": round(sum(values) / total, 3) if total else None,
+        "median": round(float(median(values)), 3) if total else None,
+        "min": round(min(values), 3) if total else None,
+        "max": round(max(values), 3) if total else None,
+        "dominant_range": dominant,
+        "bins": bins,
+    }
+
+
+def _strip_prompt_weight(tag):
+    value = _normalized_tag(tag)
+    value = _WEIGHT_PREFIX_PATTERN.sub("", value)
+    value = _WEIGHT_SUFFIX_PATTERN.sub("", value)
+    return _SINGLE_WEIGHT_SUFFIX_PATTERN.sub("", value).strip()
+
+
+def _canonical_artist_tag(tag):
+    match = _ARTIST_TAG_PATTERN.fullmatch(_strip_prompt_weight(tag))
+    if not match:
+        return ""
+    artist = re.sub(r"\s+", " ", match.group(1)).strip().casefold()
+    return f"artist:{artist}" if artist else ""
+
+
+def _canonical_quality_tag(tag):
+    return QUALITY_TAG_ALIASES.get(_strip_prompt_weight(tag), "")
+
+
 def _normalized_tag(tag):
     value = re.sub(r"\s+", " ", str(tag).strip()).casefold()
     return re.sub(r"(?<=\S)::?\s*([+-]?\d+(?:\.\d+)?)$", r":\1", value)
@@ -937,23 +1632,118 @@ def build_search_urls(keyword, tabs, page, category_params=None):
     return urls
 
 
+def _search_item_date(item):
+    try:
+        return date.fromisoformat(str(item.get("posted_at") or ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _search_page_date_bounds(items):
+    dates = [posted_at for posted_at in (_search_item_date(item) for item in items) if posted_at]
+    return (min(dates), max(dates)) if dates else (None, None)
+
+
+def _locate_archive_page(fetch_page, end):
+    """Find the first newest-to-oldest result page that might contain ``end``."""
+    first_items = fetch_page(1)
+    oldest, _ = _search_page_date_bounds(first_items)
+    if not first_items or oldest is None or oldest <= end:
+        return 1
+
+    lower_page, upper_page = 1, 2
+    while upper_page <= MAX_ARCHIVE_SEARCH_PAGE:
+        items = fetch_page(upper_page)
+        oldest, _ = _search_page_date_bounds(items)
+        if not items or oldest is None or oldest <= end:
+            break
+        lower_page, upper_page = upper_page, upper_page * 2
+    else:
+        return MAX_ARCHIVE_SEARCH_PAGE
+
+    while lower_page + 1 < upper_page:
+        middle_page = (lower_page + upper_page) // 2
+        items = fetch_page(middle_page)
+        oldest, _ = _search_page_date_bounds(items)
+        if not items or oldest is None or oldest <= end:
+            upper_page = middle_page
+        else:
+            lower_page = middle_page
+    return upper_page
+
+
 def fetch_html(session, url):
     response = session.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     return response.text
 
 
+def _clone_arca_session(session):
+    cloned = create_arca_session()
+    headers = getattr(session, "headers", None)
+    if headers:
+        cloned.headers.update(dict(headers))
+    for cookie in getattr(session, "cookies", ()):
+        cloned.cookies.set_cookie(copy.copy(cookie))
+    return cloned
+
+
+def _fetch_article_htmls(session, search_items):
+    def fetch_one(search_item):
+        worker_session = _clone_arca_session(session)
+        started = time.monotonic()
+        try:
+            return search_item, fetch_html(worker_session, search_item["source_url"]), time.monotonic() - started
+        except requests.RequestException:
+            return search_item, None, time.monotonic() - started
+        finally:
+            close = getattr(worker_session, "close", None)
+            if close:
+                close()
+
+    if not search_items:
+        return
+    workers = min(COLLECTION_WORKERS, len(search_items))
+    pending_items = iter(search_items)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = {}
+        for _ in range(workers):
+            search_item = next(pending_items, None)
+            if search_item is None:
+                break
+            pending[executor.submit(fetch_one, search_item)] = search_item
+        while pending:
+            future = next(as_completed(tuple(pending)))
+            pending.pop(future)
+            yield future.result()
+            search_item = next(pending_items, None)
+            if search_item is not None:
+                pending[executor.submit(fetch_one, search_item)] = search_item
+
+
+def _obvious_non_png_content_type(image_url):
+    return NON_PNG_IMAGE_TYPES.get(Path(urlparse(str(image_url or "")).path).suffix.lower(), "")
+
+
 def download_image(session, image_url):
     response = session.get(image_url, timeout=IMAGE_TIMEOUT, stream=True)
-    response.raise_for_status()
-    content_type = response.headers.get("Content-Type", "").split(";", 1)[0]
-    if not content_type.startswith("image/"): raise ArcaCollectorError("이미지 응답이 아닙니다.")
-    chunks, size = [], 0
-    for chunk in response.iter_content(64 * 1024):
-        size += len(chunk)
-        if size > MAX_IMAGE_BYTES: raise ArcaCollectorError("이미지 크기 제한을 초과했습니다.")
-        chunks.append(chunk)
-    return b"".join(chunks), content_type
+    try:
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if not content_type.startswith("image/"):
+            raise ArcaCollectorError("이미지 응답이 아닙니다.")
+        if content_type != "image/png":
+            return None, content_type
+        chunks, size = [], 0
+        for chunk in response.iter_content(64 * 1024):
+            size += len(chunk)
+            if size > MAX_IMAGE_BYTES: raise ArcaCollectorError("이미지 크기 제한을 초과했습니다.")
+            chunks.append(chunk)
+        return b"".join(chunks), content_type
+    finally:
+        close = getattr(response, "close", None)
+        if close:
+            close()
 
 
 def save_image_bytes(image_dir, image_url, image_bytes, content_type):
@@ -982,7 +1772,7 @@ def count_style_groups_for_item(db_path, item_id):
     return len(build_style_groups(rows))
 
 
-def list_arca_styles(db_path, filters=None):
+def _arca_style_list_query(filters):
     filters = filters or {}; clauses, args = [
         "TRIM(prompt) <> ''",
         "metadata_status = 'ok'",
@@ -1000,23 +1790,551 @@ def list_arca_styles(db_path, filters=None):
     if filters.get("q"): clauses.append("(title LIKE ? OR prompt LIKE ? OR source_url LIKE ?)"); args += [f"%{filters['q']}%"] * 3
     if filters.get("tab") and filters["tab"] != "all": clauses.append("board_tab=?"); args.append(filters["tab"])
     if filters.get("metadata") and filters["metadata"] != "all": clauses.append("metadata_status=?"); args.append(filters["metadata"])
+    recommendation_min = filters.get("recommendation_min")
+    if recommendation_min not in (None, ""):
+        try:
+            recommendation_min = int(recommendation_min)
+        except (TypeError, ValueError):
+            raise ArcaCollectorError("최소 추천수는 0 이상의 정수여야 합니다.")
+        if recommendation_min < 0:
+            raise ArcaCollectorError("최소 추천수는 0 이상의 정수여야 합니다.")
+        clauses.append("recommendation_count IS NOT NULL AND recommendation_count>=?")
+        args.append(recommendation_min)
     sort = filters.get("sort") or "posted_desc"
     if sort not in {"posted_desc", "posted_asc", "recommend_desc", "views_desc"}:
         raise ArcaCollectorError("아카라이브 날짜 정렬 값을 확인해 주세요.")
-    limit = min(max(int(filters.get("limit", 200)), 1), 500)
-    sql = "SELECT * FROM arca_style_items" + (" WHERE " + " AND ".join(clauses) if clauses else "")
     if sort in {"posted_desc", "posted_asc"}:
         direction = "DESC" if sort == "posted_desc" else "ASC"
         order_sql = f"CASE WHEN TRIM(COALESCE(posted_at,''))='' THEN 1 ELSE 0 END ASC,posted_at {direction},id DESC"
     else:
         column = "recommendation_count" if sort == "recommend_desc" else "view_count"
         order_sql = f"CASE WHEN {column} IS NULL THEN 1 ELSE 0 END ASC,{column} DESC,id DESC"
-    sql += f" ORDER BY {order_sql} LIMIT ?"
+    return " WHERE " + " AND ".join(clauses) if clauses else "", args, order_sql
+
+
+def list_arca_styles(db_path, filters=None):
+    filters = filters or {}
+    where_sql, args, order_sql = _arca_style_list_query(filters)
+    try:
+        limit = min(max(int(filters.get("limit", 200)), 1), 500)
+        offset = max(int(filters.get("offset", 0)), 0)
+    except (TypeError, ValueError):
+        raise ArcaCollectorError("목록 표시 개수와 위치를 확인해 주세요.")
+    sql = f"SELECT * FROM arca_style_items{where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?"
     with closing(_connect(db_path)) as conn:
-        items = [_row(row) for row in conn.execute(sql, (*args, limit))]
+        items = [_row(row) for row in conn.execute(sql, (*args, limit, offset))]
+        grouped_images = {item["id"]: [] for item in items}
+        if items:
+            placeholders = ",".join("?" for _ in items)
+            rows = conn.execute(
+                f"SELECT item_id,id,prompt,base_prompt,negative_prompt,character_prompts_json FROM arca_style_images "
+                f"WHERE item_id IN ({placeholders}) AND TRIM(COALESCE(base_prompt,prompt,''))<>'' ORDER BY item_id,id",
+                tuple(item["id"] for item in items),
+            ).fetchall()
+            for row in rows:
+                image = _row(row)
+                try:
+                    characters = json.loads(image.get("character_prompts_json") or "[]")
+                except json.JSONDecodeError:
+                    characters = []
+                image["character_prompts"] = characters if isinstance(characters, list) else []
+                grouped_images[image["item_id"]].append(image)
     for item in items:
-        item["style_group_count"] = count_style_groups_for_item(db_path, item["id"])
+        item["style_group_count"] = len(build_style_groups(grouped_images[item["id"]]))
     return items
+
+
+def get_arca_style_page(db_path, filters=None):
+    filters = dict(filters or {})
+    try:
+        page = max(int(filters.get("page", 1)), 1)
+        per_page = min(max(int(filters.get("per_page", 50)), 1), 200)
+    except (TypeError, ValueError):
+        raise ArcaCollectorError("페이지와 페이지당 표시 개수를 확인해 주세요.")
+    where_sql, args, _ = _arca_style_list_query(filters)
+    with closing(_connect(db_path)) as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM arca_style_items{where_sql}", tuple(args)).fetchone()[0]
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    filters.update({"limit": per_page, "offset": (page - 1) * per_page})
+    return {
+        "items": list_arca_styles(db_path, filters),
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
+def _recommendation_summary(values):
+    numbers = [int(value) for value in values if value is not None]
+    return {
+        "recommendation_sample_count": len(numbers),
+        "average_recommendations": round(sum(numbers) / len(numbers), 1) if numbers else None,
+        "median_recommendations": round(float(median(numbers)), 1) if numbers else None,
+        "max_recommendations": max(numbers) if numbers else None,
+    }
+
+
+def _statistics_entries(counts, total, weights_by_tag, representatives=None, recommendations_by_tag=None):
+    representatives = representatives or {}
+    recommendations_by_tag = recommendations_by_tag or {}
+    entries = []
+    for tag, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0])):
+        weights = _weight_summary(weights_by_tag.get(tag, []))
+        entry = {
+            "tag": tag,
+            "count": count,
+            "percentage": round(count * 100 / total, 1) if total else 0.0,
+            "average_weight": weights["average"],
+            "median_weight": weights["median"],
+            "max_weight": weights["max"],
+            "dominant_weight_range": weights["dominant_range"],
+            **_recommendation_summary(recommendations_by_tag.get(tag, [])),
+        }
+        if tag in representatives:
+            entry["representative_image"] = representatives[tag]
+        entries.append(entry)
+    return entries
+
+
+def _combination_entries(counts, total, representatives=None, recommendations=None):
+    representatives = representatives or {}
+    recommendations = recommendations or {}
+    return [
+        {
+            "tags": list(tags), "size": len(tags), "count": count,
+            "percentage": round(count * 100 / total, 1) if total else 0.0,
+            **_recommendation_summary(recommendations.get(tags, [])),
+            **({"representative_image": representatives[tags]} if tags in representatives else {}),
+        }
+        for tags, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
+    ]
+
+
+def _statistics_image_rows(db_path, filters=None):
+    filters = filters or {}
+    clauses = [
+        "item.metadata_status = 'ok'",
+        "TRIM(item.prompt) <> ''",
+        "item.board_tab IN ('NAI','R18_NAI')",
+        "image.metadata_status = 'ok'",
+        "TRIM(COALESCE(NULLIF(image.base_prompt,''),image.prompt)) <> ''",
+        "((item.title LIKE '%그림체%' AND item.title LIKE '%공유%') OR EXISTS ("
+        "SELECT 1 FROM arca_collection_jobs direct_job "
+        "WHERE json_extract(direct_job.request_json,'$.source_url')=item.source_url))",
+    ]
+    args = []
+    if filters.get("q"):
+        clauses.append("(item.title LIKE ? OR item.prompt LIKE ? OR item.source_url LIKE ?)")
+        args.extend([f"%{filters['q']}%"] * 3)
+    if filters.get("tab") and filters["tab"] != "all":
+        clauses.append("item.board_tab=?")
+        args.append(filters["tab"])
+    recommendation_min = filters.get("recommendation_min")
+    recommendation_max = filters.get("recommendation_max")
+    try:
+        recommendation_min = int(recommendation_min) if recommendation_min not in (None, "") else None
+        recommendation_max = int(recommendation_max) if recommendation_max not in (None, "") else None
+    except (TypeError, ValueError):
+        raise ArcaCollectorError("추천수 범위는 0 이상의 숫자여야 합니다.")
+    if (recommendation_min is not None and recommendation_min < 0) or (recommendation_max is not None and recommendation_max < 0):
+        raise ArcaCollectorError("추천수 범위는 0 이상의 숫자여야 합니다.")
+    if recommendation_min is not None and recommendation_max is not None and recommendation_min > recommendation_max:
+        raise ArcaCollectorError("최소 추천수는 최대 추천수보다 클 수 없습니다.")
+    if recommendation_min is not None:
+        clauses.append("item.recommendation_count IS NOT NULL AND item.recommendation_count>=?")
+        args.append(recommendation_min)
+    if recommendation_max is not None:
+        clauses.append("item.recommendation_count IS NOT NULL AND item.recommendation_count<=?")
+        args.append(recommendation_max)
+    sql = (
+        "SELECT image.id,image.item_id,image.image_url,image.image_path,item.title,item.source_url,item.posted_at,item.board_tab,item.recommendation_count,"
+        "COALESCE(NULLIF(image.base_prompt,''),image.prompt) AS base_prompt,"
+        "COALESCE(NULLIF(image.negative_prompt,''),item.negative_prompt) AS negative_prompt "
+        "FROM arca_style_images image JOIN arca_style_items item ON item.id=image.item_id "
+        "WHERE " + " AND ".join(clauses)
+    )
+    with closing(_connect(db_path)) as conn:
+        return conn.execute(sql, args).fetchall()
+
+
+def _quality_tag_sequence(prompt):
+    sequence = []
+    for parsed in parse_weighted_prompt_tags(prompt):
+        quality = _canonical_quality_tag(parsed["tag"])
+        if quality and quality not in sequence:
+            sequence.append(quality)
+    return sequence
+
+
+def _format_parsed_prompt_tag(parsed):
+    tag = re.sub(r"\s+", " ", str(parsed["tag"] or "")).strip()
+    weight = float(parsed["weight"])
+    return tag if abs(weight - 1.0) <= 1e-6 else f"{weight:g}::{tag}::"
+
+
+def _is_character_content_tag(tag):
+    value = re.sub(r"\s+", " ", str(tag or "").replace("_", " ")).strip().casefold()
+    return value in CHARACTER_CONTENT_TAGS or any(pattern.search(value) for pattern in CHARACTER_CONTENT_PATTERNS)
+
+
+def _prompt_preset_parts(prompt):
+    included = []
+    excluded = []
+    seen = set()
+    for parsed in parse_weighted_prompt_tags(prompt):
+        if _canonical_artist_tag(parsed["tag"]):
+            continue
+        formatted = _format_parsed_prompt_tag(parsed)
+        key = _normalized_tag(formatted)
+        if not formatted or key in seen:
+            continue
+        seen.add(key)
+        if _is_character_content_tag(parsed["tag"]):
+            excluded.append({"tag": str(parsed["tag"]).strip(), "prompt": formatted})
+        else:
+            included.append(formatted)
+    return ", ".join(included), excluded
+
+
+def _prompt_preset_source_hash(row):
+    source = "\0".join((
+        PROMPT_PRESET_INDEX_VERSION,
+        str(row["base_prompt"] or ""),
+        str(row["negative_prompt"] or ""),
+        str(row["recommendation_count"] if row["recommendation_count"] is not None else ""),
+    ))
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def _indexed_prompt_preset_rows(db_path):
+    source_rows = _statistics_image_rows(db_path)
+    indexed_rows = []
+    with closing(_connect(db_path)) as conn, conn:
+        existing = {
+            row["image_id"]: row
+            for row in conn.execute("SELECT * FROM arca_prompt_preset_index")
+        }
+        upserts = []
+        for row in source_rows:
+            image_id = int(row["id"])
+            source_hash = _prompt_preset_source_hash(row)
+            cached = existing.pop(image_id, None)
+            try:
+                if cached is None or cached["source_hash"] != source_hash:
+                    raise ValueError
+                excluded_tags = json.loads(cached["excluded_tags_json"] or "[]")
+                parsed_artists = json.loads(cached["artists_json"] or "[]")
+                if not isinstance(excluded_tags, list) or not isinstance(parsed_artists, list):
+                    raise ValueError
+                base_prompt = cached["base_prompt"]
+                negative_prompt = cached["negative_prompt"]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                base_prompt, excluded_tags = _prompt_preset_parts(row["base_prompt"])
+                negative_prompt = str(row["negative_prompt"] or "").strip()
+                parsed_artists = sorted({
+                    artist for parsed in parse_weighted_prompt_tags(row["base_prompt"])
+                    if (artist := _canonical_artist_tag(parsed["tag"]))
+                })
+                upserts.append((
+                    image_id, source_hash, base_prompt, negative_prompt,
+                    json.dumps(excluded_tags, ensure_ascii=False),
+                    json.dumps(parsed_artists, ensure_ascii=False),
+                    row["recommendation_count"],
+                ))
+            indexed_rows.append({
+                "image_id": image_id,
+                "base_prompt": base_prompt,
+                "negative_prompt": negative_prompt,
+                "excluded_tags": excluded_tags,
+                "parsed_artists": set(parsed_artists),
+                "recommendation_count": row["recommendation_count"],
+            })
+        if upserts:
+            conn.executemany(
+                """INSERT INTO arca_prompt_preset_index(
+                    image_id,source_hash,base_prompt,negative_prompt,excluded_tags_json,artists_json,recommendation_count
+                ) VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(image_id) DO UPDATE SET
+                    source_hash=excluded.source_hash,base_prompt=excluded.base_prompt,
+                    negative_prompt=excluded.negative_prompt,excluded_tags_json=excluded.excluded_tags_json,
+                    artists_json=excluded.artists_json,recommendation_count=excluded.recommendation_count""",
+                upserts,
+            )
+        if existing:
+            conn.executemany(
+                "DELETE FROM arca_prompt_preset_index WHERE image_id=?",
+                ((image_id,) for image_id in existing),
+            )
+    return indexed_rows
+
+
+def get_shared_style_artist_pool(db_path):
+    counts = defaultdict(int)
+    for row in _indexed_prompt_preset_rows(db_path):
+        for artist in row["parsed_artists"]:
+            name = artist.split(":", 1)[1].strip() if artist.startswith("artist:") else artist.strip()
+            if name:
+                counts[name] += 1
+    return [
+        {"artist": artist, "sample_count": count}
+        for artist, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
+    ]
+
+
+def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
+    if not isinstance(artists, (list, tuple)):
+        raise ArcaCollectorError("작가 목록을 확인해 주세요.")
+    try:
+        limit = min(max(int(limit), 1), 50)
+    except (TypeError, ValueError):
+        raise ArcaCollectorError("추천 프롬프트 개수는 숫자여야 합니다.")
+
+    selected_artists = set()
+    for value in artists:
+        if not isinstance(value, str):
+            raise ArcaCollectorError("작가 이름은 문자열이어야 합니다.")
+        canonical = _canonical_artist_tag(value if value.casefold().startswith("artist:") else f"artist:{value}")
+        if canonical:
+            selected_artists.add(canonical)
+
+    grouped = {}
+    for row in _indexed_prompt_preset_rows(db_path):
+        negative_prompt = row["negative_prompt"]
+        base_prompt = row["base_prompt"]
+        excluded_tags = row["excluded_tags"]
+        if not base_prompt or not negative_prompt:
+            continue
+        parsed_artists = row["parsed_artists"]
+        matched = tuple(sorted(selected_artists.intersection(parsed_artists)))
+        excluded_key = tuple(item["prompt"] for item in excluded_tags)
+        key = (base_prompt, negative_prompt, excluded_key)
+        entry = grouped.setdefault(key, {
+            "base_prompt": base_prompt,
+            "quality_prompt": base_prompt,
+            "negative_prompt": negative_prompt,
+            "excluded_tags": excluded_tags,
+            "sample_count": 0,
+            "matched_artists": set(),
+            "recommendations": [],
+        })
+        entry["sample_count"] += 1
+        entry["matched_artists"].update(matched)
+        if row["recommendation_count"] is not None:
+            entry["recommendations"].append(int(row["recommendation_count"]))
+
+    presets = []
+    for (base_prompt, negative_prompt, excluded_key), entry in grouped.items():
+        recommendations = entry.pop("recommendations")
+        matched_artists = sorted(entry["matched_artists"])
+        presets.append({
+            "key": hashlib.sha256(f"{base_prompt}\0{negative_prompt}\0{excluded_key}".encode("utf-8")).hexdigest()[:16],
+            "base_prompt": base_prompt,
+            "quality_prompt": base_prompt,
+            "negative_prompt": negative_prompt,
+            "excluded_tags": entry["excluded_tags"],
+            "sample_count": entry["sample_count"],
+            "matched_artists": matched_artists,
+            "match_count": len(matched_artists),
+            "average_recommendations": round(sum(recommendations) / len(recommendations), 1) if recommendations else None,
+        })
+    presets.sort(key=lambda entry: (
+        -entry["match_count"],
+        -(entry["average_recommendations"] if entry["average_recommendations"] is not None else -1),
+        -entry["sample_count"],
+        entry["base_prompt"],
+    ))
+    return {"presets": presets[:limit], "selected_artist_count": len(selected_artists)}
+
+
+def _statistics_representative(row, weight=None):
+    image = {
+        "id": row["id"], "image_url": row["image_url"], "image_path": row["image_path"],
+        "title": row["title"], "source_url": row["source_url"], "posted_at": row["posted_at"],
+        "prompt": row["base_prompt"], "recommendation_count": row["recommendation_count"],
+    }
+    if weight is not None:
+        image["weight"] = round(float(weight), 3)
+    return image
+
+
+def get_arca_style_statistics(db_path, filters=None):
+    artist_counts, quality_counts, post_ids = defaultdict(int), defaultdict(int), set()
+    artist_weights, quality_weights = defaultdict(list), defaultdict(list)
+    sequence_counts, bundle_counts, edge_counts = defaultdict(int), defaultdict(int), defaultdict(int)
+    artist_recommendations, quality_recommendations = defaultdict(list), defaultdict(list)
+    sequence_recommendations, bundle_recommendations = defaultdict(list), defaultdict(list)
+    artist_representatives, quality_representatives, sequence_representatives = {}, {}, {}
+    analyzed_image_count = analyzed_tag_count = images_with_artist = images_with_quality = 0
+    for row in _statistics_image_rows(db_path, filters):
+        analyzed_image_count += 1
+        post_ids.add(row["item_id"])
+        artists, quality_tags = defaultdict(list), defaultdict(list)
+        quality_sequence = []
+        for parsed in parse_weighted_prompt_tags(row["base_prompt"]):
+            analyzed_tag_count += 1
+            artist = _canonical_artist_tag(parsed["tag"])
+            quality = _canonical_quality_tag(parsed["tag"])
+            if artist:
+                artists[artist].append(parsed["weight"])
+            if quality:
+                if quality not in quality_tags:
+                    quality_sequence.append(quality)
+                quality_tags[quality].append(parsed["weight"])
+        if artists:
+            images_with_artist += 1
+            for artist, weights in artists.items():
+                artist_counts[artist] += 1
+                artist_weights[artist].extend(weights)
+                if row["recommendation_count"] is not None:
+                    artist_recommendations[artist].append(row["recommendation_count"])
+                highest = max(weights)
+                if artist not in artist_representatives or highest > artist_representatives[artist].get("weight", float("-inf")):
+                    artist_representatives[artist] = _statistics_representative(row, highest)
+        if quality_tags:
+            images_with_quality += 1
+            for quality, weights in quality_tags.items():
+                quality_counts[quality] += 1
+                quality_weights[quality].extend(weights)
+                if row["recommendation_count"] is not None:
+                    quality_recommendations[quality].append(row["recommendation_count"])
+                highest = max(weights)
+                if quality not in quality_representatives or highest > quality_representatives[quality].get("weight", float("-inf")):
+                    quality_representatives[quality] = _statistics_representative(row, highest)
+            if len(quality_sequence) >= 2:
+                sequence_counts[tuple(quality_sequence)] += 1
+                bundle_counts[tuple(sorted(quality_tags))] += 1
+                if row["recommendation_count"] is not None:
+                    sequence_recommendations[tuple(quality_sequence)].append(row["recommendation_count"])
+                    bundle_recommendations[tuple(sorted(quality_tags))].append(row["recommendation_count"])
+                sequence_representatives.setdefault(tuple(quality_sequence), _statistics_representative(row))
+            for left, right in combinations(sorted(quality_tags), 2):
+                edge_counts[(left, right)] += 1
+    artist_entries = _statistics_entries(
+        artist_counts, analyzed_image_count, artist_weights, artist_representatives, artist_recommendations,
+    )
+    quality_entries = _statistics_entries(
+        quality_counts, analyzed_image_count, quality_weights, quality_representatives, quality_recommendations,
+    )
+    quality_entry_map = {entry["tag"]: entry for entry in quality_entries}
+    return {
+        "analyzed_image_count": analyzed_image_count,
+        "analyzed_post_count": len(post_ids),
+        "analyzed_tag_count": analyzed_tag_count,
+        "images_with_artist": images_with_artist,
+        "images_with_quality": images_with_quality,
+        "artists": artist_entries,
+        "quality_tags": quality_entries,
+        "quality_sequences": _combination_entries(
+            sequence_counts, analyzed_image_count, sequence_representatives, sequence_recommendations,
+        ),
+        "quality_bundles": _combination_entries(bundle_counts, analyzed_image_count, recommendations=bundle_recommendations),
+        "quality_network": {
+            "nodes": [
+                {key: entry[key] for key in ("tag", "count", "percentage", "average_weight")}
+                for entry in quality_entries
+            ],
+            "edges": [
+                {
+                    "source": pair[0], "target": pair[1], "count": count,
+                    "percentage": round(count * 100 / analyzed_image_count, 1) if analyzed_image_count else 0.0,
+                }
+                for pair, count in sorted(edge_counts.items(), key=lambda entry: (-entry[1], entry[0]))
+                if pair[0] in quality_entry_map and pair[1] in quality_entry_map
+            ],
+        },
+        "collection_scope_note": "저장된 공유 그림체 이미지 기준이며, 수집은 선택한 날짜 범위의 검색 종료 지점까지 진행됩니다.",
+    }
+
+
+def get_arca_tag_statistics(db_path, kind, tag, image_limit=24, filters=None):
+    kind = str(kind or "").strip().lower()
+    if kind == "artist":
+        canonical = _canonical_artist_tag(tag)
+        canonicalizer = _canonical_artist_tag
+    elif kind == "quality":
+        canonical = _canonical_quality_tag(tag)
+        canonicalizer = _canonical_quality_tag
+    else:
+        raise ArcaCollectorError("통계 태그 종류는 artist 또는 quality여야 합니다.")
+    if not canonical:
+        raise ArcaCollectorError("통계 태그를 확인해 주세요.")
+    try:
+        image_limit = min(max(int(image_limit), 1), 100)
+    except (TypeError, ValueError):
+        raise ArcaCollectorError("이미지 개수는 숫자여야 합니다.")
+    weights, matched_images, related_counts = [], {}, defaultdict(int)
+    for row in _statistics_image_rows(db_path, filters):
+        parsed_tags = parse_weighted_prompt_tags(row["base_prompt"])
+        matched_weights = [
+            parsed["weight"] for parsed in parsed_tags
+            if canonicalizer(parsed["tag"]) == canonical
+        ]
+        if not matched_weights:
+            continue
+        if kind == "quality":
+            related_in_image = {
+                quality for parsed in parsed_tags
+                if (quality := _canonical_quality_tag(parsed["tag"])) and quality != canonical
+            }
+        else:
+            related_in_image = {
+                artist for parsed in parsed_tags
+                if (artist := _canonical_artist_tag(parsed["tag"])) and artist != canonical
+            }
+        for related in related_in_image:
+            related_counts[related] += 1
+        weights.extend(matched_weights)
+        matched_images[row["id"]] = {
+            "id": row["id"], "item_id": row["item_id"],
+            "image_url": row["image_url"], "image_path": row["image_path"],
+            "title": row["title"], "source_url": row["source_url"],
+            "posted_at": row["posted_at"], "board_tab": row["board_tab"],
+            "prompt": row["base_prompt"], "recommendation_count": row["recommendation_count"],
+            "weight": round(max(matched_weights), 3),
+        }
+    images = sorted(matched_images.values(), key=lambda image: (-image["weight"], -image["id"]))
+    return {
+        "kind": kind,
+        "tag": canonical,
+        "image_count": len(images),
+        "occurrence_count": len(weights),
+        "weights": _weight_summary(weights),
+        "related_tags": [
+            {
+                "tag": related, "count": count,
+                "percentage": round(count * 100 / len(images), 1) if images else 0.0,
+            }
+            for related, count in sorted(related_counts.items(), key=lambda entry: (-entry[1], entry[0]))
+        ],
+        "images": images[:image_limit],
+    }
+
+
+def get_arca_quality_sequence_statistics(db_path, tags, image_limit=40, filters=None):
+    if not isinstance(tags, (list, tuple)):
+        raise ArcaCollectorError("퀄리티 순서 조합을 확인해 주세요.")
+    canonical_tags = [_canonical_quality_tag(tag) for tag in tags]
+    if len(canonical_tags) < 2 or any(not tag for tag in canonical_tags):
+        raise ArcaCollectorError("퀄리티 순서 조합은 두 개 이상의 유효한 태그여야 합니다.")
+    try:
+        image_limit = min(max(int(image_limit), 1), 100)
+    except (TypeError, ValueError):
+        raise ArcaCollectorError("이미지 개수는 숫자여야 합니다.")
+    images = []
+    for row in _statistics_image_rows(db_path, filters):
+        if _quality_tag_sequence(row["base_prompt"]) != canonical_tags:
+            continue
+        images.append({
+            "id": row["id"], "item_id": row["item_id"],
+            "image_url": row["image_url"], "image_path": row["image_path"],
+            "title": row["title"], "source_url": row["source_url"],
+            "posted_at": row["posted_at"], "board_tab": row["board_tab"],
+            "prompt": row["base_prompt"], "recommendation_count": row["recommendation_count"],
+        })
+    images.sort(key=lambda image: -image["id"])
+    return {"tags": canonical_tags, "image_count": len(images), "images": images[:image_limit]}
 
 
 def get_arca_style_detail(db_path, item_id):
@@ -1085,6 +2403,12 @@ def delete_arca_style(db_path, image_dir, item_id):
 
 def collect_arca_styles(db_path, image_dir, payload, job_id=None):
     params = normalize_collect_payload(payload); init_arca_style_tables(db_path)
+    start, end = date.fromisoformat(params["start_date"]), date.fromisoformat(params["end_date"])
+    uncovered = uncovered_date_intervals(start, end, get_completed_coverage(db_path, params))
+    if not uncovered:
+        if job_id:
+            update_collection_job(db_path, job_id, status="completed", stage="completed", skipped_existing=1)
+        return {"ok": True, "skipped_existing": True, "scanned_pages": 0, "scanned_posts": 0, "saved": 0, "updated": 0, "items": []}
     browser_status = get_arca_browser_session_status()
     if "R18_NAI" in params["tabs"] and not browser_status["connected"]:
         raise ArcaBrowserSessionRequired("🔞 NAI 수집 전에 브라우저 로그인을 가져와 주세요.")
@@ -1098,56 +2422,122 @@ def collect_arca_styles(db_path, image_dir, payload, job_id=None):
             clear_arca_browser_session("로그인 세션에서 🔞 NAI 항목을 확인하지 못했습니다.")
             raise ArcaBrowserSessionRequired("브라우저 로그인이 만료되었습니다. 다시 가져와 주세요.")
         raise ArcaCollectorError("아카라이브 NAI 검색 항목을 찾지 못했습니다.")
-    start, end = date.fromisoformat(params["start_date"]), date.fromisoformat(params["end_date"])
-    uncovered = uncovered_date_intervals(start, end, get_completed_coverage(db_path, params))
-    if not uncovered:
-        if job_id:
-            update_collection_job(db_path, job_id, status="completed", stage="completed", skipped_existing=1)
-        return {"ok": True, "skipped_existing": True, "scanned_pages": 0, "scanned_posts": 0, "saved": 0, "updated": 0, "items": []}
-    summary = {"ok": True, "skipped_existing": False, "scanned_pages": 0, "scanned_posts": 0, "saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "skipped": 0, "items": []}
+    summary = {"ok": True, "skipped_existing": False, "partial": False, "scanned_pages": 0, "scanned_posts": 0, "saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "skipped": 0, "items": []}
     if job_id:
-        update_collection_job(db_path, job_id, status="running", stage="searching", total_posts=params["max_posts"])
+        update_collection_job(
+            db_path, job_id, status="running", stage="searching",
+            total_posts=params["max_posts"] or None,
+            total_pages=params["max_pages"] * len(params["tabs"]) * len(uncovered) if params["max_pages"] else None,
+        )
+    reached_post_limit = False
     for interval_start, interval_end in uncovered:
-        interval_start_posts = summary["scanned_posts"]
         now = datetime.now().isoformat(timespec="seconds")
         with closing(_connect(db_path)) as conn, conn:
             run_id = conn.execute("INSERT INTO arca_collection_runs(keyword,tabs,start_date,end_date,max_pages,max_posts,search_scope,status,created_at,updated_at,job_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (params["keyword"], _tabs_key(params["tabs"]), interval_start.isoformat(), interval_end.isoformat(), params["max_pages"], params["max_posts"], SEARCH_SCOPE, "running", now, now, job_id)).lastrowid
         try:
             seen = set()
-            for page in range(1, params["max_pages"] + 1):
-                for search_url in build_search_urls(params["keyword"], params["tabs"], page, category_params):
-                    html = fetch_html(session, search_url); summary["scanned_pages"] += 1
+            search_items = []
+            interval_complete = True
+            for tab in params["tabs"]:
+                page_cache = {}
+
+                def fetch_page(page):
+                    _wait_for_collection_control(db_path, job_id, "scanning")
+                    if page in page_cache:
+                        return page_cache[page]
+                    urls = build_search_urls(params["keyword"], [tab], page, category_params)
+                    if not urls:
+                        page_cache[page] = []
+                        return page_cache[page]
+                    html = fetch_html(session, urls[0]); summary["scanned_pages"] += 1
+                    _wait_for_collection_control(db_path, job_id, "scanning")
                     if job_id:
                         update_collection_job(db_path, job_id, stage="scanning", scanned_pages=summary["scanned_pages"])
-                    search_results = extract_search_results(html, ARCA_BASE_URL, params["keyword"])
+                    page_cache[page] = [
+                        item for item in extract_search_results(html, ARCA_BASE_URL, params["keyword"])
+                        if item.get("board_tab") == tab
+                    ]
+                    return page_cache[page]
+
+                page = _locate_archive_page(fetch_page, interval_end)
+                target_pages = 0
+                reached_lower_boundary = False
+                while page <= MAX_ARCHIVE_SEARCH_PAGE and (not params["max_pages"] or target_pages < params["max_pages"]):
+                    search_results = fetch_page(page)
+                    target_pages += 1
+                    if not search_results:
+                        reached_lower_boundary = True
+                        break
+                    oldest, newest = _search_page_date_bounds(search_results)
                     for search_item in search_results:
                         article_url = search_item["source_url"]
-                        if article_url in seen or summary["scanned_posts"] >= params["max_posts"]: continue
-                        seen.add(article_url); summary["scanned_posts"] += 1
-                        post_started = time.monotonic()
-                        if job_id:
-                            update_collection_job(db_path, job_id, stage="fetching_posts", scanned_posts=summary["scanned_posts"])
-                        try:
-                            article = extract_article_data(fetch_html(session, article_url), article_url)
-                        except requests.RequestException:
-                            summary["skipped"] += 1
+                        if article_url in seen:
                             continue
-                        article.update(search_item)
-                        if not article["posted_at"] or not interval_start <= date.fromisoformat(article["posted_at"]) <= interval_end or article["board_tab"] not in params["tabs"]: summary["skipped"] += 1; continue
-                        downloaded_count, _ = _save_article(db_path, image_dir, session, article, summary, run_id=run_id)
-                        if job_id:
-                            previous = get_collection_job(db_path, job_id)
-                            elapsed = max(time.monotonic() - post_started, 0.001)
-                            prior_average = previous.get("average_post_seconds") if previous else None
-                            average = elapsed if prior_average is None else (float(prior_average) * 0.7 + elapsed * 0.3)
-                            update_collection_job(
-                                db_path, job_id, stage="downloading",
-                                downloaded_images=(previous["downloaded_images"] if previous else 0) + downloaded_count,
-                                saved=summary["saved"], updated=summary["updated"], average_post_seconds=average,
-                            )
-            run_status = "completed" if summary["scanned_posts"] > interval_start_posts else "failed"
-            run_error = "" if run_status == "completed" else "검색 결과 글 행을 받지 못했습니다."
-            if run_status == "failed":
+                        posted_at = _search_item_date(search_item)
+                        if posted_at and not interval_start <= posted_at <= interval_end:
+                            continue
+                        seen.add(article_url)
+                        search_items.append(search_item)
+                        summary["scanned_posts"] += 1
+                        if params["max_posts"] and summary["scanned_posts"] >= params["max_posts"]:
+                            reached_post_limit = True
+                            break
+                    if reached_post_limit:
+                        break
+                    if newest and newest < interval_start:
+                        reached_lower_boundary = True
+                        break
+                    if oldest and oldest < interval_start:
+                        reached_lower_boundary = True
+                        break
+                    page += 1
+                if reached_post_limit:
+                    interval_complete = False
+                    break
+                if not reached_lower_boundary:
+                    interval_complete = False
+            if job_id and search_items:
+                update_collection_job(db_path, job_id, stage="fetching_posts", scanned_posts=summary["scanned_posts"])
+            for search_item, article_html, fetch_seconds in _fetch_article_htmls(session, search_items):
+                _wait_for_collection_control(db_path, job_id, "fetching_posts")
+                if article_html is None:
+                    summary["skipped"] += 1
+                    continue
+                post_started = time.monotonic()
+                article_url = search_item["source_url"]
+                article = extract_article_data(article_html, article_url)
+                article["source_url"] = article_url
+                article["title"] = search_item.get("title") or article.get("title", "")
+                article["board_tab"] = search_item.get("board_tab") or article.get("board_tab", "")
+                if search_item.get("posted_at"):
+                    try:
+                        date.fromisoformat(search_item["posted_at"])
+                        article["posted_at"] = search_item["posted_at"]
+                    except ValueError:
+                        pass
+                try:
+                    article_date = date.fromisoformat(article.get("posted_at") or "")
+                except ValueError:
+                    article_date = None
+                if not article_date or not interval_start <= article_date <= interval_end or article["board_tab"] not in params["tabs"]:
+                    summary["skipped"] += 1
+                    continue
+                _wait_for_collection_control(db_path, job_id, "downloading")
+                downloaded_count, _ = _save_article(db_path, image_dir, session, article, summary, run_id=run_id)
+                if job_id:
+                    previous = get_collection_job(db_path, job_id)
+                    elapsed = max(fetch_seconds + time.monotonic() - post_started, 0.001)
+                    prior_average = previous.get("average_post_seconds") if previous else None
+                    average = elapsed if prior_average is None else (float(prior_average) * 0.7 + elapsed * 0.3)
+                    update_collection_job(
+                        db_path, job_id, stage="downloading",
+                        downloaded_images=(previous["downloaded_images"] if previous else 0) + downloaded_count,
+                        saved=summary["saved"], updated=summary["updated"], average_post_seconds=average,
+                    )
+            run_status = "completed" if interval_complete else "partial"
+            run_error = "" if interval_complete else "요청 기간의 검색 종료 지점을 확인하지 못해 일부만 수집했습니다."
+            if not interval_complete:
+                summary["partial"] = True
                 summary["warning"] = run_error
             with closing(_connect(db_path)) as conn, conn: conn.execute("UPDATE arca_collection_runs SET status=?,error=?,scanned_pages=?,scanned_posts=?,saved=?,updated=?,updated_at=? WHERE id=?", (run_status, run_error, summary["scanned_pages"], summary["scanned_posts"], summary["saved"], summary["updated"], datetime.now().isoformat(timespec="seconds"), run_id))
             if run_status == "completed":
@@ -1156,12 +2546,20 @@ def collect_arca_styles(db_path, image_dir, payload, job_id=None):
                         "DELETE FROM arca_collection_invalidations WHERE keyword=? AND tabs=? AND max_pages=? AND max_posts=? AND search_scope=? AND invalidated_date BETWEEN ? AND ?",
                         (params["keyword"], _tabs_key(params["tabs"]), params["max_pages"], params["max_posts"], SEARCH_SCOPE, interval_start.isoformat(), interval_end.isoformat()),
                     )
+        except ArcaCollectionStopped as exc:
+            with closing(_connect(db_path)) as conn, conn:
+                conn.execute(
+                    "UPDATE arca_collection_runs SET status='partial',error=?,scanned_pages=?,scanned_posts=?,saved=?,updated=?,updated_at=? WHERE id=?",
+                    (str(exc), summary["scanned_pages"], summary["scanned_posts"], summary["saved"], summary["updated"], datetime.now().isoformat(timespec="seconds"), run_id),
+                )
+            raise
         except Exception as exc:
             with closing(_connect(db_path)) as conn, conn: conn.execute("UPDATE arca_collection_runs SET status='failed',error=?,updated_at=? WHERE id=?", (str(exc)[:1000], datetime.now().isoformat(timespec="seconds"), run_id))
             raise
+        if reached_post_limit:
+            break
     if job_id:
-        final_status = "failed" if summary.get("warning") else "completed"
-        update_collection_job(db_path, job_id, status=final_status, stage=final_status, scanned_pages=summary["scanned_pages"], scanned_posts=summary["scanned_posts"], total_posts=summary["scanned_posts"], saved=summary["saved"], updated=summary["updated"], error=summary.get("warning", ""))
+        update_collection_job(db_path, job_id, status="completed", stage="completed", scanned_pages=summary["scanned_pages"], scanned_posts=summary["scanned_posts"], total_posts=summary["scanned_posts"], saved=summary["saved"], updated=summary["updated"], error=summary.get("warning", ""))
     return summary
 
 
@@ -1173,44 +2571,87 @@ def _save_article(db_path, image_dir, session, article, summary, run_id=None):
             (article["source_url"],),
         ).fetchall()
     existing = {_image_identity(row["image_url"]): dict(row) for row in rows}
-    downloaded, new_urls, seen_identities = [], [], set()
+    resolved, new_urls, identities, seen_identities = {}, [], [], set()
+
+    def stored_record(stored):
+        try:
+            characters = json.loads(stored.get("character_prompts_json") or "[]")
+        except json.JSONDecodeError:
+            characters = []
+        meta = {
+            "metadata_status": stored.get("metadata_status") or "no_metadata",
+            "prompt": stored.get("prompt") or "",
+            "base_prompt": stored.get("base_prompt") or stored.get("prompt") or "",
+            "negative_prompt": stored.get("negative_prompt") or "",
+            "character_prompts": characters if isinstance(characters, list) else [],
+            "seed": stored.get("seed") or "", "sampler": stored.get("sampler") or "",
+            "steps": stored.get("steps"), "scale": stored.get("scale"),
+            "cfg_rescale": stored.get("cfg_rescale"), "noise_schedule": stored.get("noise_schedule") or "",
+            "model": stored.get("model") or "", "width": stored.get("width"), "height": stored.get("height"),
+            "raw_metadata_json": stored.get("raw_metadata_json") or "{}",
+        }
+        return stored["image_url"], stored.get("image_path") or "", stored.get("content_type") or "image/png", meta
+
     for image_url in article["image_urls"]:
         identity = _image_identity(image_url)
         if identity in seen_identities:
             continue
         seen_identities.add(identity)
+        identities.append(identity)
         stored = existing.get(identity)
         stored_path = (image_root / stored["image_path"]).resolve() if stored and stored.get("image_path") else None
-        if stored and stored_path and image_root in stored_path.parents and stored_path.exists():
-            try:
-                characters = json.loads(stored.get("character_prompts_json") or "[]")
-            except json.JSONDecodeError:
-                characters = []
-            meta = {
-                "metadata_status": stored.get("metadata_status") or "no_metadata",
-                "prompt": stored.get("prompt") or "",
-                "base_prompt": stored.get("base_prompt") or stored.get("prompt") or "",
-                "negative_prompt": stored.get("negative_prompt") or "",
-                "character_prompts": characters if isinstance(characters, list) else [],
-                "seed": stored.get("seed") or "", "sampler": stored.get("sampler") or "",
-                "steps": stored.get("steps"), "scale": stored.get("scale"),
-                "cfg_rescale": stored.get("cfg_rescale"), "noise_schedule": stored.get("noise_schedule") or "",
-                "model": stored.get("model") or "", "width": stored.get("width"), "height": stored.get("height"),
-                "raw_metadata_json": stored.get("raw_metadata_json") or "{}",
-            }
-            downloaded.append((stored["image_url"], stored["image_path"], stored.get("content_type") or "image/png", meta))
+        if stored and stored.get("metadata_status") == "no_metadata":
+            resolved[identity] = stored_record(stored)
+        elif stored and stored_path and image_root in stored_path.parents and stored_path.exists():
+            resolved[identity] = stored_record(stored)
         else:
-            new_urls.append(image_url)
+            obvious_content_type = _obvious_non_png_content_type(image_url)
+            if obvious_content_type:
+                resolved[identity] = (image_url, "", obvious_content_type, extract_novelai_metadata(b""))
+            else:
+                new_urls.append(image_url)
+
     def fetch_new_image(image_url):
         try:
             data, content_type = download_image(session, image_url)
-            path = save_image_bytes(image_dir, image_url, data, content_type)
-            return image_url, path, content_type, extract_novelai_metadata(data, content_type)
-        except (requests.RequestException, ArcaCollectorError, OSError, zlib.error):
+            if data is None:
+                return image_url, None, content_type, extract_novelai_metadata(b"")
+            meta = extract_novelai_metadata(data, content_type)
+            return image_url, data if meta["metadata_status"] == "ok" else None, content_type, meta
+        except (requests.RequestException, ArcaCollectorError, zlib.error):
             return None
-    with ThreadPoolExecutor(max_workers=min(4, len(new_urls) or 1)) as executor:
-        new_downloads = [item for item in executor.map(fetch_new_image, new_urls) if item]
-    downloaded.extend(new_downloads)
+
+    saved_count = 0
+    if new_urls:
+        pending_urls = iter(new_urls)
+        image_workers = min(COLLECTION_WORKERS, len(new_urls))
+        with ThreadPoolExecutor(max_workers=image_workers) as executor:
+            pending = {}
+            for _ in range(image_workers):
+                image_url = next(pending_urls)
+                pending[executor.submit(fetch_new_image, image_url)] = image_url
+            while pending:
+                future = next(as_completed(tuple(pending)))
+                pending.pop(future)
+                result = future.result()
+                if result:
+                    image_url, data, content_type, image_meta = result
+                    path = ""
+                    if data is not None:
+                        try:
+                            path = save_image_bytes(image_dir, image_url, data, content_type)
+                        except OSError:
+                            result = None
+                        else:
+                            saved_count += 1
+                    if result:
+                        resolved[_image_identity(image_url)] = (image_url, path, content_type, image_meta)
+                try:
+                    image_url = next(pending_urls)
+                except StopIteration:
+                    continue
+                pending[executor.submit(fetch_new_image, image_url)] = image_url
+    downloaded = [resolved[identity] for identity in identities if identity in resolved]
     representative = next((item for item in downloaded if item[3]["metadata_status"] == "ok"), downloaded[0] if downloaded else None)
     meta = representative[3] if representative else extract_novelai_metadata(b"")
     now = datetime.now().isoformat(timespec="seconds")
@@ -1245,4 +2686,4 @@ def _save_article(db_path, image_dir, session, article, summary, run_id=None):
         if duplicate_ids:
             conn.executemany("DELETE FROM arca_style_images WHERE id=?", ((image_id,) for image_id in duplicate_ids))
     summary["metadata_ok" if meta["metadata_status"] == "ok" else "no_metadata"] += 1; summary["items"].append({"id": item_id, "source_url": article["source_url"]})
-    return len(new_downloads), item_id
+    return saved_count, item_id

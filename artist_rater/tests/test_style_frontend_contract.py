@@ -43,6 +43,7 @@ class StyleFrontendContractTest(unittest.TestCase):
     def setUpClass(cls):
         cls.html = HTML_PATH.read_text(encoding="utf-8")
         cls.css = CSS_PATH.read_text(encoding="utf-8")
+        cls.script = JS_PATH.read_text(encoding="utf-8")
 
     def test_maker_tab_workspace_and_script_exist(self):
         for marker in (
@@ -87,7 +88,14 @@ class StyleFrontendContractTest(unittest.TestCase):
             'id="weightGraph"',
             'id="artistPromptPreview"',
             'id="styleArtistSearch"',
+            'id="styleArtistAutocomplete"',
             'id="styleArtistSelect"',
+            'id="styleArtistPosition"',
+            'id="styleArtistWeight"',
+            'id="styleArtistList"',
+            '가중치 표',
+            '여기서도 바로 수정',
+            'style-artist-row-head',
             'id="addStyleArtist"',
             'id="basePrompt"',
             'id="negativePrompt"',
@@ -115,6 +123,14 @@ class StyleFrontendContractTest(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
+        self.assertLess(
+            self.html.index('id="styleArtistList"'),
+            self.html.index('id="latestStyleResult"'),
+        )
+        self.assertLess(
+            self.html.index('id="styleArtistList"'),
+            self.html.index('id="styleMakerEditor"'),
+        )
         settings_start = self.html.index('id="styleMakerSettings"')
         editor_start = self.html.index('id="styleMakerEditor"')
         preview_index = self.html.index('id="weightGraphPreview"')
@@ -122,6 +138,44 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertLess(settings_start, preview_index)
         self.assertLess(preview_index, editor_start)
         self.assertGreater(result_index, editor_start)
+        self.assertLess(
+            self.html.index('id="latestStyleResult"'),
+            self.html.index('id="artistPromptPreview"'),
+        )
+
+    def test_weight_graph_edits_fixed_artists_as_overlays_not_bottom_table(self):
+        overlay_start = self.script.index("function renderWeightGraphFixedArtistOverlays")
+        overlay_end = self.script.index("function renderWeightGraph()", overlay_start)
+        overlay_script = self.script[overlay_start:overlay_end]
+        self.assertNotIn('id="weightGraphFixedArtistList"', self.html)
+        self.assertNotIn('class="weight-graph-fixed-artists"', self.html)
+        self.assertIn("function renderWeightGraphFixedArtistOverlays", self.script)
+        self.assertIn("weight-fixed-artist-card", overlay_script)
+        self.assertIn("const overlayEntries = entries.map", overlay_script)
+        self.assertIn("occupiedLanes", overlay_script)
+        self.assertIn("overlayEntries.forEach(({ artist: item, index, slot, stackIndex, visualStackIndex })", overlay_script)
+        self.assertIn('dataTransfer.setData("application/x-fixed-style-artist"', overlay_script)
+        self.assertIn('dataTransfer.setData("application/x-fixed-style-artists"', overlay_script)
+        self.assertIn(".weight-fixed-artist-card", self.css)
+        self.assertIn("position: absolute", self.css)
+        self.assertIn("--fixed-card-x-offset", self.css)
+        self.assertNotIn("translate(-50%, 50%)", self.css)
+        self.assertIn("weight-fixed-drop-indicator", self.script)
+        self.assertIn(".weight-fixed-drop-indicator", self.css)
+        self.assertIn("weight-fixed-artist-select", self.script)
+        self.assertIn(".weight-fixed-artist-card.selected", self.css)
+
+    def test_fixed_artist_add_controls_prevent_label_overlap(self):
+        self.assertIn(".artist-add-row .field > span", self.css)
+        self.assertIn("white-space: nowrap", self.css)
+        self.assertIn("text-overflow: ellipsis", self.css)
+        self.assertIn(".style-editor-head .status", self.css)
+        self.assertIn("overflow-wrap: anywhere", self.css)
+
+    def test_latest_generation_result_keeps_large_preview_space(self):
+        self.assertIn("grid-template-rows: auto auto minmax(420px, 1fr) auto", self.css)
+        self.assertIn("min-height: 420px", self.css)
+        self.assertIn("max-height: min(72vh, 820px)", self.css)
 
     def test_generation_result_metadata_includes_saved_parameters(self):
         script = JS_PATH.read_text(encoding="utf-8")
@@ -147,6 +201,7 @@ class StyleFrontendContractTest(unittest.TestCase):
             'id="generationModel"',
             'id="generationResolutionPreset"',
             'id="generationScheduler"',
+            'value="karras" selected',
             'id="generationScaleRange"',
             'id="generationCfgRescaleRange"',
             'id="generationSeed"',
@@ -192,11 +247,38 @@ class StyleFrontendContractTest(unittest.TestCase):
             'id="basePromptPanel"',
             'id="negativePromptPanel"',
             'class="field prompt-editor negative hidden"',
+            'id="togglePromptView"',
+            '>텍스트 편집</button>',
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
         source = JS_PATH.read_text(encoding="utf-8")
         self.assertIn("function selectPromptTab", source)
+        self.assertIn("function setPromptViewMode", source)
+        self.assertIn('setPromptViewMode("buttons")', source)
+
+    def test_collected_prompt_presets_support_auto_and_fixed_modes(self):
+        for marker in (
+            'id="promptPresetMode"',
+            '<option value="auto">자동 추천</option>',
+            '<option value="fixed">수동 고정</option>',
+            'id="promptPresetSelect"',
+            'id="applyPromptPreset"',
+            'id="promptPresetStatus"',
+            'id="excludedPromptTags"',
+            'id="excludedPromptTagList"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        for marker in (
+            'apiFetch("/api/style-maker/prompt-presets"',
+            "function applyPromptPreset",
+            "function refreshAutomaticPromptPreset",
+            "function fixPromptPresetAfterManualEdit",
+            "function restoreExcludedPromptTag",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script)
 
     def test_editor_script_exposes_state_and_required_operations(self):
         source = JS_PATH.read_text(encoding="utf-8")
@@ -250,6 +332,12 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.css)
 
+    def test_artist_tags_are_above_quality_tags_and_base_buttons_can_be_excluded(self):
+        self.assertIn('id="artistPromptTokens"', self.html)
+        self.assertLess(self.html.index('id="artistPromptTokens"'), self.html.index('id="basePromptTokens"'))
+        self.assertIn("function excludeBasePromptToken", self.script)
+        self.assertIn('chip.addEventListener("click", () => excludeBasePromptToken(token))', self.script)
+
     def test_score_and_drag_controls_expose_accessible_state(self):
         source = JS_PATH.read_text(encoding="utf-8")
         self.assertIn('button.setAttribute("aria-pressed"', source)
@@ -267,6 +355,7 @@ class StyleFrontendContractTest(unittest.TestCase):
             "rerollStyleWeights",
             "rerollStyleAll",
             "styleArtistCount",
+            "sharedStyleArtistMax",
             "styleScoreAll",
             "weightMode",
         ):
@@ -277,7 +366,9 @@ class StyleFrontendContractTest(unittest.TestCase):
         source = JS_PATH.read_text(encoding="utf-8")
         for marker in (
             'id="settingsModal"', 'id="novelAiAppKey"', 'id="testNovelAiKey"',
-            'id="generationLimitMode"', 'id="generationCount"', 'id="styleChangeMode"',
+            'id="generationLimitMode"', 'id="generationCount"', 'id="sharedStyleArtistMax"',
+            'data-random-target="artists"', 'data-random-target="weights"',
+            'data-random-target="quality"', 'data-random-target="negative"',
             'id="startContinuous"', 'id="pauseContinuous"', 'id="stopContinuous"',
             'data-tab="style-manager"', 'id="styleManagerList"', 'id="styleManagerDetail"',
             'id="generatedImageModal"', 'id="generatedImagePrev"', 'id="generatedImageNext"',
@@ -285,9 +376,22 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
         self.assertIn("async function runContinuousGeneration()", source)
+        self.assertIn("async function randomizeSelectedStyleParts()", source)
+        self.assertIn("async function randomizePromptTargets(targets)", source)
+        self.assertIn("async function generateOneRandomizedStyle()", source)
+        self.assertIn('styleElement("generateOne")?.addEventListener("click", () => generateOneRandomizedStyle()', source)
         self.assertIn("await generateCurrentStyle()", source)
         self.assertIn("async function loadStyleManager()", source)
         self.assertIn("function renderGeneratedImageModal()", source)
+
+    def test_single_generation_randomizes_enabled_targets_before_generation(self):
+        start = self.script.index("async function generateOneRandomizedStyle()")
+        end = self.script.index("async function runContinuousGeneration()", start)
+        function_source = self.script[start:end]
+        self.assertLess(
+            function_source.index("await randomizeSelectedStyleParts();"),
+            function_source.index("return generateCurrentStyle();"),
+        )
 
     def test_workspace_does_not_nest_panels_or_cards(self):
         parser = NestedWorkspacePanelParser()

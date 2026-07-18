@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 from PIL import Image
 
+import arca_style_collector as collector_module
 from arca_style_collector import (
     ArcaCollectorError,
     ArcaBrowserSessionRequired,
@@ -42,18 +43,34 @@ from arca_style_collector import (
     discover_category_params,
     get_arca_browser_session_status,
     import_arca_browser_session,
+    import_arca_style_seed,
     snapshot_imported_arca_cookies,
     build_style_groups,
     count_style_groups_for_item,
     create_collection_job,
+    create_image_restore_job,
+    create_url_collection_job,
     delete_arca_style,
     get_collection_job,
+    get_latest_resumable_collection_job,
+    get_arca_style_statistics,
+    get_arca_style_page,
+    get_arca_tag_statistics,
+    get_arca_quality_sequence_statistics,
+    get_style_maker_prompt_presets,
+    get_shared_style_artist_pool,
     list_arca_styles,
+    parse_weighted_prompt_tags,
+    pause_collection_job,
+    resume_collection_job,
+    restore_arca_style_images,
+    stop_collection_job,
     split_prompt_tags,
     update_collection_job,
     _save_article,
     collect_arca_style_url,
     collect_arca_styles,
+    export_arca_style_seed,
 )
 
 
@@ -197,6 +214,7 @@ class ArcaCollectorTest(unittest.TestCase):
         payload = normalize_collect_payload({"start_date": "2026-01-01", "end_date": "2026-01-03"})
         self.assertEqual(payload["keyword"], "그림체 공유")
         self.assertEqual(payload["tabs"], ["NAI", "R18_NAI"])
+        self.assertEqual((payload["max_pages"], payload["max_posts"]), (0, 0))
         with self.assertRaises(ArcaCollectorError):
             normalize_collect_payload({"start_date": "bad", "end_date": "2026-01-03"})
         with self.assertRaises(ArcaCollectorError):
@@ -215,6 +233,71 @@ class ArcaCollectorTest(unittest.TestCase):
             with self.assertRaises(ArcaCollectorError):
                 normalize_arca_article_url(value)
 
+    def test_metadata_seed_excludes_paths_and_imports_only_once(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            collector_module._init_danbooru_seed_tables(conn)
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_url,representative_image_path,prompt) VALUES(?,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/1", "now", "now", "https://img/1.png", "adult.png", "artist:foo"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?,?)",
+                (item_id, "https://img/1.png", "adult.png", "ok", "artist:foo", "artist:foo", "now"),
+            )
+            conn.execute(
+                "INSERT INTO ratings(artist_tag,score,mode,representative_thumbnail_path,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                ("danbooru_artist", 5, "manual", "thumbnail.jpg", "now", "now"),
+            )
+            conn.execute(
+                "INSERT INTO artist_cache(artist_tag,artist_post_count,updated_at) VALUES(?,?,?)",
+                ("danbooru_artist", 1234, "now"),
+            )
+            conn.execute("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT)")
+            conn.execute("INSERT INTO settings VALUES('novelai_app_key','must-not-export')")
+        seed = Path(self.temp.name) / "seed.sqlite"
+        exported = export_arca_style_seed(self.db_path, seed)
+        self.assertEqual((exported["items"], exported["images"]), (1, 1))
+        self.assertEqual((exported["ratings"], exported["artist_cache"]), (1, 1))
+        with closing(sqlite3.connect(seed)) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertEqual(conn.execute("SELECT representative_image_path FROM arca_style_items").fetchone()[0], "")
+            self.assertEqual(conn.execute("SELECT image_path FROM arca_style_images").fetchone()[0], "")
+            self.assertEqual(conn.execute("SELECT representative_thumbnail_path FROM ratings").fetchone()[0], "")
+            self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache").fetchone()[0], 1234)
+            self.assertNotIn("settings", tables)
+            self.assertNotIn("generated_images", tables)
+            self.assertNotIn("art_styles", tables)
+
+        destination = Path(self.temp.name) / "destination.sqlite"
+        init_arca_style_tables(destination)
+        first = import_arca_style_seed(destination, seed)
+        second = import_arca_style_seed(destination, seed)
+        self.assertEqual(first, {"imported": True, "items": 1, "images": 1})
+        self.assertEqual(second, {"imported": False, "items": 0, "images": 0})
+        with closing(sqlite3.connect(destination)) as conn:
+            self.assertEqual(conn.execute("SELECT artist_tag,score FROM ratings").fetchone(), ("danbooru_artist", 5))
+            self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache").fetchone()[0], 1234)
+
+    def test_image_restore_uses_saved_urls_without_fetching_posts(self):
+        image_dir = Path(self.temp.name) / "images"
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_url,metadata_status) VALUES(?,?,?,?,?)",
+                ("https://arca.live/b/aiart/1", "now", "now", "https://img/1.png", "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,created_at) VALUES(?,?,?,?,?)",
+                (item_id, "https://img/1.png", "", "ok", "now"),
+            )
+        job_id, missing = create_image_restore_job(self.db_path, image_dir)
+        with patch.object(collector_module, "download_image", return_value=(b"png-bytes", "image/png")):
+            result = restore_arca_style_images(self.db_path, image_dir, job_id, missing)
+        self.assertEqual(result, {"restored": 1, "failed": 0, "skipped_existing": False})
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            image_path = conn.execute("SELECT image_path FROM arca_style_images").fetchone()[0]
+            representative = conn.execute("SELECT representative_image_path FROM arca_style_items").fetchone()[0]
+        self.assertEqual(representative, image_path)
+        self.assertEqual((image_dir / image_path).read_bytes(), b"png-bytes")
     def test_collects_one_article_url_without_date_search(self):
         article_url = "https://arca.live/b/aiart/174457459"
         image_url = "https://img.example/direct.png"
@@ -240,6 +323,80 @@ class ArcaCollectorTest(unittest.TestCase):
         detail = get_arca_style_detail(self.db_path, result["item_id"])
         self.assertEqual(detail["source_url"], article_url)
         self.assertEqual(detail["images"][0]["base_prompt"], "artist:foo")
+
+    def test_direct_url_reuses_complete_local_metadata_item_before_network(self):
+        article_url = "https://arca.live/b/aiart/174457459"
+        image_dir = Path(self.temp.name) / "images"
+        image_dir.mkdir()
+        (image_dir / "cached.png").write_bytes(b"cached")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_path,metadata_status,prompt) VALUES(?,?,?,?,?,?)",
+                (article_url, "now", "now", "cached.png", "ok", "artist:cached"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,content_type,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (item_id, "https://img.example/cached.png", "cached.png", "image/png", "ok", "artist:cached", "artist:cached", "now"),
+            )
+        job_id = create_url_collection_job(self.db_path, article_url)
+
+        with patch("arca_style_collector.create_arca_session", side_effect=AssertionError("network session must not be created")) as create_session:
+            result = collect_arca_style_url(self.db_path, image_dir, article_url, job_id=job_id)
+
+        create_session.assert_not_called()
+        self.assertEqual(result, {
+            "ok": True, "item_id": item_id, "saved": 0, "updated": 0,
+            "downloaded_images": 0, "skipped_existing": True,
+        })
+        job = get_collection_job(self.db_path, job_id)
+        self.assertEqual((job["status"], job["skipped_existing"], job["downloaded_images"]), ("completed", 1, 0))
+
+        delete_arca_style(self.db_path, image_dir, item_id)
+        png = png_with_text("Comment", json.dumps({"prompt": "artist:new", "seed": 1, "sampler": "k_euler"}))
+        html = '<div class="article-content"><img src="https://img.example/new.png"></div>'
+
+        class Response:
+            def __init__(self, text="", data=b"", content_type="text/html"):
+                self.text, self.data = text, data
+                self.headers = {"Content-Type": content_type}
+            def raise_for_status(self): pass
+            def iter_content(self, _size): return [self.data]
+
+        class TrackingSession:
+            def __init__(self): self.calls = []
+            def get(self, url, **_kwargs):
+                self.calls.append(url)
+                return Response(text=html) if url == article_url else Response(data=png, content_type="image/png")
+
+        session = TrackingSession()
+        recollected = collect_arca_style_url(self.db_path, image_dir, article_url, session=session)
+        self.assertEqual(recollected["saved"], 1)
+        self.assertIn(article_url, session.calls)
+
+    def test_direct_url_applies_imported_browser_cookies_to_its_own_session(self):
+        article_url = "https://arca.live/b/aiart/174457460"
+        jar = CookieJar()
+        jar.set_cookie(self._cookie(".arca.live", "session", "direct-secret"))
+        connect_arca_cookie_jar(
+            jar, "Chrome", validator=lambda _session: {"R18_NAI": {"category": "r18"}},
+        )
+
+        class Session:
+            def __init__(self): self.cookies = CookieJar()
+
+        session = Session()
+        article = {
+            "source_url": article_url, "article_id": "174457460", "board_tab": "R18_NAI",
+            "title": "style", "author": "", "posted_at": "2026-06-01", "body_text": "",
+            "image_urls": ["https://img.example/style.png"],
+        }
+        with patch("arca_style_collector.create_arca_session", return_value=session), \
+                patch("arca_style_collector.fetch_html", return_value="<html></html>"), \
+                patch("arca_style_collector.extract_article_data", return_value=article), \
+                patch("arca_style_collector._save_article", return_value=(0, 7)):
+            collect_arca_style_url(self.db_path, Path(self.temp.name) / "images", article_url)
+
+        self.assertEqual([(cookie.name, cookie.value) for cookie in session.cookies], [("session", "direct-secret")])
 
     def test_schema_adds_jobs_prompt_parts_and_recollection_links(self):
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -271,6 +428,60 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual(status["status"], "running")
         self.assertEqual(status["progress"], {"pages": [1, 2], "posts": [2, 3], "images": 4})
         self.assertEqual(status["estimated_remaining_seconds"], 2)
+
+    def test_job_total_pages_counts_each_selected_tab(self):
+        job_id = create_collection_job(self.db_path, {
+            "keyword": "그림체 공유", "tabs": ["NAI", "R18_NAI"],
+            "start_date": "2026-06-01", "end_date": "2026-06-02",
+            "max_pages": 3, "max_posts": 10,
+        })
+        self.assertEqual(get_collection_job(self.db_path, job_id)["total_pages"], 6)
+
+    def test_unlimited_collection_job_has_unknown_totals(self):
+        job_id = create_collection_job(self.db_path, {
+            "tabs": ["NAI"], "start_date": "2026-06-01", "end_date": "2026-06-02",
+        })
+        job = get_collection_job(self.db_path, job_id)
+        self.assertIsNone(job["total_pages"])
+        self.assertIsNone(job["total_posts"])
+
+    def test_collection_job_can_pause_resume_and_stop_in_place(self):
+        job_id = create_collection_job(self.db_path, {
+            "tabs": ["NAI"], "start_date": "2026-06-01", "end_date": "2026-06-02",
+        })
+        collector_module._register_collection_control(job_id)
+        try:
+            pause_collection_job(self.db_path, job_id)
+            waiter = threading.Thread(
+                target=collector_module._wait_for_collection_control,
+                args=(self.db_path, job_id, "scanning"),
+            )
+            waiter.start()
+            for _ in range(20):
+                if get_collection_job(self.db_path, job_id)["status"] == "paused":
+                    break
+                time.sleep(0.01)
+            self.assertEqual(get_collection_job(self.db_path, job_id)["status"], "paused")
+            self.assertEqual(resume_collection_job(self.db_path, Path(self.temp.name), job_id), job_id)
+            waiter.join(1)
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(get_collection_job(self.db_path, job_id)["status"], "running")
+            stop_collection_job(self.db_path, job_id)
+            with self.assertRaises(collector_module.ArcaCollectionStopped):
+                collector_module._wait_for_collection_control(self.db_path, job_id, "scanning")
+        finally:
+            collector_module._remove_collection_control(job_id)
+
+    def test_interrupted_job_resume_starts_recovery_job_with_saved_request(self):
+        job_id = create_collection_job(self.db_path, {
+            "tabs": ["NAI"], "start_date": "2026-06-01", "end_date": "2026-06-02",
+        })
+        update_collection_job(self.db_path, job_id, status="interrupted", stage="interrupted")
+        self.assertEqual(get_latest_resumable_collection_job(self.db_path)["id"], job_id)
+        with patch("arca_style_collector.start_collection_job", return_value=99) as start:
+            self.assertEqual(resume_collection_job(self.db_path, Path(self.temp.name), job_id), 99)
+        self.assertEqual(start.call_args.args[1], Path(self.temp.name))
+        self.assertEqual(start.call_args.args[2]["start_date"], "2026-06-01")
 
     def test_user_agent_is_browser_compatible_for_public_board_requests(self):
         self.assertTrue(USER_AGENT.startswith("Mozilla/5.0"))
@@ -345,6 +556,175 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual([item["recommendation_count"] for item in list_arca_styles(self.db_path, {"sort": "recommend_desc"})], [20, 5, 2])
         self.assertEqual([item["view_count"] for item in list_arca_styles(self.db_path, {"sort": "views_desc"})], [3000, 900, 100])
 
+    def test_list_page_reaches_all_rows_and_filters_minimum_recommendations(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            for index, recommendations in enumerate((1, 5, 10, 20), 1):
+                conn.execute(
+                    "INSERT INTO arca_style_items(source_url,collected_at,updated_at,title,board_tab,prompt,metadata_status,recommendation_count) VALUES(?,?,?,?,?,?,?,?)",
+                    (f"https://arca.live/b/aiart/page-{index}", "now", "now", f"그림체 공유 {index}", "NAI", "artist prompt", "ok", recommendations),
+                )
+        result = get_arca_style_page(self.db_path, {
+            "page": 2, "per_page": 2, "recommendation_min": 5, "sort": "recommend_desc",
+        })
+        self.assertEqual((result["page"], result["per_page"], result["total"], result["total_pages"]), (2, 2, 3, 2))
+        self.assertEqual([item["recommendation_count"] for item in result["items"]], [5])
+        with self.assertRaises(ArcaCollectorError):
+            get_arca_style_page(self.db_path, {"recommendation_min": -1})
+
+    def test_list_loads_style_group_counts_with_one_database_connection(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            for index in range(2):
+                item_id = conn.execute(
+                    "INSERT INTO arca_style_items(source_url,collected_at,updated_at,title,board_tab,prompt,metadata_status) VALUES(?,?,?,?,?,?,?)",
+                    (f"https://arca.live/b/aiart/bulk-{index}", "now", "now", f"그림체 공유 {index}", "NAI", "artist:foo", "ok"),
+                ).lastrowid
+                for image_index in range(2):
+                    prompt = f"artist:foo, watercolor, {image_index + 1}girl"
+                    conn.execute(
+                        "INSERT INTO arca_style_images(item_id,image_url,prompt,base_prompt,created_at) VALUES(?,?,?,?,?)",
+                        (item_id, f"https://img/{index}-{image_index}.png", prompt, prompt, "now"),
+                    )
+
+        with patch("arca_style_collector._connect", wraps=collector_module._connect) as connect:
+            items = list_arca_styles(self.db_path)
+
+        self.assertEqual(connect.call_count, 1)
+        self.assertEqual([item["style_group_count"] for item in items], [1, 1])
+
+    def test_statistics_separates_explicit_artists_and_quality_tags_for_shared_styles(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            shared_item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,title,board_tab,prompt,metadata_status) VALUES(?,?,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/shared", "now", "now", "그림체 공유", "NAI", "artist:foo", "ok"),
+            ).lastrowid
+            conn.execute("UPDATE arca_style_items SET recommendation_count=40 WHERE id=?", (shared_item_id,))
+            prompts = [
+                "artist: Foo, best quality, masterpiece, 1girl",
+                "artists:foo, {{amazing quality, highres}}, watercolor",
+                "artist:bar, 4::masterpiece, newest",
+            ]
+            for index, prompt in enumerate(prompts, 1):
+                conn.execute(
+                    "INSERT INTO arca_style_images(item_id,image_url,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?)",
+                    (shared_item_id, f"https://img/shared-{index}.png", "ok", prompt, prompt, "now"),
+                )
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?)",
+                (shared_item_id, "https://img/not-metadata.png", "no_metadata", "artist:hidden, best quality", "artist:hidden, best quality", "now"),
+            )
+
+            direct_url = "https://arca.live/b/aiart/direct"
+            direct_item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,title,board_tab,prompt,metadata_status) VALUES(?,?,?,?,?,?,?)",
+                (direct_url, "now", "now", "직접 추가", "R18_NAI", "artist:direct", "ok"),
+            ).lastrowid
+            conn.execute("UPDATE arca_style_items SET recommendation_count=100 WHERE id=?", (direct_item_id,))
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?)",
+                (direct_item_id, "https://img/direct.png", "ok", "artist:direct, very aesthetic", "artist:direct, very aesthetic", "now"),
+            )
+            conn.execute(
+                "INSERT INTO arca_collection_jobs(request_json,status,stage,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (json.dumps({"source_url": direct_url}), "completed", "completed", "now", "now"),
+            )
+
+            misc_item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,title,board_tab,prompt,metadata_status) VALUES(?,?,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/misc", "now", "now", "일반 게시글", "NAI", "artist:hidden", "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?)",
+                (misc_item_id, "https://img/misc.png", "ok", "artist:hidden, best quality", "artist:hidden, best quality", "now"),
+            )
+
+        stats = get_arca_style_statistics(self.db_path)
+
+        self.assertEqual({key: stats[key] for key in (
+            "analyzed_image_count", "analyzed_post_count", "analyzed_tag_count",
+            "images_with_artist", "images_with_quality",
+        )}, {
+            "analyzed_image_count": 4, "analyzed_post_count": 2, "analyzed_tag_count": 13,
+            "images_with_artist": 4, "images_with_quality": 4,
+        })
+        self.assertEqual({entry["tag"]: entry["count"] for entry in stats["artists"]}, {
+            "artist:foo": 2, "artist:bar": 1, "artist:direct": 1,
+        })
+        artist_foo = next(entry for entry in stats["artists"] if entry["tag"] == "artist:foo")
+        self.assertEqual(artist_foo["representative_image"]["prompt"], prompts[0])
+        self.assertEqual((artist_foo["average_recommendations"], artist_foo["max_recommendations"]), (40.0, 40))
+        quality = {entry["tag"]: entry for entry in stats["quality_tags"]}
+        self.assertEqual({tag: entry["count"] for tag, entry in quality.items()}, {
+            "masterpiece": 2, "amazing quality": 1, "best quality": 1,
+            "highres": 1, "newest": 1, "very aesthetic": 1,
+        })
+        self.assertEqual((quality["masterpiece"]["average_weight"], quality["masterpiece"]["max_weight"]), (2.5, 4.0))
+        self.assertEqual(stats["quality_sequences"][0]["count"], 1)
+        self.assertIn("representative_image", stats["quality_sequences"][0])
+        self.assertTrue(all(entry["size"] == len(entry["tags"]) for entry in stats["quality_bundles"]))
+        self.assertIn(
+            {"source": "best quality", "target": "masterpiece", "count": 1, "percentage": 25.0},
+            stats["quality_network"]["edges"],
+        )
+        quality_detail = get_arca_tag_statistics(self.db_path, "quality", "masterpiece")
+        self.assertIn(
+            {"tag": "best quality", "count": 1, "percentage": 50.0},
+            quality_detail["related_tags"],
+        )
+        sequence_detail = get_arca_quality_sequence_statistics(self.db_path, ["best quality", "masterpiece"])
+        self.assertEqual(sequence_detail["image_count"], 1)
+        self.assertEqual(sequence_detail["images"][0]["prompt"], prompts[0])
+        recommended = get_arca_style_statistics(self.db_path, {"recommendation_min": 80})
+        self.assertEqual(recommended["analyzed_image_count"], 1)
+        self.assertEqual([entry["tag"] for entry in recommended["artists"]], ["artist:direct"])
+
+    def test_statistics_rejects_invalid_recommendation_ranges(self):
+        with self.assertRaises(ArcaCollectorError):
+            get_arca_style_statistics(self.db_path, {"recommendation_min": "bad"})
+        with self.assertRaises(ArcaCollectorError):
+            get_arca_style_statistics(self.db_path, {"recommendation_min": 20, "recommendation_max": 10})
+
+    def test_weight_parser_preserves_explicit_groups_wrappers_and_negative_values(self):
+        parsed = parse_weighted_prompt_tags(
+            "1.2::artist:foo, masterpiece::, {{highres}}, [aesthetic], -2::artist:bar::"
+        )
+        self.assertEqual([(entry["tag"], entry["weight"]) for entry in parsed], [
+            ("artist:foo", 1.2), ("masterpiece", 1.2), ("highres", 1.1025),
+            ("aesthetic", 0.952381), ("artist:bar", -2.0),
+        ])
+
+    def test_tag_statistics_sorts_images_by_highest_weight_and_builds_ranges(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,title,board_tab,prompt,metadata_status) VALUES(?,?,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/weighted", "now", "now", "그림체 공유", "NAI", "artist:foo", "ok"),
+            ).lastrowid
+            for index, prompt in enumerate(("0.8::artist:foo::, artist:bar", "1.8::artist:foo::", "artist:foo"), 1):
+                conn.execute(
+                    "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (item_id, f"https://img/{index}.png", f"{index}.png", "ok", prompt, prompt, "now"),
+                )
+        detail = get_arca_tag_statistics(self.db_path, "artist", "artist:foo", 2)
+        self.assertEqual((detail["image_count"], detail["occurrence_count"]), (3, 3))
+        self.assertEqual([image["weight"] for image in detail["images"]], [1.8, 1.0])
+        self.assertEqual(detail["images"][0]["prompt"], "1.8::artist:foo::")
+        self.assertEqual(sum(entry["count"] for entry in detail["weights"]["bins"]), 3)
+        self.assertEqual(detail["related_tags"], [{"tag": "artist:bar", "count": 1, "percentage": 33.3}])
+
+    def test_statistics_returns_a_stable_empty_interface(self):
+        self.assertEqual(get_arca_style_statistics(self.db_path), {
+            "analyzed_image_count": 0,
+            "analyzed_post_count": 0,
+            "analyzed_tag_count": 0,
+            "images_with_artist": 0,
+            "images_with_quality": 0,
+            "artists": [],
+            "quality_tags": [],
+            "quality_sequences": [],
+            "quality_bundles": [],
+            "quality_network": {"nodes": [], "edges": []},
+            "collection_scope_note": "저장된 공유 그림체 이미지 기준이며, 수집은 선택한 날짜 범위의 검색 종료 지점까지 진행됩니다.",
+        })
+
     def test_coverage_merges_and_subtracts_dates(self):
         merged = merge_date_intervals([
             (date(2026, 1, 1), date(2026, 1, 3)),
@@ -367,6 +747,198 @@ class ArcaCollectorTest(unittest.TestCase):
         coverage = get_completed_coverage(self.db_path, {"keyword": "그림체 공유", "tabs": ["NAI", "R18_NAI"], "max_pages": 5, "max_posts": 80})
         self.assertEqual(coverage, [(date(2026, 1, 1), date(2026, 1, 3))])
 
+    def test_completed_coverage_skips_login_and_category_network(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                "INSERT INTO arca_collection_runs(keyword,tabs,start_date,end_date,max_pages,max_posts,status,search_scope,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("그림체 공유", "R18_NAI", "2026-06-01", "2026-06-02", 1, 5, "completed", SEARCH_SCOPE, "now", "now"),
+            )
+        payload = {
+            "keyword": "그림체 공유", "tabs": ["R18_NAI"],
+            "start_date": "2026-06-01", "end_date": "2026-06-02",
+            "max_pages": 1, "max_posts": 5,
+        }
+
+        with patch("arca_style_collector.get_arca_browser_session_status", side_effect=AssertionError("login must not be checked")) as login_status, \
+                patch("arca_style_collector.create_arca_session", side_effect=AssertionError("session must not be created")) as create_session, \
+                patch("arca_style_collector.discover_category_params", side_effect=AssertionError("category must not be fetched")) as discover:
+            result = collect_arca_styles(self.db_path, Path(self.temp.name) / "images", payload)
+
+        self.assertTrue(result["skipped_existing"])
+        login_status.assert_not_called()
+        create_session.assert_not_called()
+        discover.assert_not_called()
+
+    def test_search_prefilters_rows_fetches_articles_in_parallel_and_stops_at_post_limit(self):
+        def row(article_id, badge, posted_at):
+            return (
+                f'<a class="vrow column" href="/b/aiart/{article_id}">'
+                f'<span class="badge">{badge}</span><span class="title">그림체 공유 {article_id}</span>'
+                f'<time datetime="{posted_at}T12:00:00Z"></time></a>'
+            )
+
+        search_html = "".join([
+            row(1, "NAI", "2026-06-01"),
+            row(2, "🔞 NAI", "2026-06-11"),
+            row(3, "NAI", "2026-06-11"),
+            row(4, "NAI", "2026-06-11"),
+            row(5, "NAI", "2026-06-11"),
+            row(6, "NAI", "2026-06-11"),
+            row(7, "NAI", "2026-06-11"),
+        ])
+        lock = threading.Lock()
+        search_calls, article_calls, article_sessions = [], [], []
+        active_articles = 0
+        max_active_articles = 0
+        session_instances = []
+
+        class Session:
+            def __init__(self):
+                self.headers = {}
+                self.cookies = CookieJar()
+                session_instances.append(self)
+            def close(self): pass
+
+        def fake_fetch(session, url):
+            nonlocal active_articles, max_active_articles
+            if "keyword=" in url:
+                search_calls.append(url)
+                return search_html
+            with lock:
+                article_calls.append(url)
+                article_sessions.append(session)
+                active_articles += 1
+                max_active_articles = max(max_active_articles, active_articles)
+            time.sleep(0.03)
+            with lock:
+                active_articles -= 1
+            return '<div class="article-content"><img src="https://img.example/style.png"></div>'
+
+        saved_active = 0
+        max_saved_active = 0
+
+        def fake_save(_db_path, _image_dir, _session, article, summary, run_id=None):
+            nonlocal saved_active, max_saved_active
+            saved_active += 1
+            max_saved_active = max(max_saved_active, saved_active)
+            time.sleep(0.005)
+            saved_active -= 1
+            return 0, int(article["article_id"])
+
+        payload = {
+            "keyword": "그림체 공유", "tabs": ["NAI"],
+            "start_date": "2026-06-10", "end_date": "2026-06-12",
+            "max_pages": 2, "max_posts": 4,
+        }
+        with patch("arca_style_collector.create_arca_session", side_effect=Session), \
+                patch("arca_style_collector.discover_category_params", return_value={"NAI": {"category": "nai"}}), \
+                patch("arca_style_collector.fetch_html", side_effect=fake_fetch), \
+                patch("arca_style_collector._save_article", side_effect=fake_save):
+            result = collect_arca_styles(self.db_path, Path(self.temp.name) / "images", payload)
+
+        self.assertEqual((result["scanned_pages"], result["scanned_posts"]), (1, 4))
+        self.assertEqual(len(search_calls), 1)
+        self.assertEqual(set(article_calls), {f"https://arca.live/b/aiart/{index}" for index in range(3, 7)})
+        self.assertGreaterEqual(max_active_articles, 2)
+        self.assertLessEqual(max_active_articles, 4)
+        self.assertEqual(max_saved_active, 1)
+        self.assertEqual(len({id(session) for session in article_sessions}), 4)
+        self.assertNotIn(session_instances[0], article_sessions)
+
+    def test_archive_search_locates_2025_before_scanning_target_window(self):
+        def row(article_id, posted_at):
+            return (
+                f'<a class="vrow column" href="/b/aiart/{article_id}">'
+                f'<span class="badge">NAI</span><span class="title">style</span>'
+                f'<time datetime="{posted_at}T12:00:00Z"></time></a>'
+            )
+
+        search_pages = {
+            1: row(1, "2026-06-01"),
+            2: row(2, "2026-01-01"),
+            3: row(3, "2025-06-15"),
+            4: row(4, "2024-12-31"),
+        }
+        search_calls, article_calls, saved = [], [], []
+
+        class Session:
+            def __init__(self):
+                self.headers = {}
+                self.cookies = CookieJar()
+            def close(self): pass
+
+        def fake_fetch(_session, url):
+            if "keyword=" in url:
+                page = int(url.rsplit("p=", 1)[-1])
+                search_calls.append(page)
+                return search_pages.get(page, "")
+            article_calls.append(url)
+            return '<div class="article-content"></div>'
+
+        def fake_save(_db_path, _image_dir, _session, article, _summary, run_id=None):
+            saved.append(article["article_id"])
+            return 0, int(article["article_id"])
+
+        payload = {
+            "keyword": "style", "tabs": ["NAI"],
+            "start_date": "2025-01-01", "end_date": "2025-12-31",
+        }
+        with patch("arca_style_collector.create_arca_session", side_effect=Session), \
+                patch("arca_style_collector.discover_category_params", return_value={"NAI": {"category": "nai"}}), \
+                patch("arca_style_collector.fetch_html", side_effect=fake_fetch), \
+                patch("arca_style_collector._save_article", side_effect=fake_save):
+            result = collect_arca_styles(self.db_path, Path(self.temp.name) / "images", payload)
+
+        self.assertFalse(result["partial"])
+        self.assertEqual(search_calls, [1, 2, 4, 3])
+        self.assertEqual(saved, ["3"])
+        self.assertEqual(article_calls, ["https://arca.live/b/aiart/3"])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            status = conn.execute("SELECT status FROM arca_collection_runs").fetchone()[0]
+        self.assertEqual(status, "completed")
+
+    def test_post_limit_marks_archive_range_partial_without_coverage(self):
+        def row(article_id):
+            return (
+                f'<a class="vrow column" href="/b/aiart/{article_id}">'
+                f'<span class="badge">NAI</span><span class="title">style</span>'
+                f'<time datetime="2025-06-15T12:00:00Z"></time></a>'
+            )
+
+        class Session:
+            def __init__(self):
+                self.headers = {}
+                self.cookies = CookieJar()
+            def close(self): pass
+
+        def fake_fetch(_session, url):
+            if "keyword=" in url:
+                return row(1) + row(2) if url.endswith("p=1") else ""
+            return '<div class="article-content"></div>'
+
+        payload = {
+            "keyword": "style", "tabs": ["NAI"],
+            "start_date": "2025-01-01", "end_date": "2025-12-31",
+            "max_pages": 5, "max_posts": 1,
+        }
+        with patch("arca_style_collector.create_arca_session", side_effect=Session), \
+                patch("arca_style_collector.discover_category_params", return_value={"NAI": {"category": "nai"}}), \
+                patch("arca_style_collector.fetch_html", side_effect=fake_fetch), \
+                patch("arca_style_collector._save_article", return_value=(0, 1)):
+            result = collect_arca_styles(self.db_path, Path(self.temp.name) / "images", payload)
+
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["warning"])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            status = conn.execute("SELECT status FROM arca_collection_runs").fetchone()[0]
+        self.assertEqual(status, "partial")
+        params = normalize_collect_payload(payload)
+        self.assertEqual(get_completed_coverage(self.db_path, params), [])
+        self.assertEqual(
+            uncovered_date_intervals(date(2025, 1, 1), date(2025, 12, 31), get_completed_coverage(self.db_path, params)),
+            [(date(2025, 1, 1), date(2025, 12, 31))],
+        )
+
     def test_delete_reopens_only_the_item_date_for_its_search(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             item_id = conn.execute(
@@ -382,6 +954,7 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual(result["recollect_date"], "2026-06-10")
         params = normalize_collect_payload({
             "keyword": "그림체 공유", "start_date": "2026-06-01", "end_date": "2026-06-30",
+            "max_pages": 5, "max_posts": 80,
         })
         coverage = get_completed_coverage(self.db_path, params)
         self.assertEqual(uncovered_date_intervals(date(2026, 6, 1), date(2026, 6, 30), coverage), [
@@ -397,11 +970,11 @@ class ArcaCollectorTest(unittest.TestCase):
         coverage = get_completed_coverage(self.db_path, {"keyword": "그림체 공유", "tabs": ["NAI", "R18_NAI"], "max_pages": 5, "max_posts": 80})
         self.assertEqual(coverage, [])
 
-    def test_pre_session_category_runs_do_not_cover_new_searches(self):
+    def test_pre_archive_locator_runs_do_not_cover_new_searches(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 "INSERT INTO arca_collection_runs(keyword,tabs,start_date,end_date,max_pages,max_posts,status,search_scope,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                ("그림체 공유", "NAI,R18_NAI", "2026-01-01", "2026-01-03", 5, 80, "completed", "title-row-stealth-v4", "now", "now"),
+                ("그림체 공유", "NAI,R18_NAI", "2026-01-01", "2026-01-03", 5, 80, "completed", "title-category-session-v5", "now", "now"),
             )
         coverage = get_completed_coverage(self.db_path, {"keyword": "그림체 공유", "tabs": ["NAI", "R18_NAI"], "max_pages": 5, "max_posts": 80})
         self.assertEqual(coverage, [])
@@ -481,6 +1054,45 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual([entry["prompt"] for entry in meta["character_prompts"]], [
             "1girl, blue hair", "1boy, black hair",
         ])
+
+    def test_prompt_presets_keep_non_character_tags_and_full_negative(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            for index, (prompt, negative, recommendations) in enumerate((
+                ("1.2::artist:alpha::, masterpiece, 1.1::best quality::, soft lighting, scenery, 1girl, blue_hair, full body", "lowres, bad hands", 2),
+                ("artist:beta, amazing quality, scenery", "blurry, text", 100),
+            ), 1):
+                item_id = conn.execute(
+                    "INSERT INTO arca_style_items(source_url,title,board_tab,metadata_status,prompt,negative_prompt,recommendation_count,collected_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (f"https://arca.live/b/aiart/preset-{index}", "그림체 공유", "NAI", "ok", prompt, negative, recommendations, "now", "now"),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO arca_style_images(item_id,image_url,metadata_status,prompt,base_prompt,negative_prompt,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (item_id, f"https://img/{index}.png", "ok", prompt, prompt, negative, "now"),
+                )
+
+        result = get_style_maker_prompt_presets(self.db_path, ["alpha"])
+
+        self.assertEqual(result["selected_artist_count"], 1)
+        self.assertEqual(
+            result["presets"][0]["base_prompt"],
+            "masterpiece, 1.1::best quality::, soft lighting, scenery",
+        )
+        self.assertEqual(result["presets"][0]["negative_prompt"], "lowres, bad hands")
+        self.assertEqual(result["presets"][0]["match_count"], 1)
+        self.assertEqual(
+            [item["prompt"] for item in result["presets"][0]["excluded_tags"]],
+            ["1girl", "blue_hair", "full body"],
+        )
+        self.assertNotIn("artist:alpha", result["presets"][0]["base_prompt"])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_prompt_preset_index").fetchone()[0], 2)
+        with patch("arca_style_collector._prompt_preset_parts", side_effect=AssertionError("cache miss")):
+            cached = get_style_maker_prompt_presets(self.db_path, ["alpha"])
+        self.assertEqual(cached, result)
+        self.assertEqual(
+            {item["artist"] for item in get_shared_style_artist_pool(self.db_path)},
+            {"alpha", "beta"},
+        )
 
     def test_namu_cdn_candidates_request_original_image_bytes(self):
         candidates = extract_image_candidates(
@@ -644,6 +1256,106 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual(network_count, 0)
         with closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_style_images WHERE item_id=?", (item_id,)).fetchone()[0], 1)
+
+    def test_save_article_negative_caches_obvious_non_png_without_request(self):
+        class NoNetworkSession:
+            def get(self, *_args, **_kwargs):
+                raise AssertionError("obvious non-PNG must not be requested")
+
+        article = {
+            "source_url": "https://arca.live/b/aiart/non-png", "article_id": "non-png", "board_tab": "NAI",
+            "title": "style", "author": "a", "posted_at": "2026-06-01", "body_text": "",
+            "image_urls": ["https://img.example/sample.jpg"],
+        }
+        summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
+        network_count, item_id = _save_article(
+            self.db_path, Path(self.temp.name) / "images", NoNetworkSession(), article, summary,
+        )
+        self.assertEqual(network_count, 0)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT content_type,metadata_status,image_path FROM arca_style_images WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(row, ("image/jpeg", "no_metadata", ""))
+
+        retry_summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
+        retry_count, _ = _save_article(
+            self.db_path, Path(self.temp.name) / "images", NoNetworkSession(), article, retry_summary,
+        )
+        self.assertEqual(retry_count, 0)
+
+    def test_save_article_stops_non_png_response_before_reading_body(self):
+        class Response:
+            headers = {"Content-Type": "image/webp"}
+            closed = False
+            def raise_for_status(self): pass
+            def iter_content(self, _size):
+                raise AssertionError("non-PNG body must not be read")
+            def close(self): self.closed = True
+
+        response = Response()
+
+        class Session:
+            def get(self, *_args, **_kwargs): return response
+
+        article = {
+            "source_url": "https://arca.live/b/aiart/header-non-png", "article_id": "header-non-png", "board_tab": "NAI",
+            "title": "style", "author": "a", "posted_at": "2026-06-01", "body_text": "",
+            "image_urls": ["https://img.example/resource"],
+        }
+        summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
+        network_count, item_id = _save_article(
+            self.db_path, Path(self.temp.name) / "images", Session(), article, summary,
+        )
+        self.assertEqual(network_count, 0)
+        self.assertTrue(response.closed)
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT content_type,metadata_status,image_path FROM arca_style_images WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(row, ("image/webp", "no_metadata", ""))
+
+    def test_save_article_negative_caches_png_without_novelai_metadata_without_file(self):
+        payload = png_with_text("Software", "generic drawing tool")
+
+        class Response:
+            headers = {"Content-Type": "image/png"}
+            def raise_for_status(self): pass
+            def iter_content(self, _size): return [payload]
+
+        class Session:
+            def __init__(self): self.calls = 0
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                return Response()
+
+        image_dir = Path(self.temp.name) / "images"
+        article = {
+            "source_url": "https://arca.live/b/aiart/plain-png", "article_id": "plain-png", "board_tab": "NAI",
+            "title": "style", "author": "a", "posted_at": "2026-06-01", "body_text": "",
+            "image_urls": ["https://img.example/plain.png"],
+        }
+        session = Session()
+        summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
+        network_count, item_id = _save_article(self.db_path, image_dir, session, article, summary)
+        self.assertEqual((network_count, session.calls), (0, 1))
+        self.assertEqual(list(image_dir.glob("*")) if image_dir.exists() else [], [])
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT metadata_status,image_path FROM arca_style_images WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(row, ("no_metadata", ""))
+
+        class NoNetworkSession:
+            def get(self, *_args, **_kwargs):
+                raise AssertionError("negative-cached PNG must not be requested again")
+
+        retry_summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
+        retry_count, _ = _save_article(self.db_path, image_dir, NoNetworkSession(), article, retry_summary)
+        self.assertEqual(retry_count, 0)
 
     def test_save_article_downloads_new_images_concurrently(self):
         payload = png_with_text("Comment", json.dumps({

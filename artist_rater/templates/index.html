@@ -18,6 +18,7 @@
         <button class="tab" data-tab="style-maker">그림체 제작</button>
         <button class="tab" data-tab="style-manager">그림체 관리</button>
         <button class="tab" data-tab="arca-style-collector">공유 그림체 수집</button>
+        <button class="tab" data-tab="arca-style-statistics">작가·퀄리티 분석</button>
         <button id="openSettings" class="icon-button" type="button" title="NovelAI 설정" aria-label="NovelAI 설정">⚙</button>
       </nav>
     </header>
@@ -223,6 +224,10 @@
                 <span>작가 수</span>
                 <input id="styleArtistCount" type="number" min="1" value="12">
               </label>
+              <label class="field">
+                <span>공유 그림체 작가 최대 인원</span>
+                <input id="sharedStyleArtistMax" type="number" min="0" max="50" value="0">
+              </label>
               <fieldset class="style-fieldset">
                 <legend>허용 평점</legend>
                 <div id="styleScoreButtons" class="segmented" aria-label="허용 평점 다중 선택">
@@ -257,6 +262,19 @@
                 <span>자리별 가중치 그래프</span>
                 <svg id="weightGraphPreview" viewBox="0 0 240 100" aria-hidden="true"></svg>
               </button>
+              <section class="style-artist-list-section" aria-label="추가된 작가 편집">
+                <div class="style-subhead compact">
+                  <h3>가중치 표</h3>
+                  <span>여기서도 바로 수정</span>
+                </div>
+                <div class="style-artist-row style-artist-row-head" aria-hidden="true">
+                  <span>순서</span>
+                  <span>작가</span>
+                  <span>가중치</span>
+                  <span></span>
+                </div>
+                <div id="styleArtistList" class="style-artist-list"></div>
+              </section>
               <div id="styleSettingsError" class="status" role="alert"></div>
             </div>
           </aside>
@@ -272,20 +290,29 @@
               </div>
               <div id="styleMakerStatus" class="status" role="status"></div>
             </div>
-            <section id="latestStyleResult" class="latest-style-result" aria-live="polite">
-              <div class="latest-result-placeholder">최근 생성 결과가 여기에 표시됩니다.</div>
-            </section>
             <div class="artist-add-row">
               <label class="field style-artist-search-field">
-                <span>평가한 작가 검색</span>
-                <input id="styleArtistSearch" type="search" placeholder="작가 이름">
+                <span>추가할 작가</span>
+                <textarea id="styleArtistSearch" autocomplete="off" placeholder="작가 이름, 쉼표나 줄바꿈으로 여러 명"></textarea>
+                <div id="styleArtistAutocomplete" class="autocomplete hidden"></div>
               </label>
               <label class="field style-artist-select-field">
-                <span>작가 선택</span>
+                <span>저장된 작가 빠른 선택</span>
                 <select id="styleArtistSelect"></select>
+              </label>
+              <label class="field style-artist-small-field">
+                <span>위치</span>
+                <input id="styleArtistPosition" type="number" min="1" value="1">
+              </label>
+              <label class="field style-artist-small-field">
+                <span>가중치</span>
+                <input id="styleArtistWeight" type="number" min="0.01" step="0.01" value="1">
               </label>
               <button id="addStyleArtist" class="icon-button primary" type="button" title="작가 추가" aria-label="작가 추가">＋</button>
             </div>
+            <section id="latestStyleResult" class="latest-style-result" aria-live="polite">
+              <div class="latest-result-placeholder">최근 생성 결과가 여기에 표시됩니다.</div>
+            </section>
             <label class="field artist-prompt-field">
               <span>작가 프롬프트 미리보기</span>
               <textarea id="artistPromptPreview" readonly></textarea>
@@ -296,12 +323,37 @@
             <div class="style-pane-head"><h2>프롬프트와 생성</h2></div>
             <div class="generation-scroll">
               <div class="prompt-workspace">
-                <div class="prompt-tabs" role="tablist" aria-label="프롬프트 종류">
-                  <button id="basePromptTab" class="prompt-tab active" type="button" role="tab" aria-selected="true" aria-controls="basePromptPanel" data-prompt-tab="base">기본 프롬프트</button>
-                  <button id="negativePromptTab" class="prompt-tab" type="button" role="tab" aria-selected="false" aria-controls="negativePromptPanel" data-prompt-tab="negative" tabindex="-1">네거티브 프롬프트</button>
+                <section class="artist-prompt-token-section" aria-labelledby="artistPromptTokenTitle">
+                  <strong id="artistPromptTokenTitle">작가 태그</strong>
+                  <div id="artistPromptTokens" class="prompt-token-surface artist-prompt-token-surface" aria-label="작가 태그"></div>
+                </section>
+                <div class="prompt-tab-row">
+                  <div class="prompt-tabs" role="tablist" aria-label="프롬프트 종류">
+                    <button id="basePromptTab" class="prompt-tab active" type="button" role="tab" aria-selected="true" aria-controls="basePromptPanel" data-prompt-tab="base">퀄리티 프롬프트</button>
+                    <button id="negativePromptTab" class="prompt-tab" type="button" role="tab" aria-selected="false" aria-controls="negativePromptPanel" data-prompt-tab="negative" tabindex="-1">네거티브 프롬프트</button>
+                  </div>
+                  <button id="togglePromptView" class="prompt-view-toggle" type="button" aria-pressed="false">텍스트 편집</button>
                 </div>
+                <section class="prompt-preset-control" aria-labelledby="promptPresetTitle">
+                  <div class="prompt-preset-head">
+                    <strong id="promptPresetTitle">수집 그림체 프롬프트</strong>
+                    <select id="promptPresetMode" aria-label="수집 프롬프트 적용 방식">
+                      <option value="auto">자동 추천</option>
+                      <option value="fixed">수동 고정</option>
+                    </select>
+                  </div>
+                  <div class="prompt-preset-row">
+                    <select id="promptPresetSelect" aria-label="수집 프롬프트 세트"><option value="">수집 세트를 불러오는 중...</option></select>
+                    <button id="applyPromptPreset" type="button">적용</button>
+                  </div>
+                  <p id="promptPresetStatus" class="prompt-preset-status">자동 추천은 작가 구성이 바뀔 때 인물 태그를 뺀 포지티브와 네거티브를 갱신합니다.</p>
+                  <div id="excludedPromptTags" class="excluded-prompt-tags hidden">
+                    <span>인물·신체 태그 제외됨 · 누르면 복원</span>
+                    <div id="excludedPromptTagList" class="excluded-prompt-tag-list"></div>
+                  </div>
+                </section>
                 <label id="basePromptPanel" class="field prompt-editor" role="tabpanel" aria-labelledby="basePromptTab">
-                  <span>기본 프롬프트</span>
+                  <span>퀄리티 프롬프트 · 버튼을 누르면 제외 목록으로 이동</span>
                   <textarea id="basePrompt" placeholder="masterpiece, best quality"></textarea>
                   <div id="basePromptTokens" class="prompt-token-surface" data-prompt-field="base" aria-label="기본 프롬프트 토큰"></div>
                 </label>
@@ -330,7 +382,7 @@
                   <label class="parameter-row"><span>해상도</span><select id="generationResolutionPreset"><option value="832x1216" selected>832 × 1216</option><option value="1216x832">1216 × 832</option><option value="1024x1024">1024 × 1024</option><option value="custom">직접 입력</option></select></label>
                   <div class="parameter-row resolution-inputs"><span>직접 입력</span><input id="generationWidth" type="number" min="64" step="64" value="832" aria-label="너비"><input id="generationHeight" type="number" min="64" step="64" value="1216" aria-label="높이"></div>
                   <label class="parameter-row"><span>샘플러</span><select id="generationSampler"><option value="k_euler_ancestral">k_euler_ancestral</option><option value="k_dpmpp_2m">k_dpmpp_2m</option><option value="k_dpmpp_sde">k_dpmpp_sde</option></select></label>
-                  <label class="parameter-row"><span>스케줄러</span><select id="generationScheduler"><option value="native" selected>native</option><option value="karras">karras</option><option value="exponential">exponential</option><option value="polyexponential">polyexponential</option></select></label>
+                  <label class="parameter-row"><span>스케줄러</span><select id="generationScheduler"><option value="native">native</option><option value="karras" selected>karras</option><option value="exponential">exponential</option><option value="polyexponential">polyexponential</option></select></label>
                   <label class="parameter-row"><span>Steps</span><input id="generationSteps" type="number" min="1" max="50" value="28"></label>
                   <div class="parameter-row range-parameter"><span>CFG Scale</span><input id="generationScaleRange" type="range" min="0" max="10" step="0.1" value="5"><input id="generationScale" type="number" min="0" max="10" step="0.1" value="5"></div>
                   <div class="parameter-row range-parameter"><span>CFG Rescale</span><input id="generationCfgRescaleRange" type="range" min="0" max="1" step="0.01" value="0"><input id="generationCfgRescale" type="number" min="0" max="1" step="0.01" value="0"></div>
@@ -343,10 +395,15 @@
                   <select id="generationLimitMode"><option value="count">지정 장수</option><option value="unlimited">중지할 때까지</option></select>
                 </label>
                 <label class="field"><span>생성 장수</span><input id="generationCount" type="number" min="1" max="1000" value="10"></label>
-                <label class="field generation-wide">
-                  <span>매 장 그림체 변경</span>
-                  <select id="styleChangeMode"><option value="weights">가중치만 변경</option><option value="artists_and_weights">작가·가중치 모두 변경</option></select>
-                </label>
+                <fieldset class="style-fieldset generation-wide random-target-control">
+                  <legend>매 장 랜덤 변경 · 활성화된 항목만 변경</legend>
+                  <div id="styleRandomTargets" class="random-targets">
+                    <button type="button" data-random-target="artists" aria-pressed="false">작가</button>
+                    <button class="active" type="button" data-random-target="weights" aria-pressed="true">가중치</button>
+                    <button type="button" data-random-target="quality" aria-pressed="false">퀄리티 프롬</button>
+                    <button type="button" data-random-target="negative" aria-pressed="false">네거 프롬</button>
+                  </div>
+                </fieldset>
               </div>
               <div class="generation-actions">
                 <button id="generateOne" class="primary" type="button">1장 생성</button>
@@ -382,6 +439,11 @@
             <span id="arcaCollectionElapsed">경과 0초</span>
             <span id="arcaCollectionEta">남은 시간 계산 중</span>
           </div>
+          <div class="arca-collection-control-actions">
+            <button id="pauseArcaCollection" type="button" class="hidden">일시정지</button>
+            <button id="resumeArcaCollection" type="button" class="hidden">계속</button>
+            <button id="stopArcaCollection" type="button" class="hidden">완전 중지</button>
+          </div>
         </section>
         <aside class="arca-collector-panel panel">
           <h2>아카라이브 그림체 수집</h2>
@@ -392,15 +454,162 @@
           </section>
           <section class="arca-browser-session">
             <div><strong>🔞 게시판 로그인</strong><span id="arcaBrowserSessionState" class="status">브라우저 로그인 연결 안 됨</span></div>
-            <button id="importArcaBrowserSession" type="button">브라우저 로그인 가져오기</button>
+            <button id="importArcaBrowserSession" type="button">자동 연결 / 전용 로그인 창</button>
+            <details class="arca-session-bridge-setup">
+              <summary>지금 쓰는 Chrome 로그인 그대로 연결하기</summary>
+              <p class="notice">처음 한 번만 아래 확장을 등록하면, 현재 Chrome의 아카라이브 로그인만 로컬 앱에 전달할 수 있습니다.</p>
+              <ol>
+                <li>설치 폴더를 엽니다.</li>
+                <li>Chrome 주소창에 <code>chrome://extensions</code>를 입력하고 개발자 모드에서 <strong>압축해제된 확장 프로그램을 로드</strong>합니다.</li>
+                <li>열린 <code>arca_session_bridge</code> 폴더를 고른 뒤 확장 버튼에서 연결합니다.</li>
+              </ol>
+              <div class="arca-session-bridge-actions">
+                <button id="setupArcaSessionBridge" type="button">설치 폴더 열기</button>
+                <button id="refreshArcaBrowserSession" type="button">연결 상태 확인</button>
+              </div>
+              <p id="arcaSessionBridgeSetupStatus" class="status" aria-live="polite"></p>
+            </details>
           </section>
           <div class="check-row"><label><input id="arcaTabNai" type="checkbox" checked> NAI</label><label><input id="arcaTabR18Nai" type="checkbox" checked> 🔞 NAI</label></div>
           <label class="field"><span>시작일</span><input id="arcaStartDate" type="date"></label><label class="field"><span>종료일</span><input id="arcaEndDate" type="date"></label>
-          <div id="arcaSearchCoverage" class="status"></div><button id="collectArcaStyles" class="primary" type="button">수집 시작</button><button id="refreshArcaStyles" type="button">목록 새로고침</button><div id="arcaCollectorStatus" class="status"></div>
+          <div id="arcaSearchCoverage" class="status"></div><button id="collectArcaStyles" class="primary" type="button">수집 시작</button><button id="restoreArcaImages" type="button">이미지만 빠르게 받기</button><button id="refreshArcaStyles" type="button">목록 새로고침</button><div id="arcaCollectorStatus" class="status"></div>
         </aside>
-        <section class="arca-style-main"><section class="panel arca-style-filters"><label class="field"><span>목록 검색</span><input id="arcaStyleSearch" type="search" placeholder="제목, 프롬프트, 링크"></label><label class="field"><span>메타데이터</span><select id="arcaMetadataFilter"><option value="all">전체</option><option value="ok">추출 성공</option><option value="body_only">본문 추출</option><option value="no_metadata">없음</option><option value="error">오류</option></select></label><label class="field"><span>정렬</span><select id="arcaStyleSort"><option value="posted_desc" selected>최신순</option><option value="posted_asc">오래된순</option><option value="recommend_desc">추천순</option><option value="views_desc">조회순</option></select></label></section><div id="arcaStyleListStatus" class="status"></div><section id="arcaStyleList" class="arca-style-list arca-style-list-scroll"></section></section>
+        <section class="arca-style-main">
+          <section class="panel arca-style-filters">
+            <label class="field"><span>목록 검색</span><input id="arcaStyleSearch" type="search" placeholder="제목, 프롬프트, 링크"></label>
+            <label class="field"><span>메타데이터</span><select id="arcaMetadataFilter"><option value="all">전체</option><option value="ok">추출 성공</option><option value="body_only">본문 추출</option><option value="no_metadata">없음</option><option value="error">오류</option></select></label>
+            <label class="field"><span>최소 추천수</span><input id="arcaRecommendationMinList" type="number" min="0" step="1" placeholder="전체"></label>
+            <label class="field"><span>정렬</span><select id="arcaStyleSort"><option value="posted_desc" selected>최신순</option><option value="posted_asc">오래된순</option><option value="recommend_desc">추천순</option><option value="views_desc">조회순</option></select></label>
+            <label class="field"><span>페이지당</span><select id="arcaStylePageSize"><option value="20">20개</option><option value="50" selected>50개</option><option value="100">100개</option><option value="200">200개</option></select></label>
+            <label class="field"><span>카드 크기</span><select id="arcaStyleCardSize"><option value="small">소형</option><option value="medium" selected>보통</option><option value="large">대형</option></select></label>
+          </section>
+          <div id="arcaStyleListStatus" class="status"></div>
+          <section id="arcaStyleList" class="arca-style-list arca-style-list-scroll"></section>
+          <nav id="arcaStylePagination" class="arca-style-pagination" aria-label="공유 그림체 목록 페이지">
+            <button id="arcaStylePrevPage" type="button">이전</button>
+            <span id="arcaStylePageSummary">1 / 1 페이지</span>
+            <label><span>페이지</span><input id="arcaStylePageInput" type="number" min="1" value="1"></label>
+            <button id="arcaStyleGoPage" type="button">이동</button>
+            <button id="arcaStyleNextPage" type="button">다음</button>
+          </nav>
+        </section>
+      </section>
+      <section id="arca-style-statistics-tab" class="view arca-statistics-view">
+        <section class="panel arca-statistics-overview">
+          <div class="arca-statistics-head">
+            <div><h2>공유 그림체 프롬프트 분석</h2><p id="arcaStyleStatisticsSummary" class="arca-statistics-summary">저장된 이미지 프롬프트를 분석합니다.</p></div>
+            <button id="refreshArcaStatistics" type="button">통계 새로고침</button>
+          </div>
+          <div class="arca-recommendation-filter">
+            <label class="field"><span>추천수 빠른 선택</span><select id="arcaRecommendationPreset"><option value="all">전체</option><option value="10">10 이상</option><option value="30">30 이상</option><option value="50">50 이상</option><option value="100">100 이상</option><option value="custom">직접 입력</option></select></label>
+            <label class="field"><span>최소 추천수</span><input id="arcaRecommendationMin" type="number" min="0" step="1" placeholder="제한 없음"></label>
+            <label class="field"><span>최대 추천수</span><input id="arcaRecommendationMax" type="number" min="0" step="1" placeholder="제한 없음"></label>
+            <button id="applyArcaRecommendationFilter" type="button">추천수 적용</button>
+          </div>
+          <p id="arcaStatisticsScopeNote" class="notice"></p>
+          <div id="arcaStyleStatisticsStatus" class="status" role="status"></div>
+        </section>
+        <div class="arca-statistics-content">
+        <section class="panel arca-statistics-showcase">
+          <div class="arca-statistics-view-tabs" role="tablist" aria-label="분석 화면 선택">
+            <button type="button" class="active" data-arca-statistics-view="artist" role="tab" aria-selected="true">작가</button>
+            <button type="button" data-arca-statistics-view="quality" role="tab" aria-selected="false">퀄리티</button>
+            <button type="button" data-arca-statistics-view="sequence" role="tab" aria-selected="false">순서 조합</button>
+          </div>
+          <div class="arca-statistics-sample-head"><div><h3 id="arcaStatisticsSampleTitle">작가 대표 그림</h3><p class="arca-statistics-summary">현재 화면의 대표 그림을 무작위로 보여줍니다.</p></div><button id="shuffleArcaStatisticsImages" type="button">다른 그림 랜덤</button></div>
+          <div id="arcaStatisticsSampleGallery" class="arca-statistics-sample-gallery"></div>
+        </section>
+        <section id="arcaStyleStatistics" class="arca-statistics-browser" aria-busy="false">
+          <section id="arcaArtistStatisticsPanel" class="panel arca-statistics-table-panel arca-statistics-view-panel">
+            <div class="arca-statistics-section-head">
+              <div><h3>작가 태그 전체</h3><span id="arcaArtistStatisticsCount" class="arca-statistics-count"></span></div>
+              <div class="arca-statistics-controls">
+                <label class="field"><span>작가 검색</span><input id="arcaArtistStatisticsSearch" type="search" placeholder="artist:태그"></label>
+                <label class="field"><span>주 사용 구간</span><select id="arcaArtistWeightRange"><option value="">전체 구간</option></select></label>
+                <label class="field arca-statistics-page-size"><span>페이지당</span><select id="arcaArtistStatisticsPageSize"><option value="20">20개</option><option value="40" selected>40개</option><option value="80">80개</option></select></label>
+              </div>
+            </div>
+            <div class="arca-statistics-table-scroll">
+              <table class="arca-statistics-table"><thead><tr>
+                <th data-arca-stat-kind="artist" data-arca-sort-key="tag"><button class="arca-statistics-sort-button" type="button">작가 태그</button></th>
+                <th data-arca-stat-kind="artist" data-arca-sort-key="count" aria-sort="descending"><button class="arca-statistics-sort-button" type="button">이미지</button></th>
+                <th data-arca-stat-kind="artist" data-arca-sort-key="percentage"><button class="arca-statistics-sort-button" type="button">비율</button></th>
+                <th data-arca-stat-kind="artist" data-arca-sort-key="weight"><button class="arca-statistics-sort-button" type="button">평균 가중치</button></th>
+                <th data-arca-stat-kind="artist" data-arca-sort-key="range"><button class="arca-statistics-sort-button" type="button">주 사용 구간</button></th>
+                <th data-arca-stat-kind="artist" data-arca-sort-key="recommendation"><button class="arca-statistics-sort-button" type="button">평균 추천</button></th>
+                <th data-arca-stat-kind="artist" data-arca-sort-key="recommendation_max"><button class="arca-statistics-sort-button" type="button">최고 추천</button></th>
+              </tr></thead><tbody id="arcaArtistStatisticsRows"></tbody></table>
+            </div>
+            <div class="arca-statistics-pagination"><button id="arcaArtistStatisticsPrev" type="button">이전</button><span id="arcaArtistStatisticsPage">1 / 1 페이지</span><button id="arcaArtistStatisticsNext" type="button">다음</button></div>
+          </section>
+          <section id="arcaQualityStatisticsPanel" class="panel arca-statistics-table-panel arca-statistics-view-panel hidden">
+            <div class="arca-statistics-section-head">
+              <div><h3>퀄리티 태그</h3><span id="arcaQualityStatisticsCount" class="arca-statistics-count"></span></div>
+              <div class="arca-statistics-controls">
+                <label class="field"><span>퀄리티 검색</span><input id="arcaQualityStatisticsSearch" type="search" placeholder="masterpiece"></label>
+                <label class="field"><span>주 사용 구간</span><select id="arcaQualityWeightRange"><option value="">전체 구간</option></select></label>
+                <label class="field arca-statistics-page-size"><span>페이지당</span><select id="arcaQualityStatisticsPageSize"><option value="20">20개</option><option value="40" selected>40개</option><option value="80">80개</option></select></label>
+              </div>
+            </div>
+            <div class="arca-statistics-table-scroll">
+              <table class="arca-statistics-table"><thead><tr>
+                <th data-arca-stat-kind="quality" data-arca-sort-key="tag"><button class="arca-statistics-sort-button" type="button">퀄리티 태그</button></th>
+                <th data-arca-stat-kind="quality" data-arca-sort-key="count" aria-sort="descending"><button class="arca-statistics-sort-button" type="button">이미지</button></th>
+                <th data-arca-stat-kind="quality" data-arca-sort-key="percentage"><button class="arca-statistics-sort-button" type="button">비율</button></th>
+                <th data-arca-stat-kind="quality" data-arca-sort-key="weight"><button class="arca-statistics-sort-button" type="button">평균 가중치</button></th>
+                <th data-arca-stat-kind="quality" data-arca-sort-key="range"><button class="arca-statistics-sort-button" type="button">주 사용 구간</button></th>
+                <th data-arca-stat-kind="quality" data-arca-sort-key="recommendation"><button class="arca-statistics-sort-button" type="button">평균 추천</button></th>
+                <th data-arca-stat-kind="quality" data-arca-sort-key="recommendation_max"><button class="arca-statistics-sort-button" type="button">최고 추천</button></th>
+              </tr></thead><tbody id="arcaQualityStatisticsRows"></tbody></table>
+            </div>
+            <div class="arca-statistics-pagination"><button id="arcaQualityStatisticsPrev" type="button">이전</button><span id="arcaQualityStatisticsPage">1 / 1 페이지</span><button id="arcaQualityStatisticsNext" type="button">다음</button></div>
+          </section>
+          <section id="arcaSequenceStatisticsPanel" class="panel arca-quality-relations arca-statistics-view-panel hidden" aria-labelledby="arcaQualityRelationsTitle">
+            <div class="arca-statistics-section-head">
+              <div><h3 id="arcaQualityRelationsTitle">퀄리티 태그 순서 조합</h3><p class="arca-statistics-summary">같은 순서로 사용된 조합입니다. 조합을 누르면 해당 그림과 프롬프트를 볼 수 있습니다.</p></div>
+              <label class="field"><span>조합 정렬</span><select id="arcaSequenceStatisticsSort"><option value="count_desc">이미지 많은 순</option><option value="recommendation_desc">평균 추천 높은 순</option><option value="recommendation_max_desc">최고 추천 높은 순</option></select></label>
+            </div>
+            <div id="arcaQualitySequences" class="arca-quality-relation-panel">
+              <div class="arca-statistics-table-scroll"><table class="arca-statistics-table arca-sequence-table"><thead><tr><th>입력 순서가 같은 조합</th><th>이미지</th><th>비율</th><th>평균 추천</th><th>최고 추천</th></tr></thead><tbody id="arcaQualitySequenceRows"></tbody></table></div>
+            </div>
+          </section>
+        </section>
+        </div>
       </section>
     </main>
+
+    <div id="arcaTagStatisticsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="arcaTagStatisticsTitle">
+      <div class="modal-backdrop" data-close-arca-tag-statistics></div>
+      <section class="modal-dialog arca-tag-statistics-dialog">
+        <div class="modal-head"><div><h2 id="arcaTagStatisticsTitle">태그 상세</h2><p id="arcaTagStatisticsSummary" class="arca-statistics-summary"></p></div><button id="closeArcaTagStatistics" type="button">닫기</button></div>
+        <div id="arcaTagStatisticsStatus" class="status" role="status"></div>
+        <div class="arca-tag-statistics-scroll">
+          <section class="arca-tag-detail-panel">
+              <div class="arca-statistics-table-scroll arca-weight-table-scroll"><table class="arca-statistics-table arca-weight-statistics-table"><thead><tr><th>가중치 구간</th><th>사용 횟수</th><th>비율</th></tr></thead><tbody id="arcaTagWeightRows"></tbody></table></div>
+              <section id="arcaTagRelatedSection" class="arca-tag-related hidden"><h3 id="arcaTagRelatedTitle">함께 사용된 태그</h3><div id="arcaTagRelatedTags" class="arca-related-tags"></div></section>
+          </section>
+          <section class="arca-tag-detail-images"><h3>그림·프롬프트</h3><div id="arcaTagImageGallery" class="arca-tag-image-gallery"></div></section>
+        </div>
+      </section>
+    </div>
+
+    <div id="arcaSequenceModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="arcaSequenceTitle">
+      <div class="modal-backdrop" data-close-arca-sequence></div>
+      <section class="modal-dialog arca-sequence-dialog">
+        <div class="modal-head"><div><h2 id="arcaSequenceTitle">퀄리티 순서 조합</h2><p id="arcaSequenceSummary" class="arca-statistics-summary"></p></div><button id="closeArcaSequence" type="button">닫기</button></div>
+        <div id="arcaSequenceStatus" class="status" role="status"></div>
+        <div id="arcaSequenceImageGallery" class="arca-sequence-image-gallery"></div>
+      </section>
+    </div>
+
+    <div id="arcaTagImageModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="arcaTagImageTitle">
+      <div class="modal-backdrop" data-close-arca-tag-image></div>
+      <section class="modal-dialog arca-tag-image-dialog">
+        <div class="modal-head"><h2 id="arcaTagImageTitle">이미지 크게 보기</h2><button id="closeArcaTagImage" type="button">닫기</button></div>
+        <img id="arcaTagLargeImage" alt="선택한 공유 그림체 이미지">
+        <div class="arca-tag-image-actions"><div><p id="arcaTagImageCaption"></p><pre id="arcaTagImagePrompt" class="arca-image-prompt"></pre></div><a id="arcaTagImageSourceLink" class="arca-source-link" href="#" target="_blank" rel="noreferrer">그림체 사이트 이동</a></div>
+      </section>
+    </div>
 
     <div id="arcaStyleDialog" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="arcaStyleDialogTitle">
       <div class="modal-backdrop" data-close-arca-style></div>

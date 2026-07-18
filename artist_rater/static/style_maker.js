@@ -3,6 +3,10 @@ const styleState = {
   allowedScores: new Set([1, 2, 3, 4, 5]),
   customRanges: [],
   ratedArtists: [],
+  styleArtistAutocompleteItems: [],
+  styleArtistAutocompleteIndex: -1,
+  styleArtistAutocompleteTimer: null,
+  selectedFixedArtistNames: new Set(),
   initialized: false,
   draggingIndex: null,
   requestToken: 0,
@@ -16,6 +20,13 @@ const styleState = {
   managerImages: [],
   managerImageIndex: 0,
   promptGroups: [],
+  promptPresets: [],
+  promptPresetMode: "auto",
+  selectedPromptPresetKey: "",
+  promptPresetRequestToken: 0,
+  lastPromptPresetArtistSignature: "",
+  excludedPromptTags: [],
+  suppressAutomaticPromptPreset: false,
   weightProfile: [
     { position: 0, weight: 0.1 },
     { position: 1, weight: 2.3 },
@@ -23,6 +34,8 @@ const styleState = {
 };
 
 const PROMPT_STORAGE_KEY = "naiArtistRater.prompts.v1";
+const PROMPT_PRESET_STORAGE_KEY = "naiArtistRater.promptPreset.v1";
+const RANDOM_STYLE_TARGETS = ["artists", "weights", "quality", "negative"];
 
 const STYLE_REQUEST_CONTROL_IDS = [
   "rerollStyleArtists",
@@ -31,15 +44,13 @@ const STYLE_REQUEST_CONTROL_IDS = [
   "sortStyleAsc",
   "sortStyleDesc",
   "styleArtistCount",
+  "sharedStyleArtistMax",
   "styleScoreAll",
   "weightMode",
   "styleMinWeight",
   "styleMaxWeight",
   "preferHighScores",
   "addWeightRange",
-  "styleArtistSearch",
-  "styleArtistSelect",
-  "addStyleArtist",
 ];
 
 const CUSTOM_RANGE_FIELDS = [
@@ -106,8 +117,19 @@ function buildStyleRequestPayload(options, artists, reroll) {
 }
 
 function applyStyleRerollResult(currentArtists, incomingArtists, reroll, preserveOrder = false) {
-  if (reroll !== "all" || preserveOrder) return [...incomingArtists];
-  return sortArtistsByWeight(incomingArtists, "asc");
+  const fixedByArtist = new Map((currentArtists || [])
+    .map((item) => [item.artist, item.fixed === true ? { fixed: true, slot: item.slot } : { fixed: false }]));
+  const incomingNames = new Set((incomingArtists || []).map((item) => item.artist));
+  const fixedAdditions = (currentArtists || [])
+    .filter((item) => item.fixed === true && !incomingNames.has(item.artist))
+    .map((item) => ({ ...item }));
+  const merged = (incomingArtists || []).map((item) => {
+    const fixed = fixedByArtist.get(item.artist);
+    if (!fixed?.fixed) return { ...item };
+    return fixed.slot ? { ...item, fixed: true, slot: fixed.slot } : { ...item, fixed: true };
+  }).concat(fixedAdditions);
+  if (reroll !== "all" || preserveOrder) return merged;
+  return sortArtistsByWeight(merged, "asc");
 }
 
 function sortArtistsByWeight(artists, direction) {
@@ -171,6 +193,154 @@ function formatArtistPromptTag(artist) {
   return /\d$/.test(normalized) ? `${normalized} ` : normalized;
 }
 
+function parseStyleArtistNames(text) {
+  const names = [];
+  const seen = new Set();
+  String(text || "")
+    .split(/[,\n;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .forEach((artist) => {
+      if (seen.has(artist)) return;
+      names.push(artist);
+      seen.add(artist);
+    });
+  return names;
+}
+
+function insertStyleArtistsAtPosition(currentArtists, artistNames, options = {}) {
+  const current = Array.isArray(currentArtists) ? currentArtists : [];
+  const weight = Number(options.weight);
+  const normalizedWeight = Number.isFinite(weight) && weight > 0 ? Number(weight.toFixed(2)) : 1;
+  const requestedPosition = Number(options.position);
+  const slot = Number.isInteger(requestedPosition)
+    ? Math.max(1, requestedPosition)
+    : current.length + 1;
+  const remaining = current.map((item) => ({ ...item }));
+  const additions = [];
+  parseStyleArtistNames(artistNames.join("\n")).forEach((artist) => {
+    const existingIndex = remaining.findIndex((item) => item.artist === artist);
+    if (existingIndex >= 0) {
+      const [existing] = remaining.splice(existingIndex, 1);
+      if (existing.fixed === true) {
+        remaining.splice(existingIndex, 0, existing);
+        return;
+      }
+      additions.push({ ...existing, weight: normalizedWeight, fixed: true, slot });
+      return;
+    }
+    additions.push({ artist, weight: normalizedWeight, fixed: true, slot });
+  });
+  const insertAt = Number.isInteger(requestedPosition)
+    ? Math.min(remaining.length, Math.max(0, requestedPosition - 1))
+    : remaining.length;
+  return [
+    ...remaining.slice(0, insertAt),
+    ...additions,
+    ...remaining.slice(insertAt),
+  ];
+}
+
+function updateStyleArtistAtIndex(currentArtists, index, changes = {}) {
+  return (Array.isArray(currentArtists) ? currentArtists : []).map((item, itemIndex) => {
+    if (itemIndex !== index) return { ...item };
+    const next = { ...item };
+    if (Object.prototype.hasOwnProperty.call(changes, "artist")) {
+      const artist = String(changes.artist || "").trim();
+      if (artist) next.artist = artist;
+    }
+    if (Object.prototype.hasOwnProperty.call(changes, "weight")) {
+      const weight = Number(changes.weight);
+      if (Number.isFinite(weight) && weight > 0) next.weight = Number(weight.toFixed(2));
+    }
+    return next;
+  });
+}
+
+function normalizeFixedArtistSlot(item, fallbackSlot) {
+  const slot = Number(item?.slot);
+  return Number.isInteger(slot) && slot >= 1 ? slot : fallbackSlot;
+}
+
+function moveStyleArtistToPosition(currentArtists, sourceIndex, oneBasedPosition) {
+  const artists = Array.isArray(currentArtists) ? currentArtists : [];
+  if (!artists[sourceIndex]) return artists.map((item) => ({ ...item }));
+  const target = Math.min(artists.length - 1, Math.max(0, Math.trunc(Number(oneBasedPosition)) - 1));
+  return reorderArtists(artists, sourceIndex, target).map((item, index) => (
+    item.fixed === true && item.artist === artists[sourceIndex].artist
+      ? { ...item, slot: Math.trunc(Number(oneBasedPosition)) }
+      : { ...item }
+  ));
+}
+
+function graphInsertionPositionFromRatio(ratio, artistCount) {
+  const count = Math.max(1, Math.trunc(Number(artistCount)));
+  const normalized = Math.min(1, Math.max(0, Number(ratio)));
+  return Math.min(count, Math.max(1, Math.round(normalized * (count - 1)) + 1));
+}
+
+function moveSelectedArtistsToPosition(currentArtists, sourceIndexes, oneBasedInsertionPosition) {
+  const artists = Array.isArray(currentArtists) ? currentArtists : [];
+  const selected = Array.from(new Set(sourceIndexes.map(Number)))
+    .filter((index) => Number.isInteger(index) && artists[index])
+    .sort((a, b) => a - b);
+  if (!selected.length) return artists.map((item) => ({ ...item }));
+  const selectedSet = new Set(selected);
+  const insertBefore = Math.min(artists.length + 1, Math.max(1, Math.trunc(Number(oneBasedInsertionPosition))));
+  const slot = Math.min(artists.length + 1, Math.max(1, Math.trunc(Number(oneBasedInsertionPosition))));
+  const moved = selected.map((index) => (
+    artists[index]?.fixed === true ? { ...artists[index], slot } : { ...artists[index] }
+  ));
+  const remaining = artists
+    .filter((_, index) => !selectedSet.has(index))
+    .map((item) => ({ ...item }));
+  const removedBeforeTarget = selected.filter((index) => index < insertBefore - 1).length;
+  const insertAt = Math.min(remaining.length, Math.max(0, insertBefore - 1 - removedBeforeTarget));
+  return [
+    ...remaining.slice(0, insertAt),
+    ...moved,
+    ...remaining.slice(insertAt),
+  ];
+}
+
+function fixedStyleArtistEntries(artists) {
+  return (Array.isArray(artists) ? artists : [])
+    .map((artist, index) => ({ artist, index }))
+    .filter((entry) => entry.artist.fixed === true);
+}
+
+function fixedArtistSlotEntries(artists) {
+  const counters = new Map();
+  const fixed = fixedStyleArtistEntries(artists).map((entry) => {
+    const slot = normalizeFixedArtistSlot(entry.artist, entry.index + 1);
+    const stackIndex = counters.get(slot) || 0;
+    counters.set(slot, stackIndex + 1);
+    return { ...entry, slot, stackIndex };
+  });
+  const sizes = new Map();
+  fixed.forEach((entry) => sizes.set(entry.slot, (sizes.get(entry.slot) || 0) + 1));
+  return fixed.map((entry) => ({ ...entry, stackSize: sizes.get(entry.slot) || 1 }));
+}
+
+function chooseArtistsForPrompt(artists, randomFn = Math.random) {
+  const source = Array.isArray(artists) ? artists : [];
+  const fixedBySlot = new Map();
+  fixedArtistSlotEntries(source).forEach((entry) => {
+    if (!fixedBySlot.has(entry.slot)) fixedBySlot.set(entry.slot, []);
+    fixedBySlot.get(entry.slot).push(entry.artist);
+  });
+  const usedSlots = new Set();
+  return source.flatMap((item, index) => {
+    if (item.fixed !== true) return [{ ...item }];
+    const slot = normalizeFixedArtistSlot(item, index + 1);
+    if (usedSlots.has(slot)) return [];
+    usedSlots.add(slot);
+    const group = fixedBySlot.get(slot) || [item];
+    const chosenIndex = Math.min(group.length - 1, Math.max(0, Math.floor(randomFn() * group.length)));
+    return [{ ...group[chosenIndex] }];
+  });
+}
+
 function hasProfileDragMoved(startX, startY, currentX, currentY) {
   return Math.hypot(currentX - startX, currentY - startY) >= 3;
 }
@@ -184,6 +354,22 @@ function parsePromptTokens(text) {
 
 function normalizePromptToken(token) {
   return String(token || "").trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function appendUniquePromptToken(text, token) {
+  const prompt = String(token || "").trim();
+  const existing = parsePromptTokens(text);
+  if (!prompt || existing.some((item) => normalizePromptToken(item) === normalizePromptToken(prompt))) {
+    return existing.join(", ");
+  }
+  return [...existing, prompt].join(", ");
+}
+
+function removePromptToken(text, token) {
+  const target = normalizePromptToken(token);
+  return parsePromptTokens(text)
+    .filter((item) => normalizePromptToken(item) !== target)
+    .join(", ");
 }
 
 function promptGroupItemKey(item) {
@@ -216,7 +402,7 @@ function normalizePromptGroup(group, index = 0) {
   };
 }
 
-function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, characterPromptIds = [], promptGroups = []) {
+function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, characterPromptIds = [], promptGroups = [], generationSettings = {}) {
   const prompts = Array.isArray(characterPrompts)
     ? characterPrompts.map((value) => (typeof value === "string" ? value : ""))
     : [""];
@@ -227,6 +413,7 @@ function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, char
     character_prompts: prompts,
     character_prompt_ids: ids,
     prompt_groups: Array.isArray(promptGroups) ? promptGroups.map(normalizePromptGroup) : [],
+    generation_settings: generationSettings && typeof generationSettings === "object" ? { ...generationSettings } : {},
   };
 }
 
@@ -241,7 +428,53 @@ function normalizeStoredPrompts(value) {
     characters.length ? characters : [""],
     Array.isArray(value.character_prompt_ids) ? value.character_prompt_ids : [],
     Array.isArray(value.prompt_groups) ? value.prompt_groups : [],
+    value.generation_settings && typeof value.generation_settings === "object" ? value.generation_settings : {},
   );
+}
+
+function readGenerationSettings() {
+  return {
+    resolution_preset: styleElement("generationResolutionPreset")?.value || "832x1216",
+    width: Number(styleElement("generationWidth")?.value || 832),
+    height: Number(styleElement("generationHeight")?.value || 1216),
+    sampler: styleElement("generationSampler")?.value || "k_euler_ancestral",
+    scheduler: styleElement("generationScheduler")?.value || "karras",
+    steps: Number(styleElement("generationSteps")?.value || 28),
+    scale: Number(styleElement("generationScale")?.value || 5),
+    cfg_rescale: Number(styleElement("generationCfgRescale")?.value || 0),
+    seed: styleElement("generationSeed")?.value || "",
+    seed_fixed: Boolean(styleElement("generationSeedFixed")?.checked),
+    limit_mode: styleElement("generationLimitMode")?.value || "count",
+    generation_count: Number(styleElement("generationCount")?.value || 10),
+    shared_artist_max: Number(styleElement("sharedStyleArtistMax")?.value || 0),
+    random_targets: [...selectedRandomTargets()],
+  };
+}
+
+function applyGenerationSettings(settings = {}) {
+  const setValue = (id, value) => {
+    const element = styleElement(id);
+    if (element && value !== undefined && value !== null) element.value = String(value);
+  };
+  setValue("generationResolutionPreset", settings.resolution_preset);
+  setValue("generationWidth", settings.width);
+  setValue("generationHeight", settings.height);
+  setValue("generationSampler", settings.sampler);
+  setValue("generationScheduler", settings.scheduler || "karras");
+  setValue("generationSteps", settings.steps);
+  setValue("generationScale", settings.scale);
+  setValue("generationScaleRange", settings.scale);
+  setValue("generationCfgRescale", settings.cfg_rescale);
+  setValue("generationCfgRescaleRange", settings.cfg_rescale);
+  setValue("generationSeed", settings.seed);
+  setValue("generationLimitMode", settings.limit_mode);
+  setValue("generationCount", settings.generation_count);
+  setValue("sharedStyleArtistMax", settings.shared_artist_max);
+  setRandomTargets(settings.random_targets, settings.style_change_mode);
+  const fixed = styleElement("generationSeedFixed");
+  if (fixed && typeof settings.seed_fixed === "boolean") fixed.checked = settings.seed_fixed;
+  const count = styleElement("generationCount");
+  if (count) count.disabled = styleElement("generationLimitMode")?.value === "unlimited";
 }
 
 function addPromptGroupItem(group, item) {
@@ -304,6 +537,7 @@ function savePromptDraft() {
     characters,
     characterIds,
     styleState.promptGroups,
+    readGenerationSettings(),
   );
   try { localStorage.setItem(PROMPT_STORAGE_KEY, JSON.stringify(payload)); } catch (_) { /* Storage can be disabled. */ }
 }
@@ -312,6 +546,180 @@ function loadPromptDraft() {
   if (typeof localStorage === "undefined") return normalizeStoredPrompts(null);
   try { return normalizeStoredPrompts(JSON.parse(localStorage.getItem(PROMPT_STORAGE_KEY) || "null")); }
   catch (_) { return normalizeStoredPrompts(null); }
+}
+
+function savePromptPresetSettings() {
+  if (typeof localStorage === "undefined") return;
+  const payload = {
+    mode: styleState.promptPresetMode === "fixed" ? "fixed" : "auto",
+    selected_key: styleState.selectedPromptPresetKey || "",
+  };
+  try { localStorage.setItem(PROMPT_PRESET_STORAGE_KEY, JSON.stringify(payload)); } catch (_) { /* Storage can be disabled. */ }
+}
+
+function loadPromptPresetSettings() {
+  if (typeof localStorage === "undefined") return { mode: "auto", selected_key: "" };
+  try {
+    const value = JSON.parse(localStorage.getItem(PROMPT_PRESET_STORAGE_KEY) || "null");
+    return {
+      mode: value?.mode === "fixed" ? "fixed" : "auto",
+      selected_key: typeof value?.selected_key === "string" ? value.selected_key : "",
+    };
+  } catch (_) {
+    return { mode: "auto", selected_key: "" };
+  }
+}
+
+function setPromptPresetStatus(message, state = "") {
+  const status = styleElement("promptPresetStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.dataset.state = state;
+}
+
+function renderExcludedPromptTags() {
+  const container = styleElement("excludedPromptTags");
+  const list = styleElement("excludedPromptTagList");
+  if (!container || !list) return;
+  const tags = Array.isArray(styleState.excludedPromptTags) ? styleState.excludedPromptTags : [];
+  container.classList.toggle("hidden", tags.length === 0);
+  list.replaceChildren(...tags.map((item, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "excluded-prompt-tag";
+    button.textContent = `↩ ${item.prompt || item.tag}`;
+    button.title = "기본 프롬프트에 다시 넣기";
+    button.addEventListener("click", () => restoreExcludedPromptTag(index));
+    return button;
+  }));
+}
+
+function restoreExcludedPromptTag(index) {
+  const item = styleState.excludedPromptTags[index];
+  const prompt = String(item?.prompt || "").trim();
+  if (!prompt) return false;
+  const input = styleElement("basePrompt");
+  input.value = appendUniquePromptToken(input?.value, prompt);
+  styleState.excludedPromptTags.splice(index, 1);
+  fixPromptPresetAfterManualEdit();
+  persistAndRenderPromptControls();
+  renderExcludedPromptTags();
+  setPromptPresetStatus(`제외했던 ${item.tag || prompt} 태그를 복원하고 수동 고정했습니다.`, "ok");
+  return true;
+}
+
+function excludeBasePromptToken(token) {
+  const prompt = String(token || "").trim();
+  const input = styleElement("basePrompt");
+  if (!prompt || !input) return false;
+  const nextValue = removePromptToken(input.value, prompt);
+  if (nextValue === parsePromptTokens(input.value).join(", ")) return false;
+  input.value = nextValue;
+  if (!styleState.excludedPromptTags.some((item) => (
+    normalizePromptToken(item?.prompt) === normalizePromptToken(prompt)
+  ))) {
+    styleState.excludedPromptTags.push({ tag: prompt, prompt });
+  }
+  fixPromptPresetAfterManualEdit();
+  persistAndRenderPromptControls();
+  renderExcludedPromptTags();
+  setPromptPresetStatus(`${prompt} 태그를 제외 목록으로 옮겼습니다. 제외 목록에서 누르면 복원됩니다.`, "ok");
+  return true;
+}
+
+function renderPromptPresetOptions() {
+  const select = styleElement("promptPresetSelect");
+  if (!select) return;
+  select.replaceChildren();
+  if (!styleState.promptPresets.length) {
+    select.add(new Option("사용 가능한 수집 세트가 없습니다.", ""));
+    select.disabled = true;
+    const applyButton = styleElement("applyPromptPreset");
+    if (applyButton) applyButton.disabled = true;
+    return;
+  }
+  styleState.promptPresets.forEach((preset, index) => {
+    const match = preset.match_count ? ` · 작가 ${preset.match_count}명 일치` : "";
+    const sample = ` · 표본 ${preset.sample_count || 1}`;
+    select.add(new Option(`${index + 1}. ${preset.base_prompt || preset.quality_prompt}${match}${sample}`, preset.key));
+  });
+  const selectedExists = styleState.promptPresets.some((preset) => preset.key === styleState.selectedPromptPresetKey);
+  if (!selectedExists) styleState.selectedPromptPresetKey = styleState.promptPresets[0].key;
+  select.value = styleState.selectedPromptPresetKey;
+  select.disabled = false;
+  const applyButton = styleElement("applyPromptPreset");
+  if (applyButton) applyButton.disabled = false;
+}
+
+function applyPromptPreset(preset, { fixed = false } = {}) {
+  if (!preset) return false;
+  if (fixed) {
+    styleState.promptPresetMode = "fixed";
+    const mode = styleElement("promptPresetMode");
+    if (mode) mode.value = "fixed";
+  }
+  styleElement("basePrompt").value = preset.base_prompt || preset.quality_prompt || "";
+  styleElement("negativePrompt").value = preset.negative_prompt || "";
+  styleState.excludedPromptTags = Array.isArray(preset.excluded_tags)
+    ? preset.excluded_tags.map((item) => ({ tag: String(item?.tag || ""), prompt: String(item?.prompt || "") })).filter((item) => item.prompt)
+    : [];
+  styleState.selectedPromptPresetKey = preset.key || "";
+  const select = styleElement("promptPresetSelect");
+  if (select) select.value = styleState.selectedPromptPresetKey;
+  persistAndRenderPromptControls();
+  renderExcludedPromptTags();
+  savePromptPresetSettings();
+  const match = preset.match_count ? `선택 작가 ${preset.match_count}명과 일치` : "전체 수집본 기준";
+  const excluded = styleState.excludedPromptTags.length ? ` · 인물 태그 ${styleState.excludedPromptTags.length}개 제외` : "";
+  setPromptPresetStatus(`수집 포지티브와 네거티브 전체를 적용했습니다. (${match}${excluded})`, "ok");
+  return true;
+}
+
+async function loadPromptPresets({ force = false, applyAutomatic = true } = {}) {
+  if (!styleState.artists.length) return false;
+  const artists = chooseArtistsForPrompt(styleState.artists).map((item) => item.artist);
+  const signature = [...artists].sort().join("\n");
+  if (!force && signature === styleState.lastPromptPresetArtistSignature) return false;
+  styleState.lastPromptPresetArtistSignature = signature;
+  const token = ++styleState.promptPresetRequestToken;
+  setPromptPresetStatus("수집한 그림체에서 프롬프트 세트를 고르는 중입니다...");
+  try {
+    const result = await apiFetch("/api/style-maker/prompt-presets", {
+      method: "POST",
+      body: JSON.stringify({ artists, limit: 30 }),
+    });
+    if (token !== styleState.promptPresetRequestToken) return false;
+    styleState.promptPresets = Array.isArray(result.presets) ? result.presets : [];
+    renderPromptPresetOptions();
+    if (!styleState.promptPresets.length) {
+      styleState.excludedPromptTags = [];
+      renderExcludedPromptTags();
+      setPromptPresetStatus("네거티브까지 포함된 수집 프롬프트 세트가 없습니다.", "error");
+      return false;
+    }
+    if (styleState.promptPresetMode === "auto" && applyAutomatic) {
+      return applyPromptPreset(styleState.promptPresets[0]);
+    }
+    setPromptPresetStatus("세트를 고른 뒤 적용하면 현재 프롬프트로 고정됩니다.");
+    return true;
+  } catch (error) {
+    if (token === styleState.promptPresetRequestToken) setPromptPresetStatus(error.message, "error");
+    return false;
+  }
+}
+
+function refreshAutomaticPromptPreset() {
+  if (styleState.promptPresetMode !== "auto" || styleState.suppressAutomaticPromptPreset) return;
+  void loadPromptPresets();
+}
+
+function fixPromptPresetAfterManualEdit() {
+  if (styleState.promptPresetMode !== "auto") return;
+  styleState.promptPresetMode = "fixed";
+  const mode = styleElement("promptPresetMode");
+  if (mode) mode.value = "fixed";
+  savePromptPresetSettings();
+  setPromptPresetStatus("직접 수정한 프롬프트를 수동 고정했습니다.");
 }
 
 function isPromptItemDisabled(item) {
@@ -343,10 +751,19 @@ function renderPromptTokens(surface, text, field, characterId = "") {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = `prompt-token-chip ${field}${isPromptItemDisabled(item) ? " disabled-by-group" : ""}`;
-    chip.draggable = true;
+    chip.draggable = field !== "artist";
     chip.textContent = token;
-    chip.title = "그룹으로 드래그";
-    chip.addEventListener("dragstart", (event) => setPromptDragData(event, item));
+    if (field === "base") {
+      chip.title = "클릭해서 제외 목록으로 이동";
+      chip.addEventListener("click", () => excludeBasePromptToken(token));
+    } else if (field === "artist") {
+      chip.title = "작가 태그";
+    } else {
+      chip.title = "그룹으로 드래그";
+    }
+    if (field !== "artist") {
+      chip.addEventListener("dragstart", (event) => setPromptDragData(event, item));
+    }
     surface.append(chip);
   });
 }
@@ -380,6 +797,19 @@ function selectPromptTab(tabName) {
   });
   styleElement("basePromptPanel")?.classList.toggle("hidden", selected !== "base");
   styleElement("negativePromptPanel")?.classList.toggle("hidden", selected !== "negative");
+}
+
+function setPromptViewMode(mode) {
+  const textMode = mode === "text";
+  document.querySelector(".prompt-workspace")?.classList.toggle("prompt-text-mode", textMode);
+  const button = styleElement("togglePromptView");
+  if (button) {
+    button.dataset.mode = textMode ? "text" : "buttons";
+    button.setAttribute("aria-pressed", String(textMode));
+    button.textContent = textMode ? "버튼 보기" : "텍스트 편집";
+  }
+  if (!textMode) renderAllPromptTokens();
+  return textMode ? "text" : "buttons";
 }
 
 function addPromptGroup() {
@@ -537,7 +967,7 @@ function setStyleRequestPending(pending) {
     if (control) control.disabled = pending;
   });
   if (typeof document === "undefined") return;
-  document.querySelectorAll("#styleScoreButtons [data-score], #customRangeList input, #customRangeList button, #weightGraph input, #weightGraph select, #weightGraph button")
+  document.querySelectorAll("#styleScoreButtons [data-score], #customRangeList input, #customRangeList button, #weightGraph input, #weightGraph select, #weightGraph button, .weight-fixed-artist-card input, .weight-fixed-artist-card button")
     .forEach((control) => { control.disabled = pending; });
   document.querySelectorAll("#weightGraph .weight-column")
     .forEach((column) => { column.draggable = !pending; });
@@ -561,9 +991,13 @@ function readStyleOptions() {
   const count = Number(styleElement("styleArtistCount")?.value);
   const minWeight = Number(styleElement("styleMinWeight")?.value);
   const maxWeight = Number(styleElement("styleMaxWeight")?.value);
+  const sharedArtistMax = Number(styleElement("sharedStyleArtistMax")?.value || 0);
   if (!Number.isInteger(count) || count < 1) throw new Error("작가 수는 1 이상의 정수여야 합니다.");
   if (![minWeight, maxWeight].every(Number.isFinite) || minWeight <= 0 || minWeight > maxWeight) {
     throw new Error("전체 가중치 범위를 확인하세요.");
+  }
+  if (!Number.isInteger(sharedArtistMax) || sharedArtistMax < 0 || sharedArtistMax > 50) {
+    throw new Error("공유 그림체 작가 최대 인원은 0부터 50 사이의 정수여야 합니다.");
   }
 
   const mode = styleElement("weightMode")?.value || "balanced";
@@ -576,6 +1010,7 @@ function readStyleOptions() {
     prefer_high_scores: Boolean(styleElement("preferHighScores")?.checked),
     ranges: validateCustomRanges(),
     weight_profile: mode === "profile" ? styleState.weightProfile : undefined,
+    shared_artist_max: sharedArtistMax,
   };
 }
 
@@ -610,10 +1045,11 @@ async function loadStyleArtists(reroll = "all") {
 
 function updateArtistPrompt() {
   const preview = styleElement("artistPromptPreview");
-  if (!preview) return;
-  preview.value = styleState.artists
+  const prompt = chooseArtistsForPrompt(styleState.artists)
     .map((item) => `${formatStyleWeight(item.weight)}::artist:${formatArtistPromptTag(item.artist)}::`)
     .join(", ");
+  if (preview) preview.value = prompt;
+  renderPromptTokens(styleElement("artistPromptTokens"), prompt, "artist");
 }
 
 function renderWeightProfilePreview() {
@@ -776,9 +1212,10 @@ function renderWeightProfileGraph(graph) {
 }
 
 function removeStyleArtist(index) {
+  const removed = styleState.artists[index];
+  if (removed) styleState.selectedFixedArtistNames.delete(removed.artist);
   styleState.artists.splice(index, 1);
-  const count = styleElement("styleArtistCount");
-  if (count) count.value = String(Math.max(1, styleState.artists.length));
+  syncStyleArtistCountInputs();
   renderWeightGraph();
   renderRatedArtistSelect();
 }
@@ -794,16 +1231,334 @@ function sortStyleArtists(direction) {
   renderWeightGraph();
 }
 
+function syncStyleArtistCountInputs() {
+  if (styleElement("styleArtistCount")) {
+    styleElement("styleArtistCount").value = String(Math.max(1, styleState.artists.length));
+  }
+}
+
+function renderStyleArtistListTarget(list) {
+  list.replaceChildren();
+  const entries = fixedStyleArtistEntries(styleState.artists);
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.className = "style-artist-list-empty";
+    empty.textContent = "고정으로 추가한 작가가 없습니다.";
+    list.append(empty);
+    return;
+  }
+  entries.forEach(({ artist: item, index, slot, stackIndex }) => {
+    const row = document.createElement("div");
+    row.className = "style-artist-row";
+
+    const position = document.createElement("input");
+    position.type = "number";
+    position.min = "1";
+    position.max = String(styleState.artists.length + 1);
+    position.value = String(normalizeFixedArtistSlot(item, index + 1));
+    position.title = "순서";
+    position.setAttribute("aria-label", `${item.artist} 순서`);
+    position.addEventListener("change", () => {
+      styleState.artists = moveStyleArtistToPosition(styleState.artists, index, position.value);
+      renderWeightGraph();
+    });
+
+    const name = document.createElement("input");
+    name.type = "text";
+    name.value = item.artist;
+    name.title = "작가명";
+    name.setAttribute("aria-label", `${item.artist} 작가명`);
+    name.addEventListener("change", () => {
+      styleState.artists = updateStyleArtistAtIndex(styleState.artists, index, { artist: name.value });
+      renderWeightGraph();
+      renderRatedArtistSelect();
+    });
+
+    const weight = document.createElement("input");
+    weight.type = "number";
+    weight.min = String(styleNumber("styleMinWeight", 0.1));
+    weight.max = String(styleNumber("styleMaxWeight", 2.3));
+    weight.step = "0.01";
+    weight.value = Number(item.weight).toFixed(2);
+    weight.title = "가중치";
+    weight.setAttribute("aria-label", `${item.artist} 가중치`);
+    weight.addEventListener("change", () => {
+      const nextWeight = clampStyleWeight(weight.value);
+      styleState.artists = updateStyleArtistAtIndex(styleState.artists, index, { weight: nextWeight });
+      renderWeightGraph();
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-button danger-button";
+    remove.title = "작가 삭제";
+    remove.setAttribute("aria-label", `${item.artist} 삭제`);
+    remove.textContent = "×";
+    remove.addEventListener("click", () => removeStyleArtist(index));
+
+    row.append(position, name, weight, remove);
+    list.append(row);
+  });
+}
+
+function renderStyleArtistList() {
+  const list = styleElement("styleArtistList");
+  if (list) renderStyleArtistListTarget(list);
+}
+
+function fixedArtistOverlayCoordinates(indexOrSlot, weight, total, min, max) {
+  const slotInfo = typeof indexOrSlot === "object" && indexOrSlot !== null ? indexOrSlot : null;
+  const slotCount = Math.max(1, Math.trunc(Number(total)));
+  const slot = slotInfo ? Math.min(slotCount, normalizeFixedArtistSlot(slotInfo, 1)) : null;
+  const plotLeft = 58;
+  const plotRight = 24;
+  const plotWidth = 900 - plotLeft - plotRight;
+  const ratioX = slot
+    ? (plotLeft + (((slot - 1) / Math.max(1, slotCount - 1)) * plotWidth)) / 900
+    : (slotCount <= 1 ? 0.5 : indexOrSlot / (slotCount - 1));
+  const ratioY = max > min ? (clampStyleWeight(weight) - min) / (max - min) : 0.5;
+  const left = slot
+    ? Math.min(100, Math.max(0, Number((ratioX * 100).toFixed(2))))
+    : Math.min(92, Math.max(8, Number((ratioX * 100).toFixed(2))));
+  const baseBottom = ratioY * 68 + 8;
+  const stackIndex = slotInfo ? Number(slotInfo.stackIndex || 0) : 0;
+  const stackDirection = baseBottom < 42 ? 1 : -1;
+  const stackOffset = stackIndex * 13 * stackDirection;
+  const bottom = Math.min(82, Math.max(8, Number((baseBottom + stackOffset).toFixed(2))));
+  return {
+    left,
+    bottom,
+    xOffset: left <= 16 ? "0%" : (left >= 84 ? "-100%" : "-50%"),
+  };
+}
+
+function fixedArtistCardSpan(left) {
+  const width = 34;
+  if (left <= 16) return [left, left + width];
+  if (left >= 84) return [left - width, left];
+  return [left - (width / 2), left + (width / 2)];
+}
+
+function fixedArtistSpansOverlap(first, second) {
+  return first[0] < second[1] && second[0] < first[1];
+}
+
+function styleSlotCount() {
+  return Math.max(1, Math.trunc(styleNumber("styleArtistCount", Math.max(1, styleState.artists.length))));
+}
+
+function graphInsertionPositionForEvent(graph, event) {
+  const svg = graph.querySelector(".weight-profile-svg");
+  if (!svg) return graphInsertionPositionFromRatio(0, styleSlotCount());
+  const rect = svg.getBoundingClientRect();
+  const svgX = ((event.clientX - rect.left) / Math.max(1, rect.width)) * 900;
+  const plotRatio = (svgX - 58) / (900 - 58 - 24);
+  return graphInsertionPositionFromRatio(plotRatio, styleSlotCount());
+}
+
+function fixedArtistDropLinePercent(position, artistCount) {
+  return fixedArtistOverlayCoordinates({ slot: position, stackIndex: 0 }, 1, artistCount, 0, 2).left;
+}
+
+function fixedArtistGraphLeftPx(graph, leftPercent) {
+  const svg = graph.querySelector(".weight-profile-svg");
+  if (!svg) return null;
+  const graphRect = graph.getBoundingClientRect();
+  const svgRect = svg.getBoundingClientRect();
+  return Number((svgRect.left - graphRect.left + (svgRect.width * leftPercent / 100)).toFixed(2));
+}
+
+function updateFixedArtistDropIndicator(graph, event) {
+  const position = graphInsertionPositionForEvent(graph, event);
+  let indicator = graph.querySelector(".weight-fixed-drop-indicator");
+  if (!indicator) {
+    indicator = document.createElement("div");
+    indicator.className = "weight-fixed-drop-indicator";
+    const label = document.createElement("span");
+    indicator.append(label);
+    graph.append(indicator);
+  }
+  const leftPercent = fixedArtistDropLinePercent(position, styleSlotCount());
+  const leftPx = fixedArtistGraphLeftPx(graph, leftPercent);
+  indicator.style.left = leftPx === null ? `${leftPercent}%` : `${leftPx}px`;
+  indicator.querySelector("span").textContent = `${position}번 위치`;
+  indicator.classList.add("active");
+  return position;
+}
+
+function hideFixedArtistDropIndicator(graph) {
+  graph.querySelector(".weight-fixed-drop-indicator")?.classList.remove("active");
+}
+
+function fixedArtistDragIndexes(sourceIndex) {
+  const source = styleState.artists[sourceIndex];
+  if (!source) return [];
+  if (!styleState.selectedFixedArtistNames.has(source.artist)) return [sourceIndex];
+  const selected = fixedStyleArtistEntries(styleState.artists)
+    .filter(({ artist }) => styleState.selectedFixedArtistNames.has(artist.artist))
+    .map(({ index }) => index);
+  return selected.length ? selected : [sourceIndex];
+}
+
+function moveFixedArtistByGraphDrop(graph, event) {
+  if (![...event.dataTransfer.types].some((type) => type === "application/x-fixed-style-artist" || type === "application/x-fixed-style-artists")) return;
+  event.preventDefault();
+  hideFixedArtistDropIndicator(graph);
+  let sourceIndexes = [];
+  try {
+    sourceIndexes = JSON.parse(event.dataTransfer.getData("application/x-fixed-style-artists") || "[]");
+  } catch (_) {
+    sourceIndexes = [];
+  }
+  if (!sourceIndexes.length) sourceIndexes = [Number(event.dataTransfer.getData("application/x-fixed-style-artist"))];
+  const targetPosition = graphInsertionPositionForEvent(graph, event);
+  styleState.artists = moveSelectedArtistsToPosition(styleState.artists, sourceIndexes, targetPosition);
+  renderWeightGraph();
+}
+
+function renderWeightGraphFixedArtistOverlays(graph) {
+  const entries = fixedArtistSlotEntries(styleState.artists);
+  const fixedNames = new Set(entries.map(({ artist }) => artist.artist));
+  styleState.selectedFixedArtistNames.forEach((artist) => {
+    if (!fixedNames.has(artist)) styleState.selectedFixedArtistNames.delete(artist);
+  });
+  if (!entries.length) return;
+  const min = styleNumber("styleMinWeight", 0.1);
+  const max = styleNumber("styleMaxWeight", 2.3);
+  const slotCount = styleSlotCount();
+  graph.ondragover = (event) => {
+    if (![...event.dataTransfer.types].some((type) => type === "application/x-fixed-style-artist" || type === "application/x-fixed-style-artists")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    updateFixedArtistDropIndicator(graph, event);
+  };
+  graph.ondrop = (event) => moveFixedArtistByGraphDrop(graph, event);
+  graph.ondragleave = (event) => {
+    if (!graph.contains(event.relatedTarget)) hideFixedArtistDropIndicator(graph);
+  };
+
+  const occupiedLanes = [];
+  const overlayEntries = entries.map((entry) => {
+    const coordinates = fixedArtistOverlayCoordinates({ slot: entry.slot, stackIndex: 0 }, entry.artist.weight, slotCount, min, max);
+    const span = fixedArtistCardSpan(coordinates.left);
+    let laneIndex = occupiedLanes.findIndex((laneSpans) => laneSpans.every((usedSpan) => !fixedArtistSpansOverlap(usedSpan, span)));
+    if (laneIndex < 0) laneIndex = occupiedLanes.length;
+    if (!occupiedLanes[laneIndex]) occupiedLanes[laneIndex] = [];
+    occupiedLanes[laneIndex].push(span);
+    return { ...entry, visualStackIndex: Math.max(entry.stackIndex, laneIndex) };
+  });
+
+  overlayEntries.forEach(({ artist: item, index, slot, stackIndex, visualStackIndex }) => {
+    const card = document.createElement("article");
+    const { left, bottom, xOffset } = fixedArtistOverlayCoordinates({ slot, stackIndex: visualStackIndex ?? stackIndex }, item.weight, slotCount, min, max);
+    card.className = "weight-fixed-artist-card";
+    card.classList.toggle("selected", styleState.selectedFixedArtistNames.has(item.artist));
+    card.draggable = !styleState.pending;
+    card.dataset.index = String(index);
+    card.dataset.slot = String(slot);
+    const leftPx = fixedArtistGraphLeftPx(graph, left);
+    card.style.left = leftPx === null ? `${left}%` : `${leftPx}px`;
+    card.style.bottom = `${bottom}%`;
+    card.style.setProperty("--fixed-card-x-offset", xOffset);
+
+    const select = document.createElement("input");
+    select.type = "checkbox";
+    select.className = "weight-fixed-artist-select";
+    select.checked = styleState.selectedFixedArtistNames.has(item.artist);
+    select.title = "묶음 이동 선택";
+    select.setAttribute("aria-label", `${item.artist} 묶음 이동 선택`);
+    select.addEventListener("change", () => {
+      if (select.checked) styleState.selectedFixedArtistNames.add(item.artist);
+      else styleState.selectedFixedArtistNames.delete(item.artist);
+      renderWeightGraph();
+    });
+
+    const grip = document.createElement("span");
+    grip.className = "weight-fixed-artist-grip";
+    grip.textContent = `#${slot}`;
+    grip.title = "드래그해서 순서 변경";
+
+    const name = document.createElement("input");
+    name.type = "text";
+    name.value = item.artist;
+    name.title = "작가명";
+    name.setAttribute("aria-label", `${item.artist} 작가명`);
+    name.addEventListener("change", () => {
+      styleState.selectedFixedArtistNames.delete(item.artist);
+      if (name.value.trim()) styleState.selectedFixedArtistNames.add(name.value.trim());
+      styleState.artists = updateStyleArtistAtIndex(styleState.artists, index, { artist: name.value });
+      renderWeightGraph();
+      renderRatedArtistSelect();
+    });
+
+    const position = document.createElement("input");
+    position.type = "number";
+    position.min = "1";
+    position.max = String(styleState.artists.length + 1);
+    position.value = String(slot);
+    position.title = "순서";
+    position.setAttribute("aria-label", `${item.artist} 순서`);
+    position.addEventListener("change", () => {
+      styleState.artists = moveSelectedArtistsToPosition(styleState.artists, [index], position.value);
+      renderWeightGraph();
+    });
+
+    const weight = document.createElement("input");
+    weight.type = "number";
+    weight.min = String(min);
+    weight.max = String(max);
+    weight.step = "0.01";
+    weight.value = Number(item.weight).toFixed(2);
+    weight.title = "가중치";
+    weight.setAttribute("aria-label", `${item.artist} 가중치`);
+    weight.addEventListener("change", () => {
+      const nextWeight = clampStyleWeight(weight.value);
+      styleState.artists = updateStyleArtistAtIndex(styleState.artists, index, { weight: nextWeight });
+      renderWeightGraph();
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "icon-button small danger-button";
+    remove.title = "작가 삭제";
+    remove.setAttribute("aria-label", `${item.artist} 삭제`);
+    remove.textContent = "×";
+    remove.addEventListener("click", () => removeStyleArtist(index));
+
+    card.addEventListener("dragstart", (event) => {
+      if (event.target.closest("input, button") || styleState.pending) {
+        event.preventDefault();
+        return;
+      }
+      event.dataTransfer.effectAllowed = "move";
+      const indexes = fixedArtistDragIndexes(index);
+      event.dataTransfer.setData("application/x-fixed-style-artist", String(index));
+      event.dataTransfer.setData("application/x-fixed-style-artists", JSON.stringify(indexes));
+      card.classList.add("dragging");
+      card.dataset.dragCount = String(indexes.length);
+    });
+    card.addEventListener("dragend", () => {
+      card.classList.remove("dragging");
+      hideFixedArtistDropIndicator(graph);
+    });
+    card.append(select, grip, name, position, weight, remove);
+    graph.append(card);
+  });
+}
+
 function renderWeightGraph() {
   const graph = styleElement("weightGraph");
+  renderStyleArtistList();
   if (!graph) return;
   graph.replaceChildren();
   const profileMode = styleElement("weightMode")?.value === "profile";
   graph.classList.toggle("profile-mode", profileMode);
   if (profileMode) {
     renderWeightProfileGraph(graph);
+    renderWeightGraphFixedArtistOverlays(graph);
     renderWeightProfilePreview();
     updateArtistPrompt();
+    refreshAutomaticPromptPreset();
     return;
   }
   const min = styleNumber("styleMinWeight", 0.1);
@@ -856,7 +1611,7 @@ function renderWeightGraph() {
 
     const score = document.createElement("span");
     score.className = "weight-score";
-    score.textContent = `평점 ${item.score}`;
+    score.textContent = item.score ? `평점 ${item.score}` : `#${index + 1}`;
 
     const swap = document.createElement("select");
     swap.className = "weight-swap";
@@ -906,7 +1661,95 @@ function renderWeightGraph() {
     column.append(drag, slider, number, label, score, swap, remove);
     graph.append(column);
   });
+  renderWeightGraphFixedArtistOverlays(graph);
   updateArtistPrompt();
+  refreshAutomaticPromptPreset();
+}
+
+function currentStyleArtistFragment(value) {
+  return String(value || "").split(/[,\n;]+/).at(-1)?.trim() || "";
+}
+
+function replaceCurrentStyleArtistFragment(value, artist) {
+  const text = String(value || "");
+  const match = text.match(/^(.*?)([^,\n;]*)$/s);
+  const prefix = match?.[1] || "";
+  return `${prefix}${artist}`;
+}
+
+function hideStyleArtistAutocomplete() {
+  const box = styleElement("styleArtistAutocomplete");
+  box?.classList.add("hidden");
+  styleState.styleArtistAutocompleteItems = [];
+  styleState.styleArtistAutocompleteIndex = -1;
+}
+
+function setStyleArtistAutocompleteIndex(index) {
+  const box = styleElement("styleArtistAutocomplete");
+  if (!box || !styleState.styleArtistAutocompleteItems.length) return;
+  styleState.styleArtistAutocompleteIndex = (index + styleState.styleArtistAutocompleteItems.length) % styleState.styleArtistAutocompleteItems.length;
+  box.querySelectorAll("button").forEach((button, buttonIndex) => {
+    button.classList.toggle("active", buttonIndex === styleState.styleArtistAutocompleteIndex);
+  });
+}
+
+function applyStyleArtistAutocomplete(index = styleState.styleArtistAutocompleteIndex) {
+  const input = styleElement("styleArtistSearch");
+  const item = styleState.styleArtistAutocompleteItems[index];
+  if (!input || !item) return;
+  input.value = replaceCurrentStyleArtistFragment(input.value, item.name);
+  hideStyleArtistAutocomplete();
+  input.focus();
+  renderRatedArtistSelect();
+}
+
+async function updateStyleArtistAutocomplete() {
+  const input = styleElement("styleArtistSearch");
+  const box = styleElement("styleArtistAutocomplete");
+  if (!input || !box) return;
+  const query = currentStyleArtistFragment(input.value);
+  if (query.length < 2) {
+    hideStyleArtistAutocomplete();
+    return;
+  }
+  try {
+    const items = await apiFetch(`/api/tags/autocomplete?q=${encodeURIComponent(query)}&category=1`);
+    styleState.styleArtistAutocompleteItems = Array.isArray(items) ? items : [];
+    styleState.styleArtistAutocompleteIndex = -1;
+    box.replaceChildren();
+    styleState.styleArtistAutocompleteItems.forEach((item, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      const name = document.createElement("span");
+      name.textContent = item.name;
+      const count = document.createElement("span");
+      count.textContent = String(item.post_count || 0);
+      button.append(name, count);
+      button.addEventListener("mouseenter", () => setStyleArtistAutocompleteIndex(index));
+      button.addEventListener("click", () => applyStyleArtistAutocomplete(index));
+      box.append(button);
+    });
+    box.classList.toggle("hidden", !styleState.styleArtistAutocompleteItems.length);
+  } catch {
+    hideStyleArtistAutocomplete();
+  }
+}
+
+function handleStyleArtistAutocompleteKeydown(event) {
+  const box = styleElement("styleArtistAutocomplete");
+  if (!box || box.classList.contains("hidden") || !styleState.styleArtistAutocompleteItems.length) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setStyleArtistAutocompleteIndex(styleState.styleArtistAutocompleteIndex + 1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setStyleArtistAutocompleteIndex(styleState.styleArtistAutocompleteIndex <= 0 ? styleState.styleArtistAutocompleteItems.length - 1 : styleState.styleArtistAutocompleteIndex - 1);
+  } else if (event.key === "Enter" && styleState.styleArtistAutocompleteIndex >= 0) {
+    event.preventDefault();
+    applyStyleArtistAutocomplete();
+  } else if (event.key === "Escape") {
+    hideStyleArtistAutocomplete();
+  }
 }
 
 function filteredRatedArtists() {
@@ -928,13 +1771,25 @@ function renderRatedArtistSelect() {
 }
 
 function addStyleArtist() {
-  const artist = styleElement("styleArtistSelect")?.value;
-  const rated = styleState.ratedArtists.find((item) => item.artist === artist);
-  if (!rated || styleState.artists.some((item) => item.artist === artist)) return;
-  styleState.artists.push({ artist: rated.artist, score: rated.score, weight: clampStyleWeight(1) });
-  styleElement("styleArtistCount").value = String(styleState.artists.length);
+  const input = styleElement("styleArtistSearch");
+  const selectedArtist = styleElement("styleArtistSelect")?.value || "";
+  const names = parseStyleArtistNames(input?.value || selectedArtist);
+  if (!names.length && selectedArtist) names.push(selectedArtist);
+  if (!names.length) return;
+  const beforeFixedCount = fixedStyleArtistEntries(styleState.artists).length;
+  const position = Math.trunc(Number(styleElement("styleArtistPosition")?.value || styleState.artists.length + 1));
+  const weight = clampStyleWeight(styleElement("styleArtistWeight")?.value || 1);
+  styleState.artists = insertStyleArtistsAtPosition(styleState.artists, names, { position, weight });
+  const added = fixedStyleArtistEntries(styleState.artists).length - beforeFixedCount;
+  syncStyleArtistCountInputs();
+  if (input && added > 0) input.value = "";
+  hideStyleArtistAutocomplete();
   renderWeightGraph();
   renderRatedArtistSelect();
+  showStyleStatus(
+    added ? `${added}명의 작가를 추가했습니다.` : "이미 들어간 작가입니다.",
+    added ? "ok" : "",
+  );
 }
 
 async function loadRatedStyleArtists() {
@@ -1064,20 +1919,54 @@ function buildGenerationRequest(requestId = createRequestId()) {
   if (seedFixed && (!Number.isInteger(seed) || seed < 1 || seed > 4294967295)) throw new Error("고정 시드를 확인하세요.");
   const payload = {
     request_id: requestId,
-    artists: styleState.artists.map(({ artist, score, weight }) => ({ artist, score, weight })),
+    artists: chooseArtistsForPrompt(styleState.artists)
+      .map(({ artist, score, weight }) => ({ artist, score, weight })),
     base_prompt: buildEffectivePromptText(styleElement("basePrompt")?.value, "base", "", styleState.promptGroups),
     negative_prompt: buildEffectivePromptText(styleElement("negativePrompt")?.value, "negative", "", styleState.promptGroups),
     character_prompts: readCharacterPrompts(),
     width,
     height,
     sampler: styleElement("generationSampler")?.value || "k_euler_ancestral",
-    noise_schedule: styleElement("generationScheduler")?.value || "native",
+    noise_schedule: styleElement("generationScheduler")?.value || "karras",
     steps,
     scale,
     cfg_rescale: cfgRescale,
   };
   if (seedFixed) payload.seed = seed;
   return payload;
+}
+
+function normalizeRandomTargets(values, legacyMode = "weights") {
+  if (!Array.isArray(values)) {
+    return legacyMode === "artists_and_weights" ? ["artists", "weights"] : ["weights"];
+  }
+  return RANDOM_STYLE_TARGETS.filter((target) => values.includes(target));
+}
+
+function selectedRandomTargets() {
+  if (typeof document === "undefined") return new Set(["weights"]);
+  return new Set([...document.querySelectorAll("[data-random-target][aria-pressed='true']")]
+    .map((button) => button.dataset.randomTarget)
+    .filter((target) => RANDOM_STYLE_TARGETS.includes(target)));
+}
+
+function setRandomTargets(values, legacyMode = "weights") {
+  const selected = new Set(normalizeRandomTargets(values, legacyMode));
+  document.querySelectorAll("[data-random-target]").forEach((button) => {
+    const active = selected.has(button.dataset.randomTarget);
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  return selected;
+}
+
+function pickRandomPreset(presets, randomValue = Math.random()) {
+  const items = Array.isArray(presets) ? presets : [];
+  if (!items.length) return null;
+  const numeric = Number(randomValue);
+  const normalized = Number.isFinite(numeric) ? numeric : 0;
+  const index = Math.min(items.length - 1, Math.max(0, Math.floor(normalized * items.length)));
+  return items[index];
 }
 
 function setGenerationBusy(busy) {
@@ -1151,6 +2040,50 @@ function renderQueueState() {
   if (start) start.disabled = styleState.running || styleState.generating;
 }
 
+async function randomizePromptTargets(targets) {
+  if (!targets.has("quality") && !targets.has("negative")) return true;
+  await loadPromptPresets({ force: true, applyAutomatic: false });
+  if (!styleState.promptPresets.length) throw new Error("랜덤으로 사용할 수집 프롬프트가 없습니다.");
+  const qualityPreset = targets.has("quality") ? pickRandomPreset(styleState.promptPresets) : null;
+  const negativePreset = targets.has("negative") ? pickRandomPreset(styleState.promptPresets) : null;
+  if (qualityPreset) {
+    styleElement("basePrompt").value = qualityPreset.base_prompt || qualityPreset.quality_prompt || "";
+    styleState.excludedPromptTags = Array.isArray(qualityPreset.excluded_tags)
+      ? qualityPreset.excluded_tags.map((item) => ({ tag: String(item?.tag || ""), prompt: String(item?.prompt || "") })).filter((item) => item.prompt)
+      : [];
+    styleState.selectedPromptPresetKey = qualityPreset.key || "";
+  }
+  if (negativePreset) styleElement("negativePrompt").value = negativePreset.negative_prompt || "";
+  persistAndRenderPromptControls();
+  renderExcludedPromptTags();
+  return true;
+}
+
+async function randomizeSelectedStyleParts() {
+  const targets = selectedRandomTargets();
+  const artists = targets.has("artists");
+  const weights = targets.has("weights");
+  if (artists || weights) {
+    const reroll = artists ? (weights ? "all" : "artists") : "weights";
+    styleState.suppressAutomaticPromptPreset = true;
+    let rerolled;
+    try {
+      rerolled = await loadStyleArtists(reroll);
+    } finally {
+      styleState.suppressAutomaticPromptPreset = false;
+    }
+    if (!rerolled) throw new Error("그림체를 다시 구성하지 못했습니다.");
+  }
+  await randomizePromptTargets(targets);
+  return true;
+}
+
+async function generateOneRandomizedStyle() {
+  if (styleState.running || styleState.generating) return null;
+  await randomizeSelectedStyleParts();
+  return generateCurrentStyle();
+}
+
 async function runContinuousGeneration() {
   if (styleState.running || styleState.generating) return;
   styleState.running = true;
@@ -1162,9 +2095,7 @@ async function runContinuousGeneration() {
     while (!styleState.stopRequested && !reachedGenerationLimit()) {
       while (styleState.paused && !styleState.stopRequested) await wait(150);
       if (styleState.stopRequested) break;
-      const changeMode = styleElement("styleChangeMode")?.value || "weights";
-      const rerolled = await loadStyleArtists(changeMode === "artists_and_weights" ? "all" : "weights");
-      if (!rerolled) throw new Error("그림체를 다시 구성하지 못했습니다.");
+      await randomizeSelectedStyleParts();
       await generateCurrentStyle();
       styleState.completed += 1;
       renderQueueState();
@@ -1426,7 +2357,16 @@ function initializeStyleMaker() {
   styleElement("rerollStyleAll")?.addEventListener("click", () => loadStyleArtists("all"));
   styleElement("sortStyleAsc")?.addEventListener("click", () => sortStyleArtists("asc"));
   styleElement("sortStyleDesc")?.addEventListener("click", () => sortStyleArtists("desc"));
-  styleElement("styleArtistSearch")?.addEventListener("input", renderRatedArtistSelect);
+  styleElement("styleArtistSearch")?.addEventListener("input", () => {
+    renderRatedArtistSelect();
+    clearTimeout(styleState.styleArtistAutocompleteTimer);
+    styleState.styleArtistAutocompleteTimer = setTimeout(updateStyleArtistAutocomplete, 220);
+  });
+  styleElement("styleArtistSearch")?.addEventListener("keydown", handleStyleArtistAutocompleteKeydown);
+  styleElement("styleArtistSelect")?.addEventListener("change", (event) => {
+    const input = styleElement("styleArtistSearch");
+    if (input && event.target.value) input.value = event.target.value;
+  });
   styleElement("addStyleArtist")?.addEventListener("click", addStyleArtist);
   styleElement("addCharacterPrompt")?.addEventListener("click", () => {
     addCharacterPrompt();
@@ -1443,7 +2383,26 @@ function initializeStyleMaker() {
       styleElement(next === "base" ? "basePromptTab" : "negativePromptTab")?.focus();
     });
   });
-  ["basePrompt", "negativePrompt"].forEach((id) => styleElement(id)?.addEventListener("input", persistAndRenderPromptControls));
+  styleElement("togglePromptView")?.addEventListener("click", (event) => {
+    setPromptViewMode(event.currentTarget.dataset.mode === "text" ? "buttons" : "text");
+  });
+  ["basePrompt", "negativePrompt"].forEach((id) => styleElement(id)?.addEventListener("input", () => {
+    fixPromptPresetAfterManualEdit();
+    persistAndRenderPromptControls();
+  }));
+  styleElement("promptPresetMode")?.addEventListener("change", (event) => {
+    styleState.promptPresetMode = event.target.value === "fixed" ? "fixed" : "auto";
+    savePromptPresetSettings();
+    void loadPromptPresets({ force: true, applyAutomatic: styleState.promptPresetMode === "auto" });
+  });
+  styleElement("promptPresetSelect")?.addEventListener("change", (event) => {
+    styleState.selectedPromptPresetKey = event.target.value;
+    savePromptPresetSettings();
+  });
+  styleElement("applyPromptPreset")?.addEventListener("click", () => {
+    const key = styleElement("promptPresetSelect")?.value;
+    applyPromptPreset(styleState.promptPresets.find((preset) => preset.key === key), { fixed: true });
+  });
   styleElement("toggleGenerationParameters")?.addEventListener("click", () => {
     const panel = styleElement("generationParameters");
     const button = styleElement("toggleGenerationParameters");
@@ -1454,18 +2413,20 @@ function initializeStyleMaker() {
     }
   });
   styleElement("generationResolutionPreset")?.addEventListener("change", (event) => {
-    if (event.target.value === "custom") return;
-    const [width, height] = event.target.value.split("x");
-    styleElement("generationWidth").value = width;
-    styleElement("generationHeight").value = height;
+    if (event.target.value !== "custom") {
+      const [width, height] = event.target.value.split("x");
+      styleElement("generationWidth").value = width;
+      styleElement("generationHeight").value = height;
+    }
+    savePromptDraft();
   });
   [["generationScaleRange", "generationScale"], ["generationCfgRescaleRange", "generationCfgRescale"]].forEach(([rangeId, numberId]) => {
     const range = styleElement(rangeId);
     const number = styleElement(numberId);
-    range?.addEventListener("input", () => { number.value = range.value; });
-    number?.addEventListener("input", () => { range.value = number.value; });
+    range?.addEventListener("input", () => { number.value = range.value; savePromptDraft(); });
+    number?.addEventListener("input", () => { range.value = number.value; savePromptDraft(); });
   });
-  styleElement("generateOne")?.addEventListener("click", () => generateCurrentStyle().catch(() => {}));
+  styleElement("generateOne")?.addEventListener("click", () => generateOneRandomizedStyle().catch(() => {}));
   styleElement("startContinuous")?.addEventListener("click", runContinuousGeneration);
   styleElement("pauseContinuous")?.addEventListener("click", () => {
     styleState.paused = !styleState.paused;
@@ -1479,18 +2440,44 @@ function initializeStyleMaker() {
   styleElement("generationLimitMode")?.addEventListener("change", (event) => {
     const count = styleElement("generationCount");
     if (count) count.disabled = event.target.value === "unlimited";
+    savePromptDraft();
   });
+  document.querySelectorAll("[data-random-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const active = button.getAttribute("aria-pressed") !== "true";
+      button.classList.toggle("active", active);
+      button.setAttribute("aria-pressed", String(active));
+      savePromptDraft();
+    });
+  });
+  [
+    "generationWidth",
+    "generationHeight",
+    "generationSampler",
+    "generationScheduler",
+    "generationSteps",
+    "generationSeed",
+    "generationSeedFixed",
+    "generationCount",
+    "sharedStyleArtistMax",
+  ].forEach((id) => styleElement(id)?.addEventListener("change", savePromptDraft));
   ["styleMinWeight", "styleMaxWeight"].forEach((id) => styleElement(id)?.addEventListener("change", renderWeightGraph));
   styleElement("openWeightGraph")?.addEventListener("click", openWeightGraphModal);
   styleElement("closeWeightGraph")?.addEventListener("click", closeWeightGraphModal);
   document.querySelectorAll("[data-close-weight-graph]").forEach((item) => item.addEventListener("click", closeWeightGraphModal));
 
   const storedPrompts = loadPromptDraft();
+  const storedPreset = loadPromptPresetSettings();
+  styleState.promptPresetMode = storedPreset.mode;
+  styleState.selectedPromptPresetKey = storedPreset.selected_key;
+  styleElement("promptPresetMode").value = styleState.promptPresetMode;
   styleState.promptGroups = storedPrompts.prompt_groups;
+  applyGenerationSettings(storedPrompts.generation_settings);
   styleElement("basePrompt").value = storedPrompts.base_prompt;
   styleElement("negativePrompt").value = storedPrompts.negative_prompt;
   storedPrompts.character_prompts.forEach((value, index) => addCharacterPrompt(value, storedPrompts.character_prompt_ids[index]));
   styleState.promptGroups = cleanPromptGroups(styleState.promptGroups, storedPrompts);
+  setPromptViewMode("buttons");
   renderAllPromptTokens();
   renderPromptGroups();
   addWeightRange();
@@ -1532,9 +2519,12 @@ if (typeof document !== "undefined") {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    STYLE_REQUEST_CONTROL_IDS,
     CUSTOM_RANGE_FIELDS,
     applyStyleRerollResult,
     buildStyleRequestPayload,
+    normalizeRandomTargets,
+    pickRandomPreset,
     normalizeSelectedScores,
     reorderArtists,
     runLatestStyleRequest,
@@ -1542,10 +2532,22 @@ if (typeof module !== "undefined" && module.exports) {
     validateCustomRangeValues,
     interpolateWeightProfile,
     formatArtistPromptTag,
+    parseStyleArtistNames,
+    insertStyleArtistsAtPosition,
+    updateStyleArtistAtIndex,
+    moveStyleArtistToPosition,
+    fixedStyleArtistEntries,
+    fixedArtistSlotEntries,
+    chooseArtistsForPrompt,
+    fixedArtistOverlayCoordinates,
+    graphInsertionPositionFromRatio,
+    moveSelectedArtistsToPosition,
     hasProfileDragMoved,
     normalizeStoredPrompts,
     promptStoragePayload,
     parsePromptTokens,
+    appendUniquePromptToken,
+    removePromptToken,
     addPromptGroupItem,
     cleanPromptGroups,
     buildEffectivePromptText,

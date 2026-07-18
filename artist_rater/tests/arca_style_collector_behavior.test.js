@@ -9,7 +9,58 @@ const {
   arcaBrowserSessionText,
   isArcaBrowserSessionPending,
   arcaListQuery,
+  formatArcaLocalDate,
+  fillMissingArcaDates,
+  arcaBrowserSessionAction,
+  isArcaCollectionBusy,
+  shouldRefreshArcaBrowserSession,
+  arcaCoverageQuery,
+  arcaCoverageText,
+  normalizeArcaStatisticRows,
+  arcaStatisticsSummary,
+  arcaStatisticEntryText,
+  formatArcaWeight,
+  filterArcaStatisticRows,
+  filterAndSortArcaStatisticRows,
+  paginateArcaStatisticRows,
+  arcaTagDetailQuery,
+  arcaSequenceDetailQuery,
+  arcaStatisticsQuery,
+  arcaRecommendationPreset,
+  randomArcaStatisticsSamples,
+  formatArcaRecommendation,
 } = require("../static/arca_style_collector.js");
+
+test("empty collection dates default to the local calendar day", () => {
+  const localDate = new Date(2026, 0, 2, 23, 59, 59);
+  assert.equal(formatArcaLocalDate(localDate), "2026-01-02");
+  assert.deepEqual(fillMissingArcaDates({ start_date: "", end_date: "" }, "2026-01-02"), {
+    start_date: "2026-01-02",
+    end_date: "2026-01-02",
+  });
+  assert.deepEqual(fillMissingArcaDates({ start_date: "2025-12-30", end_date: "" }, "2026-01-02"), {
+    start_date: "2025-12-30",
+    end_date: "2026-01-02",
+  });
+});
+
+test("browser login transition resumes one pending collection and clears failures", () => {
+  assert.equal(arcaBrowserSessionAction({ state: "opening" }, true), "poll");
+  assert.equal(arcaBrowserSessionAction({ state: "waiting" }, true), "poll");
+  assert.equal(arcaBrowserSessionAction({ connected: true }, true), "resume");
+  assert.equal(arcaBrowserSessionAction({ connected: true }, false), "settled");
+  assert.equal(arcaBrowserSessionAction({ state: "failed" }, true), "clear");
+  assert.equal(arcaBrowserSessionAction({ state: "cancelled" }, true), "clear");
+  assert.equal(isArcaCollectionBusy({ collecting: false, pendingCollectionPayload: { tabs: ["R18_NAI"] } }), true);
+  assert.equal(isArcaCollectionBusy({ collecting: true, pendingCollectionPayload: null }), true);
+  assert.equal(isArcaCollectionBusy({ collecting: false, pendingCollectionPayload: null }), false);
+});
+
+test("browser session refreshes when the app becomes visible again", () => {
+  assert.equal(shouldRefreshArcaBrowserSession("focus", "visible"), true);
+  assert.equal(shouldRefreshArcaBrowserSession("visibilitychange", "visible"), true);
+  assert.equal(shouldRefreshArcaBrowserSession("visibilitychange", "hidden"), false);
+});
 
 test("collection payload normalizes checked tabs and limits", () => {
   assert.deepEqual(normalizeArcaPayload({ keyword: " x ", tabs: ["NAI"], start_date: "2026-01-01", end_date: "2026-01-02", max_pages: "5", max_posts: "80" }), {
@@ -17,9 +68,103 @@ test("collection payload normalizes checked tabs and limits", () => {
   });
 });
 
-test("list query uses Arca post date sort", () => {
-  assert.equal(arcaListQuery({ q: "x", metadata: "all", sort: "posted_asc" }).get("sort"), "posted_asc");
-  assert.equal(arcaListQuery({}).get("sort"), "posted_desc");
+test("list query keeps paging size and minimum recommendations", () => {
+  const query = arcaListQuery({ q: "x", metadata: "all", sort: "posted_asc", page: 3, per_page: 20, recommendation_min: 10 });
+  assert.equal(query.get("sort"), "posted_asc");
+  assert.equal(query.get("page"), "3");
+  assert.equal(query.get("per_page"), "20");
+  assert.equal(query.get("recommendation_min"), "10");
+  assert.equal(arcaListQuery({}).toString(), "q=&metadata=all&sort=posted_desc&page=1&per_page=50");
+});
+
+test("coverage query keeps repeated tabs and explains completed ranges", () => {
+  const query = arcaCoverageQuery({
+    tabs: ["NAI", "R18_NAI"], start_date: "2026-07-01", end_date: "2026-07-12",
+    max_pages: 5, max_posts: 80,
+  });
+  assert.deepEqual(query.getAll("tabs"), ["NAI", "R18_NAI"]);
+  assert.equal(query.get("start_date"), "2026-07-01");
+  assert.equal(arcaCoverageText({ coverage: [] }), "이 조건으로 완료한 수집 기록이 없습니다.");
+  assert.equal(arcaCoverageText({ coverage: [
+    { start_date: "2026-07-01", end_date: "2026-07-03" },
+    { start_date: "2026-07-12", end_date: "2026-07-12" },
+  ] }), "완료한 범위: 2026-07-01 ~ 2026-07-03, 2026-07-12");
+});
+
+test("statistics helpers keep every valid artist and describe their sources", () => {
+  const rows = normalizeArcaStatisticRows([
+    { tag: "artist:foo", count: "8", percentage: "40" },
+    { tag: "", count: 99, percentage: 99 },
+    ...Array.from({ length: 10 }, (_value, index) => ({ tag: `tag-${index}`, count: index + 1, percentage: index + 0.25 })),
+  ]);
+  assert.equal(rows.length, 11);
+  assert.deepEqual(rows[0], {
+    tag: "artist:foo", count: 8, percentage: 40,
+    average_weight: null, median_weight: null, max_weight: null, dominant_weight_range: "",
+    representative_image: null,
+    average_recommendations: null, median_recommendations: null, max_recommendations: null,
+  });
+  assert.equal(rows[rows.length - 1].tag, "tag-9");
+  assert.equal(filterArcaStatisticRows(rows, "TAG-2")[0].tag, "tag-2");
+  assert.equal(formatArcaWeight(1.23456), "1.235");
+  assert.equal(arcaTagDetailQuery("artist", "artist:foo", 12).toString(), "kind=artist&tag=artist%3Afoo&limit=12");
+  assert.equal(
+    arcaTagDetailQuery("artist", "artist:foo", 12, { recommendation_min: 30 }).get("recommendation_min"),
+    "30",
+  );
+  assert.equal(arcaStatisticsSummary({ analyzed_image_count: 12, analyzed_post_count: 4 }), "이미지 프롬프트 12개 · 게시글 4개 분석");
+  assert.equal(arcaStatisticsSummary({ analyzed_image_count: 0, analyzed_post_count: 0 }), "집계할 이미지 프롬프트가 없습니다.");
+  assert.equal(arcaStatisticEntryText({ count: 3, percentage: 12.5 }), "이미지 3개 · 12.5%");
+});
+
+test("statistics can filter dominant ranges and sort weights", () => {
+  const entries = [
+    { tag: "artist:low", count: 10, average_weight: 0.8, dominant_weight_range: "0.80–0.99" },
+    { tag: "artist:high", count: 2, average_weight: 1.8, dominant_weight_range: "1.50–1.99" },
+    { tag: "artist:mid", count: 5, average_weight: 1.1, dominant_weight_range: "1.01–1.19" },
+  ];
+  assert.deepEqual(
+    filterAndSortArcaStatisticRows(entries, { range: "1.50–1.99", sort: "range_desc" }).map((entry) => entry.tag),
+    ["artist:high"],
+  );
+  assert.deepEqual(
+    filterAndSortArcaStatisticRows(entries, { sort: "weight_desc" }).map((entry) => entry.tag),
+    ["artist:high", "artist:mid", "artist:low"],
+  );
+  assert.deepEqual(
+    filterAndSortArcaStatisticRows(entries, { sort: "tag_desc" }).map((entry) => entry.tag),
+    ["artist:mid", "artist:low", "artist:high"],
+  );
+  assert.deepEqual(paginateArcaStatisticRows(entries, 2, 2), {
+    rows: [entries[2]], page: 2, perPage: 2, total: 3, totalPages: 2,
+  });
+});
+
+test("statistics recommendation filters and sorting keep direct ranges", () => {
+  assert.equal(arcaStatisticsQuery({ recommendation_min: 30, recommendation_max: 100 }).toString(), "recommendation_min=30&recommendation_max=100");
+  assert.deepEqual(arcaRecommendationPreset("50"), { recommendation_min: "50", recommendation_max: "" });
+  assert.deepEqual(arcaRecommendationPreset("all"), { recommendation_min: "", recommendation_max: "" });
+  assert.equal(formatArcaRecommendation(12.34), "12.3");
+  const rows = filterAndSortArcaStatisticRows([
+    { tag: "artist:common", count: 20, average_recommendations: 10 },
+    { tag: "artist:popular", count: 2, average_recommendations: 80 },
+  ], { sort: "recommendation_desc" });
+  assert.deepEqual(rows.map((entry) => entry.tag), ["artist:popular", "artist:common"]);
+});
+
+test("quality sequence detail query preserves tag order", () => {
+  const query = arcaSequenceDetailQuery(["masterpiece", "best quality"], 30);
+  assert.deepEqual(query.getAll("tag"), ["masterpiece", "best quality"]);
+  assert.equal(query.get("limit"), "30");
+});
+
+test("random statistics samples only return entries with representative images", () => {
+  const entries = [
+    { tag: "a", representative_image: { image_url: "/a.png" } },
+    { tag: "missing" },
+    { tag: "b", representative_image: { image_url: "/b.png" } },
+  ];
+  assert.deepEqual(randomArcaStatisticsSamples(entries, 1, () => 0).map((entry) => entry.tag), ["b"]);
 });
 
 test("browser session status is readable without exposing details", () => {
@@ -56,11 +201,12 @@ test("direct URL payload trims one article link", () => {
 
 test("summary explains when an existing search was skipped", () => {
   assert.equal(arcaSummaryText({ skipped_existing: true }), "이미 검색한 범위입니다. 저장된 목록을 표시합니다.");
+  assert.equal(arcaSummaryText({ error: "partial collection" }), "partial collection");
 });
 
-test("collection payload keeps fixed search and hidden safety limits", () => {
+test("collection payload keeps fixed search without page or post limits", () => {
   assert.deepEqual(normalizeArcaPayload({ tabs: ["NAI"], start_date: "2026-01-01", end_date: "2026-01-02" }), {
-    keyword: "그림체 공유", tabs: ["NAI"], start_date: "2026-01-01", end_date: "2026-01-02", max_pages: 5, max_posts: 80,
+    keyword: "그림체 공유", tabs: ["NAI"], start_date: "2026-01-01", end_date: "2026-01-02", max_pages: 0, max_posts: 0,
   });
 });
 
@@ -72,6 +218,8 @@ test("collection progress handles known and unknown totals", () => {
   assert.equal(collectionCountsText({ progress: { pages: [1, 5], posts: [2, 8], images: 4 } }), "페이지 1/5 · 게시글 2/8 · 이미지 4개");
   assert.deepEqual(collectionProgress({ status: "completed", skipped_existing: 1, progress: { posts: [0, null] } }), { determinate: true, percent: 100 });
   assert.equal(collectionCountsText({ status: "completed", skipped_existing: 1 }), "이미 수집한 기간 · 새 요청 없음");
+  assert.equal(collectionCountsText({ job_type: "image_restore", progress: { posts: [12, 30], images: 10 } }), "이미지 확인 12/30 · 복원 10개");
+  assert.equal(arcaSummaryText({ job_type: "image_restore", downloaded_images: 30 }), "이미지 30개를 복원했습니다.");
 });
 
 test("style group helpers separate prompt sections", () => {

@@ -230,6 +230,22 @@ class StyleApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {"configured": False})
 
+    @patch("app.get_style_maker_prompt_presets")
+    def test_style_maker_prompt_presets_use_selected_artists(self, get_presets):
+        get_presets.return_value = {
+            "presets": [{"key": "preset", "quality_prompt": "masterpiece", "negative_prompt": "lowres"}],
+            "selected_artist_count": 1,
+        }
+
+        response = self.client.post(
+            "/api/style-maker/prompt-presets",
+            json={"artists": ["alpha"], "limit": 12},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        get_presets.assert_called_once_with(app.DB_PATH, ["alpha"], 12)
+
     def test_put_requires_json_object_and_rejects_malformed_keys(self):
         invalid_requests = (
             {"data": json.dumps({"app_key": SECRET_KEY}), "content_type": "text/plain"},
@@ -783,24 +799,19 @@ class GenerationApiTest(StyleApiTest):
         self.assertEqual(generate.call_count, 3)
 
     @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
-    def test_generation_rejects_unknown_or_mismatched_rating(self, generate):
+    def test_generation_accepts_unrated_artists_without_scores(self, generate):
         self.save_key()
-        cases = (
-            self.request_payload(
-                request_id="unknown-artist",
-                artists=[{"artist": "missing", "score": 5, "weight": 1.0}],
-            ),
-            self.request_payload(
-                request_id="wrong-score",
-                artists=[{"artist": "artist_a", "score": 1, "weight": 1.0}],
-            ),
+        payload = self.request_payload(
+            request_id="unrated-artist",
+            artists=[{"artist": "missing", "weight": 1.0}],
         )
 
-        for payload in cases:
-            with self.subTest(payload=payload):
-                response = self.client.post("/api/style-maker/generate", json=payload)
-                self.assertEqual(response.status_code, 400)
-        generate.assert_not_called()
+        response = self.client.post("/api/style-maker/generate", json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        detail = self.client.get(f"/api/art-styles/{response.get_json()['style_id']}").get_json()
+        self.assertEqual(detail["artists"], [{"artist": "missing", "weight": 1.0}])
+        generate.assert_called_once()
 
     @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
     def test_style_identity_ignores_base_prompt_but_tracks_artist_order_and_weight(self, generate):
@@ -1002,7 +1013,7 @@ class NovelAISubscriptionTest(unittest.TestCase):
         result = test_novelai_subscription(SECRET_KEY, opener=opener)
         self.assertEqual(result, {"anlas": 154})
         request = opener.call_args.args[0]
-        self.assertEqual(request.full_url, "https://api.novelai.net/user/subscription")
+        self.assertEqual(request.full_url, "https://image.novelai.net/user/subscription")
         self.assertEqual(request.get_method(), "GET")
         self.assertEqual(
             request.unredirected_hdrs["Authorization"], f"Bearer {SECRET_KEY}"
