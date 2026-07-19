@@ -2,9 +2,26 @@ import hashlib
 import json
 import math
 import random
+import re
 
 
 SCORE_SELECTION_WEIGHT = {1: 0.08, 2: 0.2, 3: 0.55, 4: 1.0, 5: 1.6}
+_WEIGHTED_PROMPT_GROUP = re.compile(r"([+-]?\d+(?:\.\d+)?)::([\s\S]*?)::")
+_UNWEIGHTED_ARTIST_CLOSER = re.compile(r"(artist\s*:[^,\n]*?\d)\s*::", re.I)
+
+
+def normalize_numeric_prompt_closers(prompt):
+    """Keep numeric weight openers intact and space numeric tag endings before ``::``."""
+    text = str(prompt or "")
+
+    def normalize_group(match):
+        body = match.group(2).rstrip()
+        if body[-1:].isdigit():
+            body += " "
+        return f"{match.group(1)}::{body}::"
+
+    text = _WEIGHTED_PROMPT_GROUP.sub(normalize_group, text)
+    return _UNWEIGHTED_ARTIST_CLOSER.sub(lambda match: f"{match.group(1)} ::", text)
 
 
 def _integer_value(value, error_message):
@@ -370,7 +387,7 @@ def build_artist_prompt(artists):
         if artist[-1:].isdigit():
             artist += " "
         prompts.append(f'{format_weight(item["weight"])}::artist:{artist}::')
-    return ", ".join(prompts)
+    return normalize_numeric_prompt_closers(", ".join(prompts))
 
 
 def style_hash(artists):

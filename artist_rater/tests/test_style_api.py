@@ -361,6 +361,25 @@ class NovelAIGenerationTest(unittest.TestCase):
         self.assertEqual(combine_base_prompt("", "artist"), "artist")
         self.assertEqual(combine_base_prompt("", ""), "")
 
+    def test_generation_normalizes_numeric_tag_closers(self):
+        from novelai import build_generation_payload
+
+        payload = build_generation_payload(
+            self.generation_data(
+                base_prompt="2::year 2025::",
+                negative_prompt="-2::bad 3::",
+                character_prompts=["1.2::character 2::"],
+            ),
+            "1.5::artist:matrix16::",
+            42,
+        )
+        self.assertEqual(payload["input"], "1.5::artist:matrix16 ::, 2::year 2025 ::")
+        self.assertEqual(payload["parameters"]["negative_prompt"], "-2::bad 3 ::")
+        self.assertEqual(
+            payload["parameters"]["v4_prompt"]["caption"]["char_captions"][0]["char_caption"],
+            "1.2::character 2 ::",
+        )
+
     def test_build_generation_payload_is_exact_v45_structure(self):
         from novelai import MODEL, build_generation_payload
 
@@ -386,11 +405,28 @@ class NovelAIGenerationTest(unittest.TestCase):
                     "params_version": 3,
                     "legacy": False,
                     "legacy_v3_extend": False,
-                    "add_original_image": True,
+                    "add_original_image": False,
+                    "ucPreset": 0,
+                    "qualityToggle": False,
                     "prefer_brownian": True,
-                    "use_coords": False,
+                    "controlnet_strength": 1.0,
+                    "dynamic_thresholding": False,
+                    "sm": False,
+                    "sm_dyn": False,
+                    "deliberate_euler_ancestral_bug": False,
+                    "reference_image_multiple": [],
+                    "reference_information_extracted_multiple": [],
+                    "reference_strength_multiple": [],
                     "v4_negative_prompt": {
-                        "caption": {"base_caption": "lowres", "char_captions": []},
+                        "caption": {
+                            "base_caption": "lowres",
+                            "char_captions": [
+                                {"char_caption": "lowres", "centers": [{"x": 0.5, "y": 0.5}]},
+                                {"char_caption": "lowres", "centers": [{"x": 0.5, "y": 0.5}]},
+                            ],
+                        },
+                        "use_coords": False,
+                        "use_order": False,
                         "legacy_uc": False,
                     },
                     "v4_prompt": {
@@ -403,6 +439,7 @@ class NovelAIGenerationTest(unittest.TestCase):
                         },
                         "use_coords": False,
                         "use_order": True,
+                        "legacy_uc": False,
                     },
                 },
             },
@@ -433,6 +470,7 @@ class NovelAIGenerationTest(unittest.TestCase):
         self.assertEqual(request.full_url, GENERATION_URL)
         self.assertEqual(request.get_method(), "POST")
         self.assertEqual(request.headers["Content-type"], "application/json")
+        self.assertRegex(request.headers["X-correlation-id"], r"^[A-Za-z0-9]{6}$")
         self.assertEqual(request.unredirected_hdrs["Authorization"], f"Bearer {SECRET_KEY}")
         self.assertEqual(json.loads(request.data)["parameters"]["seed"], 123)
 
@@ -537,6 +575,22 @@ class NovelAIGenerationTest(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertNotIn(SECRET_KEY, str(raised.exception))
         self.assertTrue(body.closed)
+
+    def test_generation_reports_sanitized_upstream_json_reason(self):
+        from novelai import NovelAIError, generate_novelai_png
+
+        body = io.BytesIO(json.dumps({"message": f"invalid sampler {SECRET_KEY}"}).encode())
+        error = urllib.error.HTTPError("url", 500, "failure", {}, body)
+        with self.assertRaises(NovelAIError) as raised:
+            generate_novelai_png(
+                SECRET_KEY,
+                self.generation_data(seed=1),
+                "artist",
+                opener=Mock(side_effect=error),
+            )
+        self.assertIn("invalid sampler", raised.exception.public_message)
+        self.assertRegex(raised.exception.public_message, r"요청 ID [A-Za-z0-9]{6}")
+        self.assertNotIn(SECRET_KEY, raised.exception.public_message)
 
 
 class GenerationApiTest(StyleApiTest):
@@ -1179,6 +1233,327 @@ class NovelAISubscriptionTest(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.status, 502)
                 self.assertNotIn(SECRET_KEY, str(raised.exception))
+
+
+class ConfirmedStyleApiTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.temp_dir.name)
+        self.originals = (
+            app.DATA_DIR,
+            app.THUMBNAIL_DIR,
+            app.GENERATED_DIR,
+            app.SETTINGS_JSON_PATH,
+            app.DB_PATH,
+            app.CONFIRMED_STYLE_IMAGE_DIR,
+            app.COMPARISON_IMAGE_DIR,
+            app.ARCA_STYLE_IMAGE_DIR,
+            app.ARCA_STYLE_SEED_PATH,
+        )
+        app.DATA_DIR = self.tmp
+        app.THUMBNAIL_DIR = self.tmp / "thumbnails"
+        app.GENERATED_DIR = self.tmp / "generated"
+        app.SETTINGS_JSON_PATH = self.tmp / "settings.json"
+        app.DB_PATH = self.tmp / "artist_rater.sqlite"
+        app.CONFIRMED_STYLE_IMAGE_DIR = self.tmp / "confirmed_style_images"
+        app.COMPARISON_IMAGE_DIR = self.tmp / "comparison_images"
+        app.ARCA_STYLE_IMAGE_DIR = self.tmp / "arca_style_images"
+        app.ARCA_STYLE_SEED_PATH = self.tmp / "missing-seed.sqlite"
+        app.init_db()
+        self.client = app.app.test_client()
+
+    def tearDown(self):
+        (
+            app.DATA_DIR,
+            app.THUMBNAIL_DIR,
+            app.GENERATED_DIR,
+            app.SETTINGS_JSON_PATH,
+            app.DB_PATH,
+            app.CONFIRMED_STYLE_IMAGE_DIR,
+            app.COMPARISON_IMAGE_DIR,
+            app.ARCA_STYLE_IMAGE_DIR,
+            app.ARCA_STYLE_SEED_PATH,
+        ) = self.originals
+        self.temp_dir.cleanup()
+
+    @patch("app.generate_novelai_png")
+    def test_comparison_deferred_generation_reports_each_result_and_replaces_it(self, generate):
+        style = app.create_confirmed_style(
+            app.DB_PATH,
+            app.CONFIRMED_STYLE_IMAGE_DIR,
+            valid_png(64, 64),
+            {
+                "name": "비교 스타일",
+                "artist_prompt": "1.5::artist:matrix16::",
+                "quality_prompt": "best quality",
+                "negative_prompt": "lowres",
+                "sampler": "k_euler_ancestral",
+                "noise_schedule": "karras",
+                "steps": 28,
+                "scale": 5.0,
+                "cfg_rescale": 0.2,
+                "model": "nai-diffusion-4-5-full",
+            },
+        )
+        self.client.put("/api/settings/novelai", json={"app_key": SECRET_KEY})
+        prepared = self.client.post("/api/comparisons", json={
+            "name": "진행 비교군",
+            "style_ids": [style["id"]],
+            "fixed_prompt": "white sheet",
+            "character_prompts": ["1girl"],
+            "width": 64,
+            "height": 64,
+            "seed_mode": "none",
+            "defaults": {},
+            "defer_generation": True,
+        })
+        self.assertEqual(prepared.status_code, 201)
+        prepared_data = prepared.get_json()
+        self.assertEqual(prepared_data["pending_style_ids"], [style["id"]])
+        self.assertEqual(prepared_data["generated_count"], 0)
+        self.assertEqual(prepared_data["total_count"], 1)
+
+        generate.side_effect = [(valid_png(64, 64), 101), (valid_png(64, 64), 202)]
+        endpoint = f"/api/comparisons/{prepared_data['id']}/styles/{style['id']}/generate"
+        first = self.client.post(endpoint, json={})
+        second = self.client.post(endpoint, json={})
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        groups = self.client.get("/api/comparisons").get_json()
+        self.assertEqual(groups[0]["selected_style_ids"], [style["id"]])
+        self.assertEqual(len(groups[0]["results"]), 1)
+        self.assertEqual(groups[0]["results"][0]["settings"]["seed"], 202)
+        self.assertEqual(groups[0]["results"][0]["settings"]["artist_prompt"], "1.5::artist:matrix16 ::")
+        self.assertEqual(len(list(app.COMPARISON_IMAGE_DIR.iterdir())), 1)
+
+    @staticmethod
+    def metadata_png():
+        from PIL import Image, PngImagePlugin
+
+        output = io.BytesIO()
+        png_info = PngImagePlugin.PngInfo()
+        png_info.add_text("Software", "NovelAI")
+        png_info.add_text("Source", "NovelAI Diffusion V4.5")
+        png_info.add_text("Comment", json.dumps({
+            "prompt": "1.2::artist:test artist::, very aesthetic",
+            "uc": "lowres",
+            "sampler": "k_euler_ancestral",
+            "noise_schedule": "karras",
+            "steps": 28,
+            "scale": 5.0,
+            "cfg_rescale": 0.2,
+            "seed": 123,
+            "width": 32,
+            "height": 48,
+            "skip_cfg_above_sigma": 59.04722600415217,
+        }))
+        Image.new("RGB", (32, 48), "white").save(output, format="PNG", pnginfo=png_info)
+        return output.getvalue()
+
+    def test_manual_image_extract_create_update_and_delete(self):
+        image_bytes = self.metadata_png()
+        extracted = self.client.post(
+            "/api/confirmed-styles/extract",
+            data={"image": (io.BytesIO(image_bytes), "style.png")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(extracted.status_code, 200)
+        metadata = extracted.get_json()
+        self.assertEqual(metadata["metadata_status"], "ok")
+        self.assertIn("artist:test artist", metadata["artist_prompt"])
+        self.assertTrue(metadata["variety_plus"])
+        self.assertEqual(metadata["model"], "NovelAI Diffusion V4.5")
+
+        created = self.client.post(
+            "/api/confirmed-styles",
+            data={
+                "image": (io.BytesIO(image_bytes), "style.png"),
+                "data": json.dumps({"name": "직접 그림체", "description": "메모"}, ensure_ascii=False),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(created.status_code, 201)
+        item = created.get_json()
+        self.assertEqual(item["name"], "직접 그림체")
+        self.assertTrue((app.CONFIRMED_STYLE_IMAGE_DIR / item["image_path"]).is_file())
+
+        updated = self.client.patch(f"/api/confirmed-styles/{item['id']}", json={"description": "수정한 설명"})
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.get_json()["description"], "수정한 설명")
+        self.assertEqual(self.client.delete(f"/api/confirmed-styles/{item['id']}").status_code, 200)
+        self.assertFalse((app.CONFIRMED_STYLE_IMAGE_DIR / item["image_path"]).exists())
+
+    def test_generated_results_are_individual_cards_and_copy_to_confirmed(self):
+        common = {
+            "db_path": app.DB_PATH,
+            "generated_dir": app.GENERATED_DIR,
+            "artists": [{"artist": "same_artist", "weight": 1.0}],
+            "png_bytes": valid_png(64, 64),
+            "base_prompt": "very aesthetic, white sheet",
+            "quality_prompt": "very aesthetic",
+            "original_quality_prompt": "very aesthetic, masterpiece",
+            "excluded_quality_tags": ["masterpiece"],
+            "fixed_prompt": "white sheet",
+            "negative_prompt": "lowres",
+            "character_prompts": [],
+            "combined_prompt": "artist:same artist, very aesthetic, white sheet",
+            "seed": 123,
+            "width": 64,
+            "height": 64,
+            "sampler": "k_euler_ancestral",
+            "noise_schedule": "karras",
+            "steps": 28,
+            "scale": 5.0,
+            "cfg_rescale": 0.2,
+            "variety_plus": True,
+            "skip_cfg_above_sigma": 59.04722600415217,
+            "model": "nai-diffusion-4-5-full",
+        }
+        first = style_store.save_generated_result(request_id="individual-1", **common)
+        style_store.save_generated_result(request_id="individual-2", **common)
+        generated = self.client.get("/api/style-manager/generated").get_json()
+        self.assertEqual(len(generated), 2)
+        self.assertEqual({item["style_id"] for item in generated}, {first["style_id"]})
+        self.assertTrue(all(item["image_url"].startswith("/generated/") for item in generated))
+        self.assertTrue(all(item["sampler"] == "k_euler_ancestral" for item in generated))
+        self.assertTrue(all(item["noise_schedule"] == "karras" for item in generated))
+        self.assertTrue(all(item["steps"] == 28 for item in generated))
+
+        confirmed = self.client.post(
+            "/api/confirmed-styles",
+            json={"source_type": "generated", "source_id": first["image_id"], "name": "확정본"},
+        )
+        self.assertEqual(confirmed.status_code, 201)
+        confirmed_item = confirmed.get_json()
+        self.assertEqual(confirmed_item["excluded_quality_tags"], ["masterpiece"])
+        self.assertEqual(confirmed_item["sampler"], "k_euler_ancestral")
+        self.assertEqual(confirmed_item["noise_schedule"], "karras")
+        self.assertEqual(confirmed_item["steps"], 28)
+        self.assertEqual(confirmed_item["scale"], 5.0)
+        self.assertEqual(confirmed_item["cfg_rescale"], 0.2)
+        self.assertTrue(confirmed_item["image_url"].startswith("/confirmed-style-images/"))
+        self.assertEqual(len(self.client.get("/api/style-manager/generated").get_json()), 2)
+
+    def test_shared_gallery_flattens_images_from_the_same_post(self):
+        app.ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        (app.ARCA_STYLE_IMAGE_DIR / "one.png").write_bytes(valid_png(64, 64))
+        (app.ARCA_STYLE_IMAGE_DIR / "two.png").write_bytes(valid_png(64, 64))
+        with closing(app.db()) as connection, connection:
+            item_id = connection.execute(
+                "INSERT INTO arca_style_items(source_url,title,collected_at,updated_at) VALUES(?,?,?,?)",
+                ("https://arca.live/b/aiart/1", "공유글", app.now_text(), app.now_text()),
+            ).lastrowid
+            connection.executemany(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?)",
+                [
+                    (item_id, "https://image/one", "one.png", "artist:first", "artist:first", app.now_text()),
+                    (item_id, "https://image/two", "two.png", "artist:second", "artist:second", app.now_text()),
+                    (item_id, "https://image/missing", "missing.png", "artist:missing", "artist:missing", app.now_text()),
+                    (item_id, "https://image/remote-only", "", "artist:remote", "artist:remote", app.now_text()),
+                ],
+            )
+        response = self.client.get("/api/style-manager/shared?offset=0&limit=60")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["total"], 2)
+        self.assertEqual(len(data["items"]), 2)
+        self.assertTrue(all(item["title"] == "공유글" for item in data["items"]))
+        self.assertEqual({item["image_path"] for item in data["items"]}, {"one.png", "two.png"})
+        page_one = self.client.get("/api/style-manager/shared?offset=0&limit=1").get_json()
+        page_two = self.client.get("/api/style-manager/shared?offset=1&limit=1").get_json()
+        self.assertEqual(len(page_one["items"]), 1)
+        self.assertEqual(len(page_two["items"]), 1)
+        self.assertTrue(page_one["has_more"])
+        self.assertFalse(page_two["has_more"])
+
+    def test_shared_style_confirmation_recovers_model_from_local_png_metadata(self):
+        app.ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        (app.ARCA_STYLE_IMAGE_DIR / "metadata.png").write_bytes(self.metadata_png())
+        with closing(app.db()) as connection, connection:
+            item_id = connection.execute(
+                "INSERT INTO arca_style_items(source_url,title,collected_at,updated_at) VALUES(?,?,?,?)",
+                ("https://arca.live/b/aiart/metadata", "메타데이터 공유", app.now_text(), app.now_text()),
+            ).lastrowid
+            image_id = connection.execute(
+                """
+                INSERT INTO arca_style_images(
+                    item_id,image_url,image_path,content_type,prompt,base_prompt,model,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    item_id,
+                    "https://image/metadata",
+                    "metadata.png",
+                    "image/png",
+                    "artist:test artist",
+                    "artist:test artist",
+                    "",
+                    app.now_text(),
+                ),
+            ).lastrowid
+
+        gallery_item = self.client.get("/api/style-manager/shared").get_json()["items"][0]
+        self.assertEqual(gallery_item["model"], "NovelAI Diffusion V4.5")
+
+        confirmed = self.client.post(
+            "/api/confirmed-styles",
+            json={"source_type": "shared", "source_id": image_id, "model": ""},
+        )
+        self.assertEqual(confirmed.status_code, 201)
+        self.assertEqual(confirmed.get_json()["model"], "NovelAI Diffusion V4.5")
+
+    def test_shared_gallery_searches_and_filters_all_available_images(self):
+        app.ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        for name in ("alpha.png", "beta.png"):
+            (app.ARCA_STYLE_IMAGE_DIR / name).write_bytes(valid_png(64, 64))
+        with closing(app.db()) as connection, connection:
+            first_item = connection.execute(
+                "INSERT INTO arca_style_items(source_url,title,board_tab,posted_at,recommendation_count,collected_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/10", "알파 그림체", "NAI", "2026-01-01", 5, app.now_text(), app.now_text()),
+            ).lastrowid
+            second_item = connection.execute(
+                "INSERT INTO arca_style_items(source_url,title,board_tab,posted_at,recommendation_count,collected_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                ("https://arca.live/b/aiart/20", "베타 그림체", "R18_NAI", "2026-02-01", 50, app.now_text(), app.now_text()),
+            ).lastrowid
+            connection.executemany(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?,?)",
+                [
+                    (first_item, "https://image/alpha", "alpha.png", "ok", "artist:alpha", "artist:alpha", app.now_text()),
+                    (second_item, "https://image/beta", "beta.png", "no_metadata", "artist:beta", "artist:beta", app.now_text()),
+                ],
+            )
+
+        searched = self.client.get("/api/style-manager/shared?q=beta").get_json()
+        self.assertEqual([item["image_path"] for item in searched["items"]], ["beta.png"])
+        filtered = self.client.get(
+            "/api/style-manager/shared?tab=R18_NAI&metadata=no_metadata&recommendation_min=10"
+        ).get_json()
+        self.assertEqual(filtered["total"], 1)
+        self.assertEqual(filtered["items"][0]["image_path"], "beta.png")
+        ordered = self.client.get("/api/style-manager/shared?sort=posted_asc").get_json()
+        self.assertEqual([item["image_path"] for item in ordered["items"]], ["alpha.png", "beta.png"])
+
+
+class VarietyPlusRequestTest(unittest.TestCase):
+    def test_variety_plus_adds_current_v45_skip_cfg_value(self):
+        from novelai import VARIETY_PLUS_SKIP_CFG, build_generation_payload
+
+        data = {
+            "base_prompt": "test",
+            "negative_prompt": "",
+            "character_prompts": [],
+            "width": 832,
+            "height": 1216,
+            "sampler": "k_euler_ancestral",
+            "noise_schedule": "karras",
+            "steps": 28,
+            "scale": 5.0,
+            "cfg_rescale": 0.0,
+            "seed": 1,
+            "variety_plus": True,
+        }
+        payload = build_generation_payload(data, "artist:test")
+        self.assertEqual(payload["parameters"]["skip_cfg_above_sigma"], VARIETY_PLUS_SKIP_CFG)
 
 
 if __name__ == "__main__":

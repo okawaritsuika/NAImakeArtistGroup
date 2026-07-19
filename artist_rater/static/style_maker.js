@@ -31,6 +31,20 @@ const styleState = {
   managerSelectionMode: false,
   selectedStyleIds: new Set(),
   managerNegativeExpanded: false,
+  managerMode: "generated",
+  managerRequestToken: 0,
+  managerPage: 1,
+  managerPageSize: 24,
+  managerTotal: 0,
+  managerPageCount: 1,
+  managerDescriptions: false,
+  managerFilterTimer: null,
+  confirmedModalSource: null,
+  confirmedModalFile: null,
+  confirmedModalObjectUrl: "",
+  confirmedModalExcludedTags: [],
+  confirmedModalOriginalQualityPrompt: "",
+  confirmedModalEditId: null,
   ratingTagRules: [],
   ratingTagRuleDraft: [],
   ratingExcludeTags: [],
@@ -50,6 +64,10 @@ const styleState = {
 
 const PROMPT_STORAGE_KEY = "naiArtistRater.prompts.v1";
 const PROMPT_PRESET_STORAGE_KEY = "naiArtistRater.promptPreset.v1";
+const STYLE_MANAGER_DESCRIPTION_KEY = "naiArtistRater.styleManagerDescriptions.v1";
+const STYLE_MANAGER_CARD_SIZE_KEY = "naiArtistRater.styleManagerCardSize.v1";
+const STYLE_MANAGER_PAGE_SIZE_KEY = "naiArtistRater.styleManagerPageSize.v1";
+const STYLE_MANAGER_PAGE_SIZES = [12, 24, 48, 96];
 const RANDOM_STYLE_TARGETS = ["artists", "weights", "quality", "negative"];
 const OPUS_FREE_MAX_STEPS = 28;
 const OPUS_FREE_MAX_PIXELS = 1024 * 1024;
@@ -509,9 +527,18 @@ function normalizeStoredPrompts(value) {
   );
 }
 
+function normalizeNumericPromptClosers(prompt) {
+  let text = String(prompt || "");
+  text = text.replace(/([+-]?\d+(?:\.\d+)?)::([\s\S]*?)::/g, (_, weight, rawBody) => {
+    const body = rawBody.trimEnd();
+    return `${weight}::${body}${/\d$/.test(body) ? " " : ""}::`;
+  });
+  return text.replace(/(artist\s*:[^,\n]*?\d)\s*::/gi, "$1 ::");
+}
+
 function combinePromptSections(...sections) {
   return sections
-    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .map((value) => (typeof value === "string" ? normalizeNumericPromptClosers(value).trim() : ""))
     .filter(Boolean)
     .join(", ");
 }
@@ -620,6 +647,7 @@ function readGenerationSettings() {
     steps: Number(styleElement("generationSteps")?.value || 28),
     scale: Number(styleElement("generationScale")?.value || 5),
     cfg_rescale: Number(styleElement("generationCfgRescale")?.value || 0),
+    variety_plus: Boolean(styleElement("generationVarietyPlus")?.checked),
     seed: styleElement("generationSeed")?.value || "",
     seed_fixed: Boolean(styleElement("generationSeedFixed")?.checked),
     limit_mode: styleElement("generationLimitMode")?.value || "count",
@@ -662,6 +690,8 @@ function applyGenerationSettings(settings = {}) {
   setRandomTargets(settings.random_targets, settings.style_change_mode);
   const fixed = styleElement("generationSeedFixed");
   if (fixed && typeof settings.seed_fixed === "boolean") fixed.checked = settings.seed_fixed;
+  const variety = styleElement("generationVarietyPlus");
+  if (variety && typeof settings.variety_plus === "boolean") variety.checked = settings.variety_plus;
   const count = styleElement("generationCount");
   if (count) count.disabled = styleElement("generationLimitMode")?.value === "unlimited";
 }
@@ -878,13 +908,17 @@ async function loadPromptPresets({ force = false } = {}) {
     if (!styleState.promptPresets.length) {
       styleState.excludedPromptTags = [];
       renderExcludedPromptTags();
-      setPromptPresetStatus("네거티브까지 포함된 수집 프롬프트 세트가 없습니다.", "error");
+      setPromptPresetStatus("랜덤으로 사용할 수집 프롬프트가 없습니다.", "error");
       return false;
     }
     setPromptPresetStatus("세트를 직접 적용하거나, 아래 랜덤 대상에서 퀄리티·네거 프롬을 켜세요.");
     return true;
   } catch (error) {
-    if (token === styleState.promptPresetRequestToken) setPromptPresetStatus(error.message, "error");
+    if (token === styleState.promptPresetRequestToken) {
+      styleState.promptPresets = [];
+      renderPromptPresetOptions();
+      setPromptPresetStatus(error.message, "error");
+    }
     return false;
   }
 }
@@ -2441,14 +2475,20 @@ function buildGenerationRequest(requestId = createRequestId()) {
   const seedFixed = Boolean(styleElement("generationSeedFixed")?.checked);
   const seed = Number(styleElement("generationSeed")?.value);
   if (seedFixed && (!Number.isInteger(seed) || seed < 1 || seed > 4294967295)) throw new Error("고정 시드를 확인하세요.");
+  const qualityPrompt = buildEffectivePromptText(styleElement("basePrompt")?.value, "base", "", styleState.promptGroups);
+  const fixedPrompt = styleElement("fixedPrompt")?.value || "";
+  const excludedQualityTags = styleState.excludedPromptTags
+    .map((item) => String(item?.prompt || "").trim())
+    .filter(Boolean);
   const payload = {
     request_id: requestId,
     artists: chooseArtistsForPrompt(styleState.artists)
       .map(({ artist, score, weight }) => ({ artist, score, weight })),
-    base_prompt: combinePromptSections(
-      buildEffectivePromptText(styleElement("basePrompt")?.value, "base", "", styleState.promptGroups),
-      styleElement("fixedPrompt")?.value,
-    ),
+    base_prompt: combinePromptSections(qualityPrompt, fixedPrompt),
+    quality_prompt: qualityPrompt,
+    original_quality_prompt: combinePromptSections(qualityPrompt, ...excludedQualityTags),
+    excluded_quality_tags: excludedQualityTags,
+    fixed_prompt: fixedPrompt,
     negative_prompt: buildEffectivePromptText(styleElement("negativePrompt")?.value, "negative", "", styleState.promptGroups),
     character_prompts: readCharacterPrompts(),
     width,
@@ -2458,6 +2498,7 @@ function buildGenerationRequest(requestId = createRequestId()) {
     steps,
     scale,
     cfg_rescale: cfgRescale,
+    variety_plus: Boolean(styleElement("generationVarietyPlus")?.checked),
   };
   if (seedFixed) payload.seed = seed;
   return payload;
@@ -2608,8 +2649,20 @@ async function randomizePromptTargets(targets) {
   if (!targets.has("quality") && !targets.has("negative")) return true;
   await loadPromptPresets({ force: true });
   if (!styleState.promptPresets.length) throw new Error("랜덤으로 사용할 수집 프롬프트가 없습니다.");
-  const qualityPreset = targets.has("quality") ? pickRandomPreset(styleState.promptPresets) : null;
-  const negativePreset = targets.has("negative") ? pickRandomPreset(styleState.promptPresets) : null;
+  const qualityCandidates = styleState.promptPresets.filter((preset) => (
+    String(preset.base_prompt || preset.quality_prompt || "").trim()
+  ));
+  const negativeCandidates = styleState.promptPresets.filter((preset) => (
+    String(preset.negative_prompt || "").trim()
+  ));
+  if (targets.has("quality") && !qualityCandidates.length) {
+    throw new Error("랜덤으로 사용할 퀄리티 프롬프트가 없습니다.");
+  }
+  if (targets.has("negative") && !negativeCandidates.length) {
+    throw new Error("랜덤으로 사용할 네거티브 프롬프트가 없습니다.");
+  }
+  const qualityPreset = targets.has("quality") ? pickRandomPreset(qualityCandidates) : null;
+  const negativePreset = targets.has("negative") ? pickRandomPreset(negativeCandidates) : null;
   if (qualityPreset) {
     styleElement("basePrompt").value = qualityPreset.base_prompt || qualityPreset.quality_prompt || "";
     styleState.excludedPromptTags = Array.isArray(qualityPreset.excluded_tags)
@@ -2730,15 +2783,104 @@ async function deleteNovelAiKey() {
   }
 }
 
+function styleManagerFilterValues() {
+  return {
+    query: styleElement("styleManagerSearch")?.value || "",
+    scope: styleElement("styleManagerScopeFilter")?.value || "all",
+    metadata: styleElement("styleManagerMetadataFilter")?.value || "all",
+    recommendationMin: styleElement("styleManagerRecommendationMin")?.value || "",
+    sort: styleElement("styleManagerSort")?.value || "newest",
+  };
+}
+
+function filterStyleManagerItems(styles, mode, filters = {}) {
+  const query = String(filters.query || "").trim().toLocaleLowerCase();
+  const scope = String(filters.scope || "all");
+  const metadata = String(filters.metadata || "all");
+  const recommendationMin = filters.recommendationMin === "" || filters.recommendationMin === null
+    ? null
+    : Number(filters.recommendationMin);
+  const filtered = (Array.isArray(styles) ? styles : []).filter((item) => {
+    if (query) {
+      const haystack = [
+        item.name, item.title, item.description, item.artist_prompt, item.quality_prompt, item.base_prompt,
+        item.fixed_prompt, item.negative_prompt, item.model, item.source_url,
+        ...(Array.isArray(item.artists) ? item.artists : []).map((artist) => artist?.artist),
+        ...(Array.isArray(item.character_prompts) ? item.character_prompts : []).map((character) => character?.prompt || character),
+      ].filter(Boolean).join("\n").toLocaleLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    if (mode === "generated" && scope === "confirmed" && !item.confirmed) return false;
+    if (mode === "generated" && scope === "unconfirmed" && item.confirmed) return false;
+    if (mode === "confirmed" && scope !== "all" && item.source_type !== scope) return false;
+    if (mode === "shared" && scope !== "all" && item.board_tab !== scope) return false;
+    if (mode === "shared" && metadata !== "all" && item.metadata_status !== metadata) return false;
+    if (mode === "shared" && Number.isFinite(recommendationMin) && Number(item.recommendation_count) < recommendationMin) return false;
+    return true;
+  });
+  const timestamp = (item) => String(item.updated_at || item.created_at || item.posted_at || "");
+  filtered.sort((left, right) => {
+    if (filters.sort === "recommend") {
+      return Number(right.recommendation_count ?? -1) - Number(left.recommendation_count ?? -1)
+        || Number(right.id || 0) - Number(left.id || 0);
+    }
+    const direction = filters.sort === "oldest" ? 1 : -1;
+    return direction * timestamp(left).localeCompare(timestamp(right))
+      || direction * (Number(left.id || 0) - Number(right.id || 0));
+  });
+  return filtered;
+}
+
+function renderStyleManagerPagination(total) {
+  const pageCount = Math.max(1, Math.ceil(total / styleState.managerPageSize));
+  styleState.managerPageCount = pageCount;
+  styleState.managerPage = Math.min(Math.max(styleState.managerPage, 1), pageCount);
+  const summary = styleElement("styleManagerPageSummary");
+  if (summary) summary.textContent = `${styleState.managerPage} / ${pageCount} 페이지`;
+  const previous = styleElement("styleManagerPrevPage");
+  const next = styleElement("styleManagerNextPage");
+  if (previous) previous.disabled = styleState.managerPage <= 1;
+  if (next) next.disabled = styleState.managerPage >= pageCount;
+}
+
+function updateStyleManagerListStatus(total) {
+  const status = styleElement("styleManagerStatus");
+  if (!status) return;
+  if (!total) {
+    status.textContent = "조건에 맞는 그림체가 없습니다.";
+  } else {
+    status.textContent = `${total}개 · ${styleState.managerPage}페이지`;
+  }
+  renderStyleManagerPagination(total);
+}
+
+function paginateStyleManagerItems(items, page, pageSize) {
+  const size = Math.max(1, Math.trunc(Number(pageSize) || 1));
+  const currentPage = Math.max(1, Math.trunc(Number(page) || 1));
+  return (Array.isArray(items) ? items : []).slice((currentPage - 1) * size, currentPage * size);
+}
+
+function normalizeStyleManagerPageSize(value) {
+  const size = Math.trunc(Number(value));
+  return STYLE_MANAGER_PAGE_SIZES.includes(size) ? size : 24;
+}
+
 function renderStyleManagerList(styles) {
   const list = styleElement("styleManagerList");
   if (!list) return;
   list.replaceChildren();
-  styles.forEach((style) => {
+  const visibleStyles = filterStyleManagerItems(styles, styleState.managerMode, styleManagerFilterValues());
+  styleState.managerTotal = styleState.managerMode === "shared" ? styleState.managerTotal : visibleStyles.length;
+  renderStyleManagerPagination(styleState.managerTotal);
+  const pageStyles = styleState.managerMode === "shared"
+    ? visibleStyles
+    : paginateStyleManagerItems(visibleStyles, styleState.managerPage, styleState.managerPageSize);
+  pageStyles.forEach((style) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "style-manager-item";
-    button.classList.toggle("selection-mode", styleState.managerSelectionMode);
+    button.classList.add(`manager-${styleState.managerMode}-item`);
+    button.classList.toggle("selection-mode", styleState.managerSelectionMode && styleState.managerMode !== "shared");
     button.classList.toggle("selected", styleState.selectedStyleIds.has(style.id));
     button.setAttribute("aria-pressed", String(styleState.selectedStyleIds.has(style.id)));
     const selectionMark = document.createElement("span");
@@ -2746,9 +2888,10 @@ function renderStyleManagerList(styles) {
     selectionMark.textContent = styleState.selectedStyleIds.has(style.id) ? "✓" : "";
     selectionMark.setAttribute("aria-hidden", "true");
     button.append(selectionMark);
-    if (style.representative_image_url) {
+    const imageUrl = style.image_url || style.representative_image_url;
+    if (imageUrl) {
       const image = document.createElement("img");
-      image.src = style.representative_image_url;
+      image.src = imageUrl;
       image.alt = "그림체 대표 이미지";
       image.loading = "lazy";
       button.append(image);
@@ -2756,21 +2899,43 @@ function renderStyleManagerList(styles) {
     const body = document.createElement("span");
     body.className = "style-manager-item-body";
     const title = document.createElement("strong");
-    title.textContent = `그림체 #${style.id}`;
+    title.textContent = styleState.managerMode === "confirmed"
+      ? (style.name || `확정 그림체 #${style.id}`)
+      : styleState.managerMode === "shared"
+        ? (style.title || `공유 이미지 #${style.id}`)
+        : `생성 #${style.id}`;
     const info = document.createElement("span");
-    info.textContent = `작가 ${style.artists.length}명 · 이미지 ${style.image_count}장`;
+    if (styleState.managerMode === "generated") {
+      info.textContent = `작가 ${(style.artists || []).length}명${style.confirmed ? " · 확정됨" : ""}`;
+    } else if (styleState.managerMode === "confirmed") {
+      info.textContent = `${style.source_type === "manual" ? "직접 추가" : style.source_type === "shared" ? "공유에서 확정" : "제작에서 확정"}`;
+    } else {
+      info.textContent = `${style.board_tab || "공유"}${style.confirmed ? " · 확정됨" : ""}`;
+    }
     body.append(title, info);
-    button.append(body);
+    if (styleState.managerDescriptions) {
+      const description = document.createElement("span");
+      description.className = "style-manager-card-description";
+      description.textContent = style.description || style.quality_prompt || style.base_prompt || style.prompt || "설명 없음";
+      body.append(description);
+    }
+    if (!styleState.managerDescriptions) {
+      button.classList.add("image-only");
+      button.setAttribute("aria-label", title.textContent);
+    } else {
+      button.append(body);
+    }
     button.addEventListener("click", () => {
-      if (styleState.managerSelectionMode) {
+      if (styleState.managerSelectionMode && styleState.managerMode !== "shared") {
         styleState.selectedStyleIds = toggleSelectedStyleId(styleState.selectedStyleIds, style.id);
         renderStyleManagerList(styleState.managerStyles);
         syncStyleSelectionControls();
       }
-      loadStyleDetail(style.id);
+      renderStyleManagerDetail(style);
     });
     list.append(button);
   });
+  updateStyleManagerListStatus(styleState.managerTotal);
 }
 
 function toggleSelectedStyleId(selectedIds, styleId) {
@@ -2785,14 +2950,90 @@ function syncStyleSelectionControls() {
   const begin = styleElement("beginStyleSelection");
   const remove = styleElement("deleteSelectedStyles");
   const cancel = styleElement("cancelStyleSelection");
+  const canDelete = styleState.managerMode !== "shared";
+  begin?.classList.toggle("hidden", !canDelete);
+  styleElement("addConfirmedStyle")?.classList.toggle("hidden", styleState.managerMode !== "confirmed");
   begin?.classList.toggle("active", styleState.managerSelectionMode);
   begin?.setAttribute("aria-pressed", String(styleState.managerSelectionMode));
-  remove?.classList.toggle("hidden", !styleState.managerSelectionMode);
-  cancel?.classList.toggle("hidden", !styleState.managerSelectionMode);
+  remove?.classList.toggle("hidden", !styleState.managerSelectionMode || !canDelete);
+  cancel?.classList.toggle("hidden", !styleState.managerSelectionMode || !canDelete);
   if (remove) {
     remove.disabled = count === 0;
     remove.textContent = `선택 삭제 (${count})`;
   }
+}
+
+function syncStyleManagerFilterControls() {
+  const scope = styleElement("styleManagerScopeFilter");
+  const options = {
+    generated: [["all", "전체"], ["confirmed", "확정됨"], ["unconfirmed", "미확정"]],
+    confirmed: [["all", "전체"], ["manual", "직접 추가"], ["generated", "제작에서 확정"], ["shared", "공유에서 확정"]],
+    shared: [["all", "전체 게시판"], ["NAI", "NAI"], ["R18_NAI", "🔞 NAI"]],
+  }[styleState.managerMode];
+  if (scope) {
+    scope.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+    scope.value = "all";
+  }
+  const shared = styleState.managerMode === "shared";
+  styleElement("styleManagerMetadataField")?.classList.toggle("hidden", !shared);
+  styleElement("styleManagerRecommendationField")?.classList.toggle("hidden", !shared);
+  const recommendSort = styleElement("styleManagerRecommendSort");
+  if (recommendSort) recommendSort.hidden = !shared;
+  const sort = styleElement("styleManagerSort");
+  if (!shared && sort?.value === "recommend") sort.value = "newest";
+}
+
+function styleManagerSharedQuery(offset) {
+  const filters = styleManagerFilterValues();
+  const query = new URLSearchParams({ offset: String(offset), limit: String(styleState.managerPageSize) });
+  if (filters.query.trim()) query.set("q", filters.query.trim());
+  if (filters.scope !== "all") query.set("tab", filters.scope);
+  if (filters.metadata !== "all") query.set("metadata", filters.metadata);
+  if (String(filters.recommendationMin).trim()) query.set("recommendation_min", filters.recommendationMin);
+  const sorts = { newest: "posted_desc", oldest: "posted_asc", recommend: "recommend_desc" };
+  query.set("sort", sorts[filters.sort] || "posted_desc");
+  return query.toString();
+}
+
+function applyStyleManagerFilters({ delayed = false } = {}) {
+  clearTimeout(styleState.managerFilterTimer);
+  const apply = () => {
+    styleState.managerPage = 1;
+    resetStyleManagerDetail();
+    if (styleState.managerMode === "shared") loadStyleManager();
+    else renderStyleManagerList(styleState.managerStyles);
+  };
+  if (delayed) styleState.managerFilterTimer = setTimeout(apply, 250);
+  else apply();
+}
+
+function setStyleManagerPage(page) {
+  const nextPage = Math.trunc(Number(page));
+  if (!Number.isFinite(nextPage)) return;
+  styleState.managerPage = Math.min(Math.max(nextPage, 1), styleState.managerPageCount);
+  resetStyleManagerDetail();
+  if (styleState.managerMode === "shared") loadStyleManager();
+  else renderStyleManagerList(styleState.managerStyles);
+}
+
+function setStyleManagerMode(mode) {
+  if (!["generated", "confirmed", "shared"].includes(mode)) return;
+  styleState.managerMode = mode;
+  styleState.managerDirty = true;
+  styleState.managerPage = 1;
+  syncStyleManagerFilterControls();
+  setStyleSelectionMode(false);
+  resetStyleManagerDetail();
+  document.querySelectorAll("[data-style-manager-mode]").forEach((button) => {
+    const active = button.dataset.styleManagerMode === mode;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  const titles = { generated: "제작 기록", confirmed: "확정 그림체", shared: "공유 그림체" };
+  const title = styleElement("styleManagerListTitle");
+  if (title) title.textContent = titles[mode];
+  syncStyleSelectionControls();
+  loadStyleManager();
 }
 
 function setStyleSelectionMode(enabled) {
@@ -2804,8 +3045,23 @@ function setStyleSelectionMode(enabled) {
 
 async function loadStyleManager() {
   const status = styleElement("styleManagerStatus");
+  const requestedMode = styleState.managerMode;
+  const requestToken = ++styleState.managerRequestToken;
   try {
-    const styles = await apiFetch("/api/art-styles");
+    let styles;
+    let sharedResult = null;
+    if (styleState.managerMode === "confirmed") {
+      styles = await apiFetch("/api/confirmed-styles");
+    } else if (styleState.managerMode === "shared") {
+      sharedResult = await apiFetch(`/api/style-manager/shared?${styleManagerSharedQuery((styleState.managerPage - 1) * styleState.managerPageSize)}`);
+      styles = sharedResult.items || [];
+    } else {
+      styles = await apiFetch("/api/style-manager/generated");
+    }
+    if (requestToken !== styleState.managerRequestToken || requestedMode !== styleState.managerMode) return;
+    if (sharedResult) {
+      styleState.managerTotal = Number(sharedResult.total || 0);
+    }
     styleState.managerStyles = styles;
     const availableIds = new Set(styles.map((style) => style.id));
     styleState.selectedStyleIds = new Set(
@@ -2814,8 +3070,8 @@ async function loadStyleManager() {
     renderStyleManagerList(styles);
     syncStyleSelectionControls();
     styleState.managerDirty = false;
-    if (status) status.textContent = styles.length ? `${styles.length}개 그림체` : "저장된 그림체가 없습니다.";
   } catch (error) {
+    if (requestToken !== styleState.managerRequestToken || requestedMode !== styleState.managerMode) return;
     if (status) status.textContent = error.message;
   }
 }
@@ -2833,6 +3089,7 @@ function appendMetaRow(parent, label, value) {
 function resetStyleManagerDetail() {
   const target = styleElement("styleManagerDetail");
   if (!target) return;
+  styleElement("style-manager-tab")?.classList.remove("has-detail");
   target.replaceChildren();
   const placeholder = document.createElement("div");
   placeholder.className = "latest-result-placeholder";
@@ -2868,17 +3125,23 @@ async function deleteSelectedManagedStyles() {
   const styleIds = [...styleState.selectedStyleIds].sort((left, right) => left - right);
   if (!styleIds.length) return;
   if (!await globalThis.appDialog.confirm({
-    title: `그림체 ${styleIds.length}개 삭제`,
-    message: "선택한 그림체와 함께 저장된 생성 이미지를 모두 삭제할까요?",
-    details: ["삭제한 그림체와 생성 이미지는 복구할 수 없습니다."],
+    title: `${styleIds.length}개 삭제`,
+    message: styleState.managerMode === "confirmed"
+      ? "선택한 확정 그림체를 삭제할까요? 원본 제작 기록과 공유 그림체는 유지됩니다."
+      : "선택한 생성 결과를 삭제할까요?",
+    details: ["삭제한 항목은 복구할 수 없습니다."],
     confirmLabel: `${styleIds.length}개 삭제`,
     tone: "danger",
   })) return;
   const status = styleElement("styleManagerStatus");
   try {
-    const result = await apiFetch("/api/art-styles/delete-batch", {
+    const endpoint = styleState.managerMode === "confirmed"
+      ? "/api/confirmed-styles/delete-batch"
+      : "/api/style-manager/generated/delete-batch";
+    const key = styleState.managerMode === "confirmed" ? "style_ids" : "image_ids";
+    const result = await apiFetch(endpoint, {
       method: "POST",
-      body: JSON.stringify({ style_ids: styleIds }),
+      body: JSON.stringify({ [key]: styleIds }),
     });
     const deletedIds = new Set(result.deleted_ids || []);
     if (styleState.managerDetail && deletedIds.has(styleState.managerDetail.id)) {
@@ -2886,7 +3149,7 @@ async function deleteSelectedManagedStyles() {
     }
     setStyleSelectionMode(false);
     await loadStyleManager();
-    if (status) status.textContent = `그림체 ${deletedIds.size}개와 생성 이미지를 삭제했습니다.`;
+    if (status) status.textContent = `${deletedIds.size}개 항목을 삭제했습니다.`;
   } catch (error) {
     if (status) status.textContent = error.message;
   }
@@ -2991,36 +3254,948 @@ function renderStyleManagerImageSelection() {
   inspector.append(generation);
 }
 
-async function loadStyleDetail(styleId) {
-  const detail = await apiFetch(`/api/art-styles/${styleId}`);
+function managerCharacterText(item) {
+  const characters = Array.isArray(item?.character_prompts) ? item.character_prompts : [];
+  return characters.map((entry) => typeof entry === "string" ? entry : entry?.prompt || "").filter(Boolean).join("\n\n") || "없음";
+}
+
+function managerPromptParts(item) {
+  if (styleState.managerMode === "generated") {
+    return {
+      primary: combinePromptSections(managerArtistText(item), item.quality_prompt || item.base_prompt, item.fixed_prompt),
+      negative: item.negative_prompt || "",
+    };
+  }
+  return {
+    primary: combinePromptSections(item.artist_prompt, item.quality_prompt || item.base_prompt || item.prompt, item.fixed_prompt),
+    negative: item.negative_prompt || "",
+  };
+}
+
+function managerKnown(value, suffix = "") {
+  return value === null || value === undefined || value === "" ? "알 수 없음" : `${value}${suffix}`;
+}
+
+function managerGenerationText(item) {
+  const variety = item.variety_plus === null || item.variety_plus === undefined
+    ? "Variety+ 알 수 없음"
+    : `Variety+ ${item.variety_plus ? "켜짐" : "꺼짐"}`;
+  return [
+    `${managerKnown(item.width)}×${managerKnown(item.height)}`,
+    `${managerKnown(item.sampler)} / ${managerKnown(item.noise_schedule)}`,
+    `${managerKnown(item.steps)} steps`,
+    `CFG ${managerKnown(item.scale)}`,
+    `Rescale ${managerKnown(item.cfg_rescale)}`,
+    variety,
+    `Seed ${managerKnown(item.seed)}`,
+    managerKnown(item.model),
+  ].join(" · ");
+}
+
+function normalizedManagerModalImage(item) {
+  const prompts = managerPromptParts(item);
+  return {
+    ...item,
+    base_prompt: prompts.primary,
+    negative_prompt: prompts.negative,
+    character_prompts: Array.isArray(item.character_prompts) ? item.character_prompts.map((entry) => typeof entry === "string" ? entry : entry?.prompt || "") : [],
+  };
+}
+
+function renderStyleManagerDetail(item) {
   const target = styleElement("styleManagerDetail");
   if (!target) return;
+  styleElement("style-manager-tab")?.classList.add("has-detail");
   target.replaceChildren();
-  styleState.managerDetail = detail;
-  styleState.managerImages = detail.images;
+  styleState.managerDetail = item;
+  styleState.managerImages = [normalizedManagerModalImage(item)];
   styleState.managerImageIndex = 0;
   styleState.managerNegativeExpanded = false;
   const head = document.createElement("div");
   head.className = "style-manager-detail-head";
   const heading = document.createElement("h2");
-  heading.textContent = `그림체 #${detail.id}`;
-  const deleteButton = document.createElement("button");
-  deleteButton.type = "button";
-  deleteButton.className = "danger-button";
-  deleteButton.textContent = "그림체 삭제";
-  deleteButton.addEventListener("click", () => deleteManagedStyle(detail.id));
-  head.append(heading, deleteButton);
+  heading.textContent = styleState.managerMode === "confirmed"
+    ? (item.name || `확정 그림체 #${item.id}`)
+    : styleState.managerMode === "shared"
+      ? (item.title || `공유 이미지 #${item.id}`)
+      : `생성 #${item.id}`;
+  const headActions = document.createElement("div");
+  headActions.className = "style-manager-list-actions";
+  if (styleState.managerMode === "confirmed") {
+    const editButton = document.createElement("button");
+    editButton.type = "button";
+    editButton.textContent = "정보 수정";
+    editButton.addEventListener("click", () => openConfirmedStyleModal(item, true));
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "danger-button";
+    deleteButton.textContent = "삭제";
+    deleteButton.addEventListener("click", () => deleteSingleManagerItem(item));
+    headActions.append(editButton, deleteButton);
+  } else {
+    const confirmButton = document.createElement("button");
+    confirmButton.type = "button";
+    confirmButton.className = "primary";
+    confirmButton.textContent = item.confirmed ? "다시 확정본 만들기" : "확정 그림체로 추가";
+    confirmButton.addEventListener("click", () => openConfirmedStyleModal(item, false));
+    headActions.append(confirmButton);
+    if (styleState.managerMode === "shared" && item.source_url) {
+      const sourceLink = document.createElement("a");
+      sourceLink.className = "button-link";
+      sourceLink.href = item.source_url;
+      sourceLink.target = "_blank";
+      sourceLink.rel = "noopener noreferrer";
+      sourceLink.textContent = "원문 열기";
+      headActions.append(sourceLink);
+    }
+    if (styleState.managerMode === "generated") {
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.className = "danger-button";
+      deleteButton.textContent = "생성 결과 삭제";
+      deleteButton.addEventListener("click", () => deleteSingleManagerItem(item));
+      headActions.append(deleteButton);
+    }
+  }
+  head.append(heading, headActions);
   const detailGrid = document.createElement("div");
   detailGrid.className = "style-manager-detail-grid";
   const imageStage = document.createElement("section");
-  imageStage.id = "styleManagerImageStage";
   imageStage.className = "manager-image-stage";
+  const image = document.createElement("img");
+  image.className = "manager-selected-image";
+  image.src = item.image_url || "";
+  image.alt = "선택한 그림체 이미지";
+  image.addEventListener("click", () => openGeneratedImage(styleState.managerImages, 0));
+  imageStage.append(image);
   const inspector = document.createElement("section");
-  inspector.id = "styleManagerImageInspector";
   inspector.className = "manager-image-inspector";
+  const prompts = managerPromptParts(item);
+  appendManagerPromptBlock(inspector, "작가 · 퀄리티", prompts.primary || "없음", "manager-primary-prompt");
+  appendManagerPromptBlock(inspector, "캐릭터", managerCharacterText(item));
+  const negativeToggle = document.createElement("button");
+  negativeToggle.type = "button";
+  negativeToggle.className = "manager-negative-toggle";
+  negativeToggle.textContent = "▼ 네거티브 보기";
+  negativeToggle.setAttribute("aria-expanded", "false");
+  negativeToggle.addEventListener("click", () => {
+    const block = inspector.querySelector(".manager-negative-prompt");
+    const expanded = block?.classList.toggle("hidden") === false;
+    negativeToggle.textContent = expanded ? "▲ 네거티브 접기" : "▼ 네거티브 보기";
+    negativeToggle.setAttribute("aria-expanded", String(expanded));
+  });
+  inspector.append(negativeToggle);
+  appendManagerPromptBlock(inspector, "네거티브", prompts.negative || "없음", "manager-negative-prompt hidden");
+  if (styleState.managerMode === "confirmed" && item.description) {
+    appendManagerPromptBlock(inspector, "설명", item.description);
+  }
+  const generation = document.createElement("div");
+  generation.className = "manager-generation-summary";
+  generation.textContent = managerGenerationText(item);
+  inspector.append(generation);
   detailGrid.append(imageStage, inspector);
   target.append(head, detailGrid);
-  renderStyleManagerImageSelection();
+}
+
+async function deleteSingleManagerItem(item) {
+  if (!await globalThis.appDialog.confirm({
+    title: "항목 삭제",
+    message: styleState.managerMode === "confirmed" ? "이 확정 그림체를 삭제할까요? 원본은 유지됩니다." : "이 생성 결과를 삭제할까요?",
+    confirmLabel: "삭제",
+    tone: "danger",
+  })) return;
+  const endpoint = styleState.managerMode === "confirmed"
+    ? `/api/confirmed-styles/${item.id}`
+    : "/api/style-manager/generated/delete-batch";
+  const options = styleState.managerMode === "confirmed"
+    ? { method: "DELETE" }
+    : { method: "POST", body: JSON.stringify({ image_ids: [item.id] }) };
+  try {
+    await apiFetch(endpoint, options);
+    resetStyleManagerDetail();
+    await loadStyleManager();
+  } catch (error) {
+    const status = styleElement("styleManagerStatus");
+    if (status) status.textContent = error.message;
+  }
+}
+
+function confirmedFormValue(id, value) {
+  const element = styleElement(id);
+  if (element) element.value = value === null || value === undefined ? "" : String(value);
+}
+
+function setConfirmedModelValue(value) {
+  const element = styleElement("confirmedStyleModel");
+  if (!element) return;
+  const model = value === null || value === undefined ? "" : String(value);
+  if (model && ![...element.options].some((option) => option.value === model)) {
+    const option = document.createElement("option");
+    option.value = model;
+    option.textContent = `기존 기록: ${model}`;
+    element.append(option);
+  }
+  element.value = model;
+}
+
+function renderConfirmedExcludedTags() {
+  const section = styleElement("confirmedStyleExcludedSection");
+  const list = styleElement("confirmedStyleExcludedTags");
+  if (!section || !list) return;
+  list.replaceChildren();
+  styleState.confirmedModalExcludedTags.forEach((tag, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = tag;
+    button.title = "퀄리티 프롬프트로 복구";
+    button.addEventListener("click", () => {
+      const quality = styleElement("confirmedStyleQualityPrompt");
+      if (quality) quality.value = combinePromptSections(quality.value, tag);
+      styleState.confirmedModalExcludedTags.splice(index, 1);
+      renderConfirmedExcludedTags();
+    });
+    list.append(button);
+  });
+  section.classList.toggle("hidden", !styleState.confirmedModalExcludedTags.length);
+}
+
+function setConfirmedPreview(url, showHint = false) {
+  const image = styleElement("confirmedStylePreview");
+  const hint = styleElement("confirmedStyleDropHint");
+  if (image) {
+    image.src = url || "";
+    image.classList.toggle("hidden", !url);
+  }
+  hint?.classList.toggle("hidden", Boolean(url) && !showHint);
+}
+
+function confirmedGeneratedSourceValues(item) {
+  return {
+    ...item,
+    name: `제작 그림체 #${item.id}`,
+    description: "",
+    artist_prompt: managerArtistText(item),
+    quality_prompt: item.quality_prompt || item.base_prompt || "",
+    original_quality_prompt: item.original_quality_prompt || item.quality_prompt || item.base_prompt || "",
+    excluded_quality_tags: item.excluded_quality_tags || [],
+    fixed_prompt: item.fixed_prompt || "",
+    negative_prompt: item.negative_prompt || "",
+  };
+}
+
+function confirmedSourceValues(item) {
+  if (!item) return {};
+  return styleState.managerMode === "generated" ? confirmedGeneratedSourceValues(item) : item;
+}
+
+function openConfirmedStyleModal(item = null, editing = false) {
+  const source = confirmedSourceValues(item);
+  styleState.confirmedModalSource = !editing && item
+    ? { source_type: styleState.managerMode === "shared" ? "shared" : "generated", source_id: item.id }
+    : null;
+  styleState.confirmedModalEditId = editing ? item.id : null;
+  styleState.confirmedModalFile = null;
+  styleState.confirmedModalExcludedTags = [...(source.excluded_quality_tags || [])];
+  styleState.confirmedModalOriginalQualityPrompt = source.original_quality_prompt || source.quality_prompt || source.base_prompt || "";
+  if (styleState.confirmedModalObjectUrl) URL.revokeObjectURL(styleState.confirmedModalObjectUrl);
+  styleState.confirmedModalObjectUrl = "";
+  confirmedFormValue("confirmedStyleName", source.name || "");
+  confirmedFormValue("confirmedStyleDescription", source.description || "");
+  confirmedFormValue("confirmedStyleArtistPrompt", source.artist_prompt || "");
+  confirmedFormValue("confirmedStyleQualityPrompt", source.quality_prompt || source.base_prompt || source.prompt || "");
+  confirmedFormValue("confirmedStyleFixedPrompt", source.fixed_prompt || "");
+  confirmedFormValue("confirmedStyleNegativePrompt", source.negative_prompt || "");
+  confirmedFormValue("confirmedStyleSampler", source.sampler || "");
+  confirmedFormValue("confirmedStyleScheduler", source.noise_schedule || "");
+  confirmedFormValue("confirmedStyleSteps", source.steps);
+  confirmedFormValue("confirmedStyleScale", source.scale);
+  confirmedFormValue("confirmedStyleCfgRescale", source.cfg_rescale);
+  confirmedFormValue("confirmedStyleVariety", source.variety_plus === true ? "1" : source.variety_plus === false ? "0" : "unknown");
+  setConfirmedModelValue(source.model || "");
+  setConfirmedPreview(source.image_url || "", !source.image_url);
+  renderConfirmedExcludedTags();
+  const title = styleElement("confirmedStyleModalTitle");
+  if (title) title.textContent = editing ? "확정 그림체 수정" : item ? "확정 그림체로 추가" : "그림체 직접 추가";
+  const choose = styleElement("chooseConfirmedStyleImage");
+  if (choose) choose.disabled = editing;
+  const status = styleElement("confirmedStyleMetadataStatus");
+  if (status) status.textContent = editing ? "저장된 정보를 수정합니다." : item ? "원본의 저장 정보를 불러왔습니다." : "PNG 원본이면 NovelAI 설정을 자동으로 읽습니다.";
+  const modalStatus = styleElement("confirmedStyleModalStatus");
+  if (modalStatus) modalStatus.textContent = "";
+  styleElement("confirmedStyleModal")?.classList.remove("hidden");
+}
+
+function closeConfirmedStyleModal() {
+  styleElement("confirmedStyleModal")?.classList.add("hidden");
+  if (styleState.confirmedModalObjectUrl) URL.revokeObjectURL(styleState.confirmedModalObjectUrl);
+  styleState.confirmedModalObjectUrl = "";
+  styleState.confirmedModalFile = null;
+  hidePromptTagAutocomplete();
+}
+
+let comparisonStyles = [];
+let comparisonGroups = [];
+let comparisonSelectedStyleIds = new Set();
+let comparisonFocusedStyleId = null;
+let comparisonEditingGroupId = null;
+let comparisonCharacterPrompts = [];
+let comparisonActiveGroupId = null;
+let comparisonFocusedResultStyleId = null;
+
+function normalizeComparisonCharacterPrompts(values) {
+  if (!Array.isArray(values)) return [];
+  return values.map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+function readComparisonCharacterPrompts() {
+  const target = styleElement("comparisonCharacterPromptList");
+  if (!target) return [];
+  return normalizeComparisonCharacterPrompts(
+    [...target.querySelectorAll("textarea")].map((input) => input.value),
+  );
+}
+
+function readComparisonCharacterPromptRows() {
+  const target = styleElement("comparisonCharacterPromptList");
+  if (!target) return [];
+  return [...target.querySelectorAll("textarea")].map((input) => input.value);
+}
+
+function renderComparisonCharacterPrompts() {
+  const target = styleElement("comparisonCharacterPromptList");
+  const empty = styleElement("comparisonCharacterPromptEmpty");
+  const add = styleElement("addComparisonCharacterPrompt");
+  if (!target) return;
+  const locked = Boolean(comparisonEditingGroupId);
+  target.replaceChildren();
+  comparisonCharacterPrompts.forEach((prompt, index) => {
+    const row = document.createElement("div");
+    row.className = "comparison-character-prompt-row";
+    const field = document.createElement("label");
+    field.className = "field";
+    const title = document.createElement("span");
+    title.textContent = `캐릭터 ${index + 1}`;
+    const input = document.createElement("textarea");
+    input.value = prompt;
+    input.autocomplete = "off";
+    input.disabled = locked;
+    input.addEventListener("input", () => { comparisonCharacterPrompts[index] = input.value; });
+    const autocomplete = document.createElement("div");
+    autocomplete.className = "autocomplete prompt-tag-autocomplete hidden";
+    field.append(title, input, autocomplete);
+    bindPromptTagAutocomplete(input);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger-button";
+    remove.textContent = "삭제";
+    remove.disabled = locked;
+    remove.addEventListener("click", () => {
+      comparisonCharacterPrompts = readComparisonCharacterPromptRows();
+      comparisonCharacterPrompts.splice(index, 1);
+      renderComparisonCharacterPrompts();
+    });
+    row.append(field, remove);
+    target.append(row);
+  });
+  if (empty) empty.classList.toggle("hidden", comparisonCharacterPrompts.length > 0);
+  if (add) add.disabled = locked || comparisonCharacterPrompts.length >= 6;
+}
+
+function addComparisonCharacterPrompt() {
+  comparisonCharacterPrompts = readComparisonCharacterPromptRows();
+  if (comparisonCharacterPrompts.length >= 6) return;
+  comparisonCharacterPrompts.push("");
+  renderComparisonCharacterPrompts();
+  const inputs = styleElement("comparisonCharacterPromptList")?.querySelectorAll("textarea");
+  inputs?.[inputs.length - 1]?.focus();
+}
+
+function comparisonTextRow(target, label, value) {
+  const row = document.createElement("div");
+  const strong = document.createElement("strong");
+  const text = document.createElement("pre");
+  strong.textContent = label;
+  text.textContent = value || "없음";
+  row.append(strong, text);
+  target.append(row);
+}
+
+function renderComparisonStyleDetail(item) {
+  const target = styleElement("comparisonStyleDetail");
+  if (!target) return;
+  target.replaceChildren();
+  if (!item) {
+    const empty = document.createElement("div");
+    empty.className = "latest-result-placeholder";
+    empty.textContent = "갤러리의 그림을 클릭하면 상세정보를 표시합니다.";
+    target.append(empty);
+    return;
+  }
+  const image = document.createElement("img");
+  image.src = item.image_url || "";
+  image.alt = item.name || `확정 그림체 #${item.id}`;
+  target.append(image);
+  comparisonTextRow(target, "이름", item.name || `확정 그림체 #${item.id}`);
+  comparisonTextRow(target, "작가 프롬프트", item.artist_prompt);
+  comparisonTextRow(target, "퀄리티 프롬프트", item.quality_prompt);
+  comparisonTextRow(target, "고정 프롬프트", item.fixed_prompt);
+  comparisonTextRow(target, "네거티브 프롬프트", item.negative_prompt);
+  comparisonTextRow(target, "생성 설정", `${item.sampler || "기본"} / ${item.noise_schedule || "기본"} · ${item.steps ?? "기본"} steps · CFG ${item.scale ?? "기본"} · Rescale ${item.cfg_rescale ?? "기본"} · Variety+ ${item.variety_plus === true ? "켜짐" : item.variety_plus === false ? "꺼짐" : "기본"} · ${item.model || "기본 모델"}`);
+}
+
+function updateComparisonSelectedSummary() {
+  const summary = styleElement("comparisonSelectedSummary");
+  if (summary) summary.textContent = `${comparisonSelectedStyleIds.size}개 선택`;
+}
+
+function renderComparisonPicker() {
+  const target = styleElement("comparisonStylePicker");
+  if (!target) return;
+  const query = (styleElement("comparisonStyleSearch")?.value || "").trim().toLowerCase();
+  target.replaceChildren();
+  comparisonStyles.filter((item) => `${item.name} ${item.artist_prompt} ${item.quality_prompt} ${item.fixed_prompt} ${item.negative_prompt} ${item.model}`.toLowerCase().includes(query)).forEach((item) => {
+    const label = document.createElement("label");
+    label.className = "comparison-style-choice";
+    label.classList.toggle("selected", comparisonSelectedStyleIds.has(item.id));
+    label.classList.toggle("focused", comparisonFocusedStyleId === item.id);
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = comparisonSelectedStyleIds.has(item.id);
+    const image = document.createElement("img");
+    image.src = item.image_url || "";
+    image.alt = item.name || `확정 그림체 #${item.id}`;
+    const name = document.createElement("strong");
+    name.textContent = item.name || `확정 그림체 #${item.id}`;
+    const artist = document.createElement("small");
+    artist.textContent = item.artist_prompt || "작가 프롬프트 없음";
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) comparisonSelectedStyleIds.add(item.id);
+      else comparisonSelectedStyleIds.delete(item.id);
+      comparisonFocusedStyleId = item.id;
+      renderComparisonStyleDetail(item);
+      renderComparisonPicker();
+      updateComparisonSelectedSummary();
+    });
+    label.addEventListener("click", () => {
+      comparisonFocusedStyleId = item.id;
+      renderComparisonStyleDetail(item);
+    });
+    label.append(checkbox, image, name, artist);
+    target.append(label);
+  });
+  updateComparisonSelectedSummary();
+}
+
+function comparisonSetValue(id, value) {
+  const element = styleElement(id);
+  if (element) element.value = value === null || value === undefined ? "" : String(value);
+}
+
+function syncComparisonResolutionFields() {
+  const custom = styleElement("comparisonResolution")?.value === "custom";
+  styleElement("comparisonCustomResolution")?.classList.toggle("hidden", !custom);
+  styleElement("comparisonSeedField")?.classList.toggle("hidden", styleElement("comparisonSeedMode")?.value !== "manual");
+}
+
+function toggleComparisonColumn(column) {
+  const detail = column === "detail";
+  const editor = styleElement("comparisonEditor");
+  const panel = styleElement(detail ? "comparisonDetailPanel" : "comparisonSettingsPanel");
+  const content = styleElement(detail ? "comparisonDetailContent" : "comparisonSettingsContent");
+  const button = styleElement(detail ? "toggleComparisonDetailColumn" : "toggleComparisonSettingsColumn");
+  if (!editor || !panel || !content || !button) return;
+  const collapsed = !panel.classList.contains("is-collapsed");
+  panel.classList.toggle("is-collapsed", collapsed);
+  content.classList.toggle("hidden", collapsed);
+  editor.classList.toggle(detail ? "detail-collapsed" : "settings-collapsed", collapsed);
+  button.setAttribute("aria-expanded", String(!collapsed));
+  button.textContent = detail ? (collapsed ? "▶" : "◀") : (collapsed ? "◀" : "▶");
+}
+
+async function openComparisonEditor(group = null) {
+  comparisonStyles = await apiFetch("/api/confirmed-styles");
+  comparisonEditingGroupId = group?.id || null;
+  comparisonSelectedStyleIds = new Set(
+    (group?.selected_style_ids || group?.results?.map((item) => item.confirmed_style_id) || [])
+      .filter(Number.isInteger),
+  );
+  comparisonFocusedStyleId = comparisonSelectedStyleIds.values().next().value || comparisonStyles[0]?.id || null;
+  const defaults = group?.defaults || {};
+  comparisonSetValue("comparisonName", group?.name || "새 비교군");
+  comparisonSetValue("comparisonFixedPrompt", group?.fixed_prompt || "");
+  comparisonCharacterPrompts = normalizeComparisonCharacterPrompts(group?.character_prompts || []);
+  renderComparisonCharacterPrompts();
+  const preset = ["832x1216", "1216x832", "1024x1024"].includes(`${group?.width}x${group?.height}`) ? `${group.width}x${group.height}` : group ? "custom" : "832x1216";
+  comparisonSetValue("comparisonResolution", preset);
+  comparisonSetValue("comparisonWidth", group?.width || 832);
+  comparisonSetValue("comparisonHeight", group?.height || 1216);
+  comparisonSetValue("comparisonSeedMode", group?.seed_mode || "none");
+  comparisonSetValue("comparisonSeed", group?.seed || "");
+  comparisonSetValue("comparisonDefaultSampler", defaults.sampler || "k_euler_ancestral");
+  comparisonSetValue("comparisonDefaultSchedule", defaults.noise_schedule || "karras");
+  comparisonSetValue("comparisonDefaultSteps", defaults.steps ?? 28);
+  comparisonSetValue("comparisonDefaultScale", defaults.scale ?? 5);
+  comparisonSetValue("comparisonDefaultRescale", defaults.cfg_rescale ?? 0);
+  comparisonSetValue("comparisonDefaultVariety", defaults.variety_plus ? "1" : "0");
+  comparisonSetValue("comparisonDefaultModel", defaults.model || "nai-diffusion-4-5-full");
+  ["comparisonName", "comparisonFixedPrompt", "comparisonResolution", "comparisonWidth", "comparisonHeight", "comparisonSeedMode", "comparisonSeed", "comparisonDefaultSampler", "comparisonDefaultSchedule", "comparisonDefaultSteps", "comparisonDefaultScale", "comparisonDefaultRescale", "comparisonDefaultVariety", "comparisonDefaultModel"].forEach((id) => { const element = styleElement(id); if (element) element.disabled = Boolean(group); });
+  const save = styleElement("createComparison");
+  if (save) save.textContent = group ? "선택 변경 저장" : "선택한 그림체 생성";
+  styleElement("comparisonGroups")?.classList.add("hidden");
+  styleElement("comparisonGallery")?.classList.add("hidden");
+  styleElement("comparisonEditor")?.classList.remove("hidden");
+  styleElement("addComparison")?.classList.add("hidden");
+  styleElement("backToComparisonList")?.classList.remove("hidden");
+  const title = styleElement("comparisonPageTitle");
+  if (title) title.textContent = group ? `${group.name} 선택 수정` : "비교군 추가";
+  syncComparisonResolutionFields();
+  renderComparisonPicker();
+  renderComparisonStyleDetail(comparisonStyles.find((item) => item.id === comparisonFocusedStyleId));
+}
+
+function closeComparisonEditor() {
+  comparisonEditingGroupId = null;
+  styleElement("comparisonEditor")?.classList.add("hidden");
+  styleElement("comparisonGallery")?.classList.add("hidden");
+  styleElement("comparisonGroups")?.classList.remove("hidden");
+  styleElement("addComparison")?.classList.remove("hidden");
+  styleElement("backToComparisonList")?.classList.add("hidden");
+  const title = styleElement("comparisonPageTitle");
+  if (title) title.textContent = "비교군 관리";
+}
+
+function setComparisonProgress(completed, total, message = "") {
+  const panel = styleElement("comparisonProgress");
+  const bar = styleElement("comparisonProgressBar");
+  const text = styleElement("comparisonProgressText");
+  if (!panel || !bar || !text) return;
+  const safeTotal = Math.max(1, Number(total) || 0);
+  const safeCompleted = Math.max(0, Math.min(safeTotal, Number(completed) || 0));
+  panel.classList.remove("hidden");
+  bar.max = safeTotal;
+  bar.value = safeCompleted;
+  text.textContent = message || `${safeCompleted}/${Number(total) || 0}개 생성 완료`;
+}
+
+function hideComparisonProgress() {
+  styleElement("comparisonProgress")?.classList.add("hidden");
+}
+
+function comparisonGroupById(groupId) {
+  return comparisonGroups.find((group) => group.id === Number(groupId));
+}
+
+function comparisonStyleById(styleId) {
+  return comparisonStyles.find((style) => style.id === Number(styleId));
+}
+
+async function deleteComparisonGroup(group) {
+  if (!group || !await globalThis.appDialog.confirm({
+    title: "비교군 삭제",
+    message: `${group.name}과 생성된 비교 이미지를 모두 삭제할까요?`,
+    confirmLabel: "삭제",
+    tone: "danger",
+  })) return false;
+  await apiFetch(`/api/comparisons/${group.id}`, { method: "DELETE" });
+  comparisonActiveGroupId = null;
+  closeComparisonEditor();
+  await loadComparisons();
+  return true;
+}
+
+function renderComparisonFolders() {
+  const target = styleElement("comparisonGroups");
+  if (!target) return;
+  target.replaceChildren();
+  if (!comparisonGroups.length) {
+    const empty = document.createElement("div");
+    empty.className = "latest-result-placeholder";
+    empty.textContent = "저장된 비교군이 없습니다.";
+    target.append(empty);
+    return;
+  }
+  comparisonGroups.forEach((group) => {
+    const folder = document.createElement("article");
+    folder.className = "comparison-folder";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "comparison-folder-open";
+    const preview = document.createElement("div");
+    preview.className = "comparison-folder-preview";
+    group.results.slice(0, 4).forEach((result) => {
+      const image = document.createElement("img");
+      image.src = result.image_url;
+      image.alt = result.style_name;
+      preview.append(image);
+    });
+    if (!group.results.length) {
+      const empty = document.createElement("span");
+      empty.className = "comparison-folder-empty";
+      empty.textContent = "아직 생성된 그림 없음";
+      preview.append(empty);
+    }
+    const badge = document.createElement("span");
+    badge.className = "comparison-folder-badge";
+    badge.textContent = "폴더";
+    preview.append(badge);
+    const meta = document.createElement("div");
+    meta.className = "comparison-folder-meta";
+    const name = document.createElement("strong");
+    name.textContent = group.name;
+    const count = document.createElement("small");
+    count.textContent = `${group.results.length}/${group.selected_style_ids?.length || group.results.length}개 · ${group.width}×${group.height}`;
+    meta.append(name, count);
+    open.append(preview, meta);
+    open.addEventListener("click", () => openComparisonGallery(group.id));
+    const actions = document.createElement("div");
+    actions.className = "comparison-folder-actions";
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.textContent = "선택 변경";
+    edit.addEventListener("click", () => openComparisonEditor(group));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger-button";
+    remove.textContent = "삭제";
+    remove.addEventListener("click", () => deleteComparisonGroup(group));
+    actions.append(edit, remove);
+    folder.append(open, actions);
+    target.append(folder);
+  });
+}
+
+function comparisonResultItem(group, styleId) {
+  const result = group.results.find((item) => item.confirmed_style_id === styleId);
+  return result
+    ? { styleId, result, style: comparisonStyleById(styleId), missing: false }
+    : { styleId, result: null, style: comparisonStyleById(styleId), missing: true };
+}
+
+function renderComparisonResultDetail(group, item) {
+  const target = styleElement("comparisonResultDetail");
+  if (!target) return;
+  target.replaceChildren();
+  if (!group || !item) {
+    const empty = document.createElement("div");
+    empty.className = "latest-result-placeholder";
+    empty.textContent = "갤러리의 그림을 선택하세요.";
+    target.append(empty);
+    return;
+  }
+  const settings = item.result?.settings || {};
+  const style = item.style || {};
+  const image = document.createElement("img");
+  image.src = item.result?.image_url || style.image_url || "";
+  image.alt = item.result?.style_name || style.name || `확정 그림체 #${item.styleId}`;
+  const head = document.createElement("div");
+  head.className = "comparison-result-detail-head";
+  const title = document.createElement("h3");
+  title.textContent = item.result?.style_name || style.name || `확정 그림체 #${item.styleId}`;
+  const state = document.createElement("small");
+  state.textContent = item.missing ? "미생성" : "생성 완료";
+  head.append(title, state);
+  const actions = document.createElement("div");
+  actions.className = "comparison-result-detail-actions";
+  const reacquire = document.createElement("button");
+  reacquire.type = "button";
+  reacquire.className = "primary";
+  reacquire.textContent = item.missing ? "이 그림 생성" : "그림 재습득";
+  reacquire.addEventListener("click", () => regenerateComparisonStyle(group.id, item.styleId));
+  actions.append(reacquire);
+  if (item.result) {
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger-button";
+    remove.textContent = "그림 삭제";
+    remove.addEventListener("click", async () => {
+      if (!await globalThis.appDialog.confirm({ title: "비교 그림 삭제", message: "이 그림을 삭제할까요? 나중에 다시 생성할 수 있습니다.", confirmLabel: "삭제", tone: "danger" })) return;
+      await apiFetch(`/api/comparison-results/${item.result.id}`, { method: "DELETE" });
+      comparisonFocusedResultStyleId = item.styleId;
+      await loadComparisons({ openGroupId: group.id });
+    });
+    actions.append(remove);
+  }
+  const info = document.createElement("div");
+  info.className = "comparison-result-info";
+  comparisonTextRow(info, "작가 프롬프트", settings.artist_prompt || style.artist_prompt);
+  comparisonTextRow(info, "퀄리티 프롬프트", settings.quality_prompt || style.quality_prompt);
+  comparisonTextRow(info, "고정 프롬프트", combinePromptSections(settings.style_fixed_prompt || style.fixed_prompt, settings.comparison_fixed_prompt || group.fixed_prompt));
+  comparisonTextRow(info, "캐릭터 프롬프트", (settings.character_prompts || group.character_prompts || []).join("\n"));
+  comparisonTextRow(info, "네거티브 프롬프트", settings.negative_prompt || style.negative_prompt);
+  comparisonTextRow(info, "생성 설정", `${settings.sampler || style.sampler || "기본"} / ${settings.noise_schedule || style.noise_schedule || "기본"} · ${settings.steps ?? style.steps ?? "기본"} steps · CFG ${settings.scale ?? style.scale ?? "기본"} · Rescale ${settings.cfg_rescale ?? style.cfg_rescale ?? "기본"} · Variety+ ${(settings.variety_plus ?? style.variety_plus) ? "켜짐" : "꺼짐"} · ${settings.model || style.model || "기본 모델"} · Seed ${settings.seed ?? "미지정"}`);
+  target.append(image, head, actions, info);
+}
+
+function renderComparisonGallery(group) {
+  const target = styleElement("comparisonResultGallery");
+  if (!target || !group) return;
+  const selectedIds = group.selected_style_ids?.length
+    ? group.selected_style_ids
+    : group.results.map((item) => item.confirmed_style_id);
+  if (!selectedIds.includes(comparisonFocusedResultStyleId)) {
+    comparisonFocusedResultStyleId = selectedIds[0] || null;
+  }
+  styleElement("comparisonGalleryTitle").textContent = group.name;
+  styleElement("comparisonGalleryCount").textContent = `${group.results.length}/${selectedIds.length}개 생성`;
+  target.replaceChildren();
+  selectedIds.forEach((styleId) => {
+    const item = comparisonResultItem(group, styleId);
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "comparison-result-card";
+    card.classList.toggle("selected", comparisonFocusedResultStyleId === styleId);
+    card.classList.toggle("missing", item.missing);
+    const image = document.createElement("img");
+    image.src = item.result?.image_url || item.style?.image_url || "";
+    image.alt = item.result?.style_name || item.style?.name || `확정 그림체 #${styleId}`;
+    const name = document.createElement("span");
+    name.textContent = image.alt;
+    const state = document.createElement("small");
+    state.textContent = item.missing ? "미생성 · 클릭하여 확인" : "생성 완료";
+    card.append(image, name, state);
+    card.addEventListener("click", () => {
+      comparisonFocusedResultStyleId = styleId;
+      renderComparisonGallery(group);
+    });
+    target.append(card);
+  });
+  renderComparisonResultDetail(group, comparisonFocusedResultStyleId ? comparisonResultItem(group, comparisonFocusedResultStyleId) : null);
+}
+
+function openComparisonGallery(groupId) {
+  const group = comparisonGroupById(groupId);
+  if (!group) return;
+  comparisonActiveGroupId = group.id;
+  styleElement("comparisonGroups")?.classList.add("hidden");
+  styleElement("comparisonEditor")?.classList.add("hidden");
+  styleElement("comparisonGallery")?.classList.remove("hidden");
+  styleElement("addComparison")?.classList.add("hidden");
+  styleElement("backToComparisonList")?.classList.remove("hidden");
+  styleElement("comparisonPageTitle").textContent = group.name;
+  renderComparisonGallery(group);
+}
+
+function closeComparisonGallery() {
+  comparisonActiveGroupId = null;
+  comparisonFocusedResultStyleId = null;
+  closeComparisonEditor();
+}
+
+function backFromComparisonSubview() {
+  const editorOpen = !styleElement("comparisonEditor")?.classList.contains("hidden");
+  if (editorOpen && comparisonActiveGroupId && comparisonGroupById(comparisonActiveGroupId)) {
+    comparisonEditingGroupId = null;
+    openComparisonGallery(comparisonActiveGroupId);
+    return;
+  }
+  if (!styleElement("comparisonGallery")?.classList.contains("hidden")) {
+    closeComparisonGallery();
+    return;
+  }
+  closeComparisonEditor();
+}
+
+async function loadComparisons({ openGroupId = null } = {}) {
+  const [groups, styles] = await Promise.all([
+    apiFetch("/api/comparisons"),
+    apiFetch("/api/confirmed-styles"),
+  ]);
+  comparisonGroups = groups;
+  comparisonStyles = styles;
+  renderComparisonFolders();
+  const targetGroupId = openGroupId || comparisonActiveGroupId;
+  if (targetGroupId && comparisonGroupById(targetGroupId)) openComparisonGallery(targetGroupId);
+}
+
+async function regenerateComparisonStyle(groupId, styleId) {
+  const status = styleElement("comparisonStatus");
+  setComparisonProgress(0, 1, "그림을 재습득하는 중 · 0/1");
+  try {
+    await apiFetch(`/api/comparisons/${groupId}/styles/${styleId}/generate`, { method: "POST", body: "{}" });
+    comparisonFocusedResultStyleId = styleId;
+    setComparisonProgress(1, 1, "그림 재습득 완료 · 1/1");
+    if (status) status.textContent = "선택한 그림을 다시 생성했습니다.";
+    await loadComparisons({ openGroupId: groupId });
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    setComparisonProgress(0, 1, "그림 재습득 실패");
+  }
+}
+
+function comparisonRequestPayload(styleIds) {
+  return {
+    group_id: comparisonEditingGroupId,
+    name: styleElement("comparisonName").value,
+    style_ids: styleIds,
+    fixed_prompt: styleElement("comparisonFixedPrompt").value,
+    character_prompts: readComparisonCharacterPrompts(),
+    width: Number(styleElement("comparisonWidth").value),
+    height: Number(styleElement("comparisonHeight").value),
+    seed_mode: styleElement("comparisonSeedMode").value,
+    seed: Number(styleElement("comparisonSeed").value) || null,
+    defer_generation: true,
+    defaults: {
+      sampler: styleElement("comparisonDefaultSampler").value,
+      noise_schedule: styleElement("comparisonDefaultSchedule").value,
+      steps: Number(styleElement("comparisonDefaultSteps").value),
+      scale: Number(styleElement("comparisonDefaultScale").value),
+      cfg_rescale: Number(styleElement("comparisonDefaultRescale").value),
+      variety_plus: styleElement("comparisonDefaultVariety").value === "1",
+      model: styleElement("comparisonDefaultModel").value,
+    },
+  };
+}
+
+async function createComparison() {
+  const styleIds = [...comparisonSelectedStyleIds];
+  const modalStatus = styleElement("comparisonModalStatus");
+  const globalStatus = styleElement("comparisonStatus");
+  const button = styleElement("createComparison");
+  if (!styleIds.length) {
+    modalStatus.textContent = "확정 그림체를 한 개 이상 선택하세요.";
+    return;
+  }
+  button.disabled = true;
+  let groupId = comparisonEditingGroupId;
+  try {
+    modalStatus.textContent = "비교군 정보를 저장하는 중…";
+    const prepared = await apiFetch("/api/comparisons", {
+      method: "POST",
+      body: JSON.stringify(comparisonRequestPayload(styleIds)),
+    });
+    groupId = prepared.id;
+    comparisonEditingGroupId = groupId;
+    const pending = prepared.pending_style_ids || [];
+    let completed = Number(prepared.generated_count) || 0;
+    const total = Number(prepared.total_count) || styleIds.length;
+    setComparisonProgress(completed, total, `${completed}/${total}개 생성 완료`);
+    for (const [index, styleId] of pending.entries()) {
+      const style = comparisonStyleById(styleId);
+      modalStatus.textContent = `${style?.name || `확정 그림체 #${styleId}`} 생성 중 · ${completed}/${total}`;
+      await apiFetch(`/api/comparisons/${groupId}/styles/${styleId}/generate`, { method: "POST", body: "{}" });
+      completed += 1;
+      setComparisonProgress(completed, total, `${completed}/${total}개 생성 완료`);
+      modalStatus.textContent = `${index + 1}/${pending.length}개 새 그림 처리 · 전체 ${completed}/${total}`;
+    }
+    if (globalStatus) globalStatus.textContent = `비교군 생성 완료 · ${completed}/${total}개`;
+    closeComparisonEditor();
+    comparisonActiveGroupId = groupId;
+    await loadComparisons({ openGroupId: groupId });
+  } catch (error) {
+    modalStatus.textContent = error.message;
+    if (globalStatus) globalStatus.textContent = error.message;
+    if (groupId) {
+      closeComparisonEditor();
+      comparisonActiveGroupId = groupId;
+      await loadComparisons({ openGroupId: groupId });
+    }
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function applyExtractedConfirmedMetadata(metadata) {
+  confirmedFormValue("confirmedStyleArtistPrompt", metadata.artist_prompt || "");
+  confirmedFormValue("confirmedStyleQualityPrompt", metadata.quality_prompt || "");
+  confirmedFormValue("confirmedStyleFixedPrompt", metadata.fixed_prompt || "");
+  confirmedFormValue("confirmedStyleNegativePrompt", metadata.negative_prompt || "");
+  confirmedFormValue("confirmedStyleSampler", metadata.sampler || "");
+  confirmedFormValue("confirmedStyleScheduler", metadata.noise_schedule || "");
+  confirmedFormValue("confirmedStyleSteps", metadata.steps);
+  confirmedFormValue("confirmedStyleScale", metadata.scale);
+  confirmedFormValue("confirmedStyleCfgRescale", metadata.cfg_rescale);
+  confirmedFormValue("confirmedStyleVariety", metadata.variety_plus === true ? "1" : metadata.variety_plus === false ? "0" : "unknown");
+  setConfirmedModelValue(metadata.model || "");
+  styleState.confirmedModalExcludedTags = [...(metadata.excluded_quality_tags || [])];
+  styleState.confirmedModalOriginalQualityPrompt = metadata.original_quality_prompt || metadata.quality_prompt || "";
+  renderConfirmedExcludedTags();
+}
+
+async function useConfirmedStyleFile(file) {
+  if (!(file instanceof Blob)) return;
+  if (file.size > 32 * 1024 * 1024) {
+    const status = styleElement("confirmedStyleModalStatus");
+    if (status) status.textContent = "이미지는 32MB 이하여야 합니다.";
+    return;
+  }
+  styleState.confirmedModalFile = file;
+  styleState.confirmedModalSource = null;
+  if (styleState.confirmedModalObjectUrl) URL.revokeObjectURL(styleState.confirmedModalObjectUrl);
+  styleState.confirmedModalObjectUrl = URL.createObjectURL(file);
+  setConfirmedPreview(styleState.confirmedModalObjectUrl);
+  const form = new FormData();
+  form.append("image", file, file.name || "pasted.png");
+  const status = styleElement("confirmedStyleMetadataStatus");
+  if (status) status.textContent = "이미지 정보를 읽는 중…";
+  try {
+    const metadata = await apiFetch("/api/confirmed-styles/extract", { method: "POST", body: form });
+    applyExtractedConfirmedMetadata(metadata);
+    if (status) status.textContent = metadata.metadata_status === "ok"
+      ? "NovelAI 메타데이터를 불러왔습니다."
+      : "메타데이터가 없어 이미지 크기만 읽었습니다. 나머지는 직접 입력하세요.";
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
+function nullableConfirmedNumber(id) {
+  const value = styleElement(id)?.value.trim();
+  if (!value) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function readConfirmedStyleForm() {
+  const variety = styleElement("confirmedStyleVariety")?.value || "unknown";
+  return {
+    name: styleElement("confirmedStyleName")?.value || "",
+    description: styleElement("confirmedStyleDescription")?.value || "",
+    artist_prompt: styleElement("confirmedStyleArtistPrompt")?.value || "",
+    quality_prompt: styleElement("confirmedStyleQualityPrompt")?.value || "",
+    original_quality_prompt: styleState.confirmedModalOriginalQualityPrompt || styleElement("confirmedStyleQualityPrompt")?.value || "",
+    excluded_quality_tags: [...styleState.confirmedModalExcludedTags],
+    fixed_prompt: styleElement("confirmedStyleFixedPrompt")?.value || "",
+    negative_prompt: styleElement("confirmedStyleNegativePrompt")?.value || "",
+    sampler: styleElement("confirmedStyleSampler")?.value || "",
+    noise_schedule: styleElement("confirmedStyleScheduler")?.value || "",
+    steps: nullableConfirmedNumber("confirmedStyleSteps"),
+    scale: nullableConfirmedNumber("confirmedStyleScale"),
+    cfg_rescale: nullableConfirmedNumber("confirmedStyleCfgRescale"),
+    variety_plus: variety === "1" ? true : variety === "0" ? false : null,
+    model: styleElement("confirmedStyleModel")?.value || "",
+  };
+}
+
+async function saveConfirmedStyleFromModal() {
+  const status = styleElement("confirmedStyleModalStatus");
+  const data = readConfirmedStyleForm();
+  try {
+    let result;
+    if (styleState.confirmedModalEditId) {
+      result = await apiFetch(`/api/confirmed-styles/${styleState.confirmedModalEditId}`, {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      });
+    } else if (styleState.confirmedModalFile) {
+      const form = new FormData();
+      form.append("image", styleState.confirmedModalFile, styleState.confirmedModalFile.name || "pasted.png");
+      form.append("data", JSON.stringify(data));
+      result = await apiFetch("/api/confirmed-styles", { method: "POST", body: form });
+    } else if (styleState.confirmedModalSource) {
+      result = await apiFetch("/api/confirmed-styles", {
+        method: "POST",
+        body: JSON.stringify({ ...data, ...styleState.confirmedModalSource }),
+      });
+    } else {
+      throw new Error("대표 이미지를 추가해 주세요.");
+    }
+    closeConfirmedStyleModal();
+    setStyleManagerMode("confirmed");
+    return result;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    return null;
+  }
 }
 
 function openGeneratedImage(images, index) {
@@ -3222,6 +4397,7 @@ function initializeStyleMaker() {
     "generationSampler",
     "generationScheduler",
     "generationSteps",
+    "generationVarietyPlus",
     "generationSeed",
     "generationSeedFixed",
     "generationCount",
@@ -3267,6 +4443,7 @@ if (typeof document !== "undefined") {
       document.body.classList.toggle("style-maker-active", isStyleMaker);
       if (isStyleMaker) initializeStyleMaker();
       if (button.dataset.tab === "style-manager" && styleState.managerDirty) loadStyleManager();
+      if (button.dataset.tab === "comparison") loadComparisons();
     });
   });
 
@@ -3277,11 +4454,115 @@ if (typeof document !== "undefined") {
   styleElement("testNovelAiKey")?.addEventListener("click", testNovelAiKey);
   styleElement("deleteNovelAiKey")?.addEventListener("click", deleteNovelAiKey);
   styleElement("refreshStyleManager")?.addEventListener("click", loadStyleManager);
+  document.querySelectorAll("[data-style-manager-mode]").forEach((button) => {
+    button.addEventListener("click", () => setStyleManagerMode(button.dataset.styleManagerMode));
+  });
+  syncStyleManagerFilterControls();
+  styleElement("styleManagerSearch")?.addEventListener("input", () => applyStyleManagerFilters({ delayed: true }));
+  ["styleManagerScopeFilter", "styleManagerMetadataFilter", "styleManagerRecommendationMin", "styleManagerSort"]
+    .forEach((id) => styleElement(id)?.addEventListener("change", () => applyStyleManagerFilters()));
+  const managerPageSize = styleElement("styleManagerPageSize");
+  if (managerPageSize) {
+    try {
+      managerPageSize.value = String(normalizeStyleManagerPageSize(localStorage.getItem(STYLE_MANAGER_PAGE_SIZE_KEY)));
+    } catch (_) { managerPageSize.value = String(styleState.managerPageSize); }
+    styleState.managerPageSize = normalizeStyleManagerPageSize(managerPageSize.value);
+    managerPageSize.addEventListener("change", () => {
+      styleState.managerPageSize = normalizeStyleManagerPageSize(managerPageSize.value);
+      managerPageSize.value = String(styleState.managerPageSize);
+      styleState.managerPage = 1;
+      resetStyleManagerDetail();
+      try { localStorage.setItem(STYLE_MANAGER_PAGE_SIZE_KEY, String(styleState.managerPageSize)); } catch (_) { /* Storage can be disabled. */ }
+      if (styleState.managerMode === "shared") loadStyleManager();
+      else renderStyleManagerList(styleState.managerStyles);
+    });
+  }
+  const managerCardSize = styleElement("styleManagerCardSize");
+  if (managerCardSize) {
+    try {
+      const storedSize = localStorage.getItem(STYLE_MANAGER_CARD_SIZE_KEY);
+      if (["small", "medium", "large"].includes(storedSize)) managerCardSize.value = storedSize;
+    } catch (_) { /* Storage can be disabled. */ }
+    styleElement("styleManagerList")?.setAttribute("data-card-size", managerCardSize.value);
+    managerCardSize.addEventListener("change", () => {
+      styleElement("styleManagerList")?.setAttribute("data-card-size", managerCardSize.value);
+      try { localStorage.setItem(STYLE_MANAGER_CARD_SIZE_KEY, managerCardSize.value); } catch (_) { /* Storage can be disabled. */ }
+    });
+  }
+  try {
+    styleState.managerDescriptions = localStorage.getItem(STYLE_MANAGER_DESCRIPTION_KEY) === "1";
+  } catch (_) { styleState.managerDescriptions = false; }
+  const descriptionToggle = styleElement("toggleStyleDescriptions");
+  if (descriptionToggle) {
+    descriptionToggle.checked = styleState.managerDescriptions;
+    descriptionToggle.addEventListener("change", () => {
+      styleState.managerDescriptions = descriptionToggle.checked;
+      try { localStorage.setItem(STYLE_MANAGER_DESCRIPTION_KEY, descriptionToggle.checked ? "1" : "0"); } catch (_) { /* Storage can be disabled. */ }
+      renderStyleManagerList(styleState.managerStyles);
+    });
+  }
+  styleElement("addConfirmedStyle")?.addEventListener("click", () => openConfirmedStyleModal());
+  styleElement("addComparison")?.addEventListener("click", () => { hideComparisonProgress(); openComparisonEditor(); });
+  styleElement("backToComparisonList")?.addEventListener("click", backFromComparisonSubview);
+  styleElement("editComparisonSelection")?.addEventListener("click", () => {
+    const group = comparisonGroupById(comparisonActiveGroupId);
+    if (group) openComparisonEditor(group);
+  });
+  styleElement("deleteOpenComparison")?.addEventListener("click", () => {
+    const group = comparisonGroupById(comparisonActiveGroupId);
+    if (group) deleteComparisonGroup(group);
+  });
+  styleElement("comparisonStyleSearch")?.addEventListener("input", renderComparisonPicker);
+  styleElement("toggleComparisonDetailColumn")?.addEventListener("click", () => toggleComparisonColumn("detail"));
+  styleElement("toggleComparisonSettingsColumn")?.addEventListener("click", () => toggleComparisonColumn("settings"));
+  styleElement("comparisonResolution")?.addEventListener("change", (event) => { const [width, height] = event.target.value.split("x"); if (width && height) { styleElement("comparisonWidth").value = width; styleElement("comparisonHeight").value = height; } syncComparisonResolutionFields(); });
+  styleElement("comparisonSeedMode")?.addEventListener("change", syncComparisonResolutionFields);
+  bindPromptTagAutocomplete(styleElement("comparisonFixedPrompt"));
+  styleElement("addComparisonCharacterPrompt")?.addEventListener("click", addComparisonCharacterPrompt);
+  styleElement("createComparison")?.addEventListener("click", createComparison);
+  styleElement("styleManagerPrevPage")?.addEventListener("click", () => setStyleManagerPage(styleState.managerPage - 1));
+  styleElement("styleManagerNextPage")?.addEventListener("click", () => setStyleManagerPage(styleState.managerPage + 1));
   styleElement("beginStyleSelection")?.addEventListener("click", () => {
     if (!styleState.managerSelectionMode) setStyleSelectionMode(true);
   });
   styleElement("cancelStyleSelection")?.addEventListener("click", () => setStyleSelectionMode(false));
   styleElement("deleteSelectedStyles")?.addEventListener("click", deleteSelectedManagedStyles);
+  styleElement("closeConfirmedStyleModal")?.addEventListener("click", closeConfirmedStyleModal);
+  styleElement("cancelConfirmedStyle")?.addEventListener("click", closeConfirmedStyleModal);
+  document.querySelectorAll("[data-close-confirmed-style]").forEach((item) => item.addEventListener("click", closeConfirmedStyleModal));
+  styleElement("saveConfirmedStyle")?.addEventListener("click", saveConfirmedStyleFromModal);
+  styleElement("chooseConfirmedStyleImage")?.addEventListener("click", () => styleElement("confirmedStyleFile")?.click());
+  styleElement("confirmedStyleFile")?.addEventListener("change", (event) => useConfirmedStyleFile(event.target.files?.[0]));
+  const confirmedDropZone = styleElement("confirmedStyleDropZone");
+  confirmedDropZone?.addEventListener("click", () => {
+    if (!styleState.confirmedModalEditId) styleElement("confirmedStyleFile")?.click();
+  });
+  confirmedDropZone?.addEventListener("keydown", (event) => {
+    if ((event.key === "Enter" || event.key === " ") && !styleState.confirmedModalEditId) {
+      event.preventDefault();
+      styleElement("confirmedStyleFile")?.click();
+    }
+  });
+  ["dragenter", "dragover"].forEach((eventName) => confirmedDropZone?.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    confirmedDropZone.classList.add("drag-over");
+  }));
+  ["dragleave", "drop"].forEach((eventName) => confirmedDropZone?.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    confirmedDropZone.classList.remove("drag-over");
+    if (eventName === "drop" && !styleState.confirmedModalEditId) useConfirmedStyleFile(event.dataTransfer?.files?.[0]);
+  }));
+  ["confirmedStyleArtistPrompt", "confirmedStyleQualityPrompt", "confirmedStyleFixedPrompt", "confirmedStyleNegativePrompt"]
+    .forEach((id) => bindPromptTagAutocomplete(styleElement(id)));
+  document.addEventListener("paste", (event) => {
+    const modal = styleElement("confirmedStyleModal");
+    if (!modal || modal.classList.contains("hidden") || styleState.confirmedModalEditId) return;
+    const file = [...(event.clipboardData?.files || [])].find((item) => item.type.startsWith("image/"));
+    if (file) {
+      event.preventDefault();
+      useConfirmedStyleFile(file);
+    }
+  });
   styleElement("generatedImageClose")?.addEventListener("click", closeGeneratedImage);
   document.querySelectorAll("[data-close-generated-image]").forEach((item) => item.addEventListener("click", closeGeneratedImage));
   styleElement("generatedImagePrev")?.addEventListener("click", () => moveGeneratedImage(-1));
@@ -3338,11 +4619,17 @@ if (typeof module !== "undefined" && module.exports) {
     reachedGenerationLimit,
     toggleSelectedStyleId,
     managerCombinedPromptText,
+    confirmedGeneratedSourceValues,
+    filterStyleManagerItems,
+    paginateStyleManagerItems,
+    normalizeStyleManagerPageSize,
     normalizeRatingTagRules,
     validateRatingTagRules,
     ratingTagRuleCount,
     normalizeRatingExcludeTags,
     validateRatingExcludeTags,
     opusFreeGenerationIssues,
+    normalizeComparisonCharacterPrompts,
+    normalizeNumericPromptClosers,
   };
 }

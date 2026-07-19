@@ -25,6 +25,8 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from style_logic import normalize_numeric_prompt_closers
+
 
 ARCA_BASE_URL = "https://arca.live"
 ARCA_BOARD_PATH = "/b/aiart"
@@ -1490,22 +1492,22 @@ def _is_novelai_metadata(values):
 def _extract_prompt_parts(values):
     v4_prompt = values.get("v4_prompt") if isinstance(values.get("v4_prompt"), dict) else {}
     caption = v4_prompt.get("caption") if isinstance(v4_prompt.get("caption"), dict) else {}
-    base_prompt = str(caption.get("base_caption") or values.get("prompt") or values.get("prompts") or "")
+    base_prompt = normalize_numeric_prompt_closers(caption.get("base_caption") or values.get("prompt") or values.get("prompts") or "")
     characters = []
     for entry in caption.get("char_captions", []) if isinstance(caption.get("char_captions"), list) else []:
         if isinstance(entry, dict) and entry.get("char_caption"):
             characters.append({
-                "prompt": str(entry["char_caption"]),
+                "prompt": normalize_numeric_prompt_closers(entry["char_caption"]),
                 "centers": entry.get("centers") if isinstance(entry.get("centers"), list) else [],
             })
     v4_negative = values.get("v4_negative_prompt") if isinstance(values.get("v4_negative_prompt"), dict) else {}
     negative_caption = v4_negative.get("caption") if isinstance(v4_negative.get("caption"), dict) else {}
-    negative_prompt = str(negative_caption.get("base_caption") or values.get("uc") or values.get("negative_prompt") or values.get("undesired_content") or "")
+    negative_prompt = normalize_numeric_prompt_closers(negative_caption.get("base_caption") or values.get("uc") or values.get("negative_prompt") or values.get("undesired_content") or "")
     return base_prompt, negative_prompt, characters
 
 
 def extract_novelai_metadata(image_bytes, content_type=""):
-    base = {"metadata_status": "no_metadata", "prompt": "", "base_prompt": "", "negative_prompt": "", "character_prompts": [], "seed": "", "sampler": "", "steps": None, "scale": None, "cfg_rescale": None, "noise_schedule": "", "model": "", "width": None, "height": None, "raw_metadata_json": "{}"}
+    base = {"metadata_status": "no_metadata", "prompt": "", "base_prompt": "", "negative_prompt": "", "character_prompts": [], "seed": "", "sampler": "", "steps": None, "scale": None, "cfg_rescale": None, "noise_schedule": "", "model": "", "width": None, "height": None, "variety_plus": None, "skip_cfg_above_sigma": None, "raw_metadata_json": "{}"}
     if not (image_bytes.startswith(b"\x89PNG") or "png" in content_type.lower()): return base
     chunks = extract_png_text_chunks(image_bytes)
     values = {}
@@ -1514,6 +1516,12 @@ def extract_novelai_metadata(image_bytes, content_type=""):
         lowered_key = key.lower()
         if lowered_key == "uc":
             values["uc"] = raw
+        elif lowered_key == "source":
+            source = str(raw or "").strip()
+            if source:
+                values.setdefault("source", source)
+                if source.casefold().startswith("novelai diffusion"):
+                    values.setdefault("model", source)
         else:
             _merge_raw_metadata(
                 values,
@@ -1529,7 +1537,9 @@ def extract_novelai_metadata(image_bytes, content_type=""):
         return next((values[name] for name in names if values.get(name) not in (None, "")), "")
     prompt, negative, characters = _extract_prompt_parts(values)
     if not prompt and not negative: return base
-    base.update({"metadata_status": "ok", "prompt": str(prompt), "base_prompt": str(prompt), "negative_prompt": str(negative), "character_prompts": characters, "seed": str(pick("seed")), "sampler": str(pick("sampler")), "steps": pick("steps") or None, "scale": pick("scale") or None, "cfg_rescale": pick("cfg_rescale") or None, "noise_schedule": str(pick("noise_schedule")), "model": str(pick("model")), "width": pick("width") or None, "height": pick("height") or None, "raw_metadata_json": json.dumps(values, ensure_ascii=False)})
+    has_variety = "skip_cfg_above_sigma" in values
+    skip_cfg = values.get("skip_cfg_above_sigma") if has_variety else None
+    base.update({"metadata_status": "ok", "prompt": str(prompt), "base_prompt": str(prompt), "negative_prompt": str(negative), "character_prompts": characters, "seed": str(pick("seed")), "sampler": str(pick("sampler")), "steps": pick("steps") or None, "scale": pick("scale") or None, "cfg_rescale": pick("cfg_rescale") or None, "noise_schedule": str(pick("noise_schedule")), "model": str(pick("model")), "width": pick("width") or None, "height": pick("height") or None, "variety_plus": bool(skip_cfg) if has_variety else None, "skip_cfg_above_sigma": skip_cfg, "raw_metadata_json": json.dumps(values, ensure_ascii=False)})
     return base
 
 
@@ -1820,6 +1830,18 @@ def _canonical_artist_tag(tag):
         return ""
     artist = re.sub(r"\s+", " ", match.group(1)).strip().casefold()
     return f"artist:{artist}" if artist else ""
+
+
+def split_artist_quality_prompt(prompt):
+    artists = []
+    remaining = []
+    for parsed in parse_weighted_prompt_tags(prompt):
+        formatted = _format_parsed_prompt_tag(parsed)
+        if _canonical_artist_tag(parsed["tag"]):
+            artists.append(formatted)
+        else:
+            remaining.append(formatted)
+    return ", ".join(artists), ", ".join(remaining)
 
 
 def _canonical_quality_tag(tag):
@@ -2197,6 +2219,113 @@ def get_arca_style_page(db_path, filters=None):
     }
 
 
+def get_arca_image_gallery_page(db_path, offset=0, limit=60, image_dir=None, filters=None):
+    try:
+        offset = max(int(offset), 0)
+        limit = min(max(int(limit), 1), 200)
+    except (TypeError, ValueError):
+        raise ArcaCollectorError("갤러리 표시 개수와 위치를 확인해 주세요.")
+    filters = dict(filters or {})
+    clauses = ["TRIM(COALESCE(image.image_path,''))<>''"]
+    args = []
+    query = str(filters.get("q") or "").strip()
+    if query:
+        clauses.append(
+            "(item.title LIKE ? OR item.source_url LIKE ? OR image.prompt LIKE ? "
+            "OR image.base_prompt LIKE ? OR image.negative_prompt LIKE ? OR image.model LIKE ?)"
+        )
+        args.extend([f"%{query}%"] * 6)
+    tab = str(filters.get("tab") or "all")
+    if tab in {"NAI", "R18_NAI"}:
+        clauses.append("item.board_tab=?")
+        args.append(tab)
+    metadata = str(filters.get("metadata") or "all")
+    if metadata != "all":
+        clauses.append("image.metadata_status=?")
+        args.append(metadata)
+    recommendation_min = filters.get("recommendation_min")
+    if recommendation_min not in (None, ""):
+        try:
+            recommendation_min = int(recommendation_min)
+        except (TypeError, ValueError):
+            raise ArcaCollectorError("최소 추천수는 0 이상의 숫자여야 합니다.") from None
+        if recommendation_min < 0:
+            raise ArcaCollectorError("최소 추천수는 0 이상의 숫자여야 합니다.")
+        clauses.append("item.recommendation_count IS NOT NULL AND item.recommendation_count>=?")
+        args.append(recommendation_min)
+    order_sql = {
+        "posted_asc": "COALESCE(item.posted_at,'') ASC,image.id ASC",
+        "recommend_desc": "item.recommendation_count DESC,image.id DESC",
+    }.get(str(filters.get("sort") or "posted_desc"), "COALESCE(item.posted_at,'') DESC,image.id DESC")
+    with closing(_connect(db_path)) as conn:
+        candidates = conn.execute(
+            "SELECT image.id,image.image_path FROM arca_style_images image "
+            "JOIN arca_style_items item ON item.id=image.item_id WHERE "
+            + " AND ".join(clauses) + f" ORDER BY {order_sql}",
+            args,
+        ).fetchall()
+        available_ids = [
+            int(row["id"])
+            for row in candidates
+            if image_dir is None or _local_image_exists(image_dir, row["image_path"])
+        ]
+        total = len(available_ids)
+        page_ids = available_ids[offset:offset + limit]
+        if not page_ids:
+            rows = []
+        else:
+            placeholders = ",".join("?" for _ in page_ids)
+            fetched_rows = conn.execute(
+                f"""
+            SELECT image.id,image.item_id,image.image_url AS remote_image_url,image.image_path,
+                   image.content_type,image.metadata_status,image.prompt,image.base_prompt,
+                   image.negative_prompt,image.character_prompts_json,image.seed,image.sampler,
+                   image.steps,image.scale,image.cfg_rescale,image.noise_schedule,image.model,
+                   image.width,image.height,image.raw_metadata_json,image.created_at,
+                   item.title,item.source_url,item.board_tab,item.posted_at,
+                   EXISTS(
+                       SELECT 1 FROM confirmed_styles
+                       WHERE source_type='shared' AND source_id=image.id
+                   ) AS confirmed
+            FROM arca_style_images image
+            JOIN arca_style_items item ON item.id=image.item_id
+            WHERE image.id IN ({placeholders})
+            """,
+                page_ids,
+            ).fetchall()
+            rows_by_id = {int(row["id"]): row for row in fetched_rows}
+            rows = [rows_by_id[image_id] for image_id in page_ids if image_id in rows_by_id]
+    items = []
+    for row in rows:
+        item = _row(row)
+        try:
+            characters = json.loads(item.pop("character_prompts_json") or "[]")
+        except json.JSONDecodeError:
+            characters = []
+        try:
+            raw_metadata = json.loads(item.pop("raw_metadata_json") or "{}")
+        except json.JSONDecodeError:
+            raw_metadata = {}
+        skip_cfg_present = "skip_cfg_above_sigma" in raw_metadata
+        skip_cfg = raw_metadata.get("skip_cfg_above_sigma") if skip_cfg_present else None
+        item["character_prompts"] = characters if isinstance(characters, list) else []
+        item["artist_prompt"], item["quality_prompt"] = split_artist_quality_prompt(
+            item.get("base_prompt") or item.get("prompt") or ""
+        )
+        item["raw_metadata"] = raw_metadata
+        item["variety_plus"] = bool(skip_cfg) if skip_cfg_present else None
+        item["skip_cfg_above_sigma"] = skip_cfg
+        item["confirmed"] = bool(item.get("confirmed"))
+        items.append(item)
+    return {
+        "items": items,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "has_more": offset + len(items) < total,
+    }
+
+
 def _recommendation_summary(values):
     numbers = [int(value) for value in values if value is not None]
     return {
@@ -2302,7 +2431,7 @@ def _quality_tag_sequence(prompt):
 def _format_parsed_prompt_tag(parsed):
     tag = re.sub(r"\s+", " ", str(parsed["tag"] or "")).strip()
     weight = float(parsed["weight"])
-    return tag if abs(weight - 1.0) <= 1e-6 else f"{weight:g}::{tag}::"
+    return normalize_numeric_prompt_closers(tag if abs(weight - 1.0) <= 1e-6 else f"{weight:g}::{tag}::")
 
 
 def _is_character_content_tag(tag):
@@ -2435,7 +2564,7 @@ def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
         negative_prompt = row["negative_prompt"]
         base_prompt = row["base_prompt"]
         excluded_tags = row["excluded_tags"]
-        if not base_prompt or not negative_prompt:
+        if not base_prompt and not negative_prompt:
             continue
         parsed_artists = row["parsed_artists"]
         matched = tuple(sorted(selected_artists.intersection(parsed_artists)))
@@ -2476,7 +2605,14 @@ def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
         -entry["sample_count"],
         entry["base_prompt"],
     ))
-    return {"presets": presets[:limit], "selected_artist_count": len(selected_artists)}
+    quality_keys = [entry["key"] for entry in presets if entry["base_prompt"]][:limit]
+    selected_keys = set(quality_keys)
+    negative_keys = [entry["key"] for entry in presets if entry["negative_prompt"]][:limit]
+    selected_keys.update(negative_keys)
+    return {
+        "presets": [entry for entry in presets if entry["key"] in selected_keys],
+        "selected_artist_count": len(selected_artists),
+    }
 
 
 def _statistics_representative(row, weight=None):

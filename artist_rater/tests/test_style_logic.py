@@ -13,6 +13,7 @@ import app
 from style_logic import (
     assign_weights,
     build_artist_prompt,
+    normalize_numeric_prompt_closers,
     normalize_style_artists,
     random_weight,
     select_artists,
@@ -71,6 +72,20 @@ class PngValidatorTest(unittest.TestCase):
 
 
 class StyleIdentityTest(unittest.TestCase):
+    def test_numeric_prompt_closer_spaces_tag_end_without_changing_weight_opener(self):
+        self.assertEqual(
+            normalize_numeric_prompt_closers(
+                "1.5::artist:matrix16::, 2::year 2025::, -3::clone::"
+            ),
+            "1.5::artist:matrix16 ::, 2::year 2025 ::, -3::clone::",
+        )
+
+    def test_numeric_prompt_closer_handles_unweighted_artist_tag(self):
+        self.assertEqual(
+            normalize_numeric_prompt_closers("artist:foo 2::, best quality"),
+            "artist:foo 2 ::, best quality",
+        )
+
     def test_prompt_preserves_artist_order(self):
         artists = [
             {"artist": "artist_b", "weight": 0.5, "score": 3},

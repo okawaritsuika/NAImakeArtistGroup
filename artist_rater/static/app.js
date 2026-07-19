@@ -46,8 +46,9 @@ function showStatus(target, message, type = "") {
 }
 
 async function apiFetch(url, options = {}) {
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: { ...(isFormData ? {} : { "Content-Type": "application/json" }), ...(options.headers || {}) },
     ...options,
   });
   const data = await response.json().catch(() => ({}));

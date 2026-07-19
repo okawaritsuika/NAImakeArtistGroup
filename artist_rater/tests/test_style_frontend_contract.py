@@ -370,13 +370,14 @@ class StyleFrontendContractTest(unittest.TestCase):
             self.assertIn(marker, self.html)
         for marker in (
             'grid-template-columns: minmax(560px, 3fr) minmax(430px, 2fr)',
-            'grid-template-columns: 124px minmax(0, 1fr)',
+            'grid-template-columns: 160px minmax(0, 1fr)',
             '.manager-image-inspector',
             '.manager-selected-image',
         ):
             self.assertIn(marker, self.css)
         for marker in (
-            'apiFetch("/api/art-styles/delete-batch"',
+            '"/api/confirmed-styles/delete-batch"',
+            '"/api/style-manager/generated/delete-batch"',
             'appendManagerPromptBlock(inspector, "작가 · 퀄리티", managerCombinedPromptText(item)',
             'negativeToggle.textContent = styleState.managerNegativeExpanded',
             'appendManagerPromptBlock(\n    inspector,\n    "캐릭터"',
@@ -386,10 +387,38 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn('class="danger-button style-manager-delete-selected hidden"', self.html)
         self.assertIn('.style-manager-delete-selected', self.css)
         self.assertIn('min-width: 172px', self.css)
-        selection_branch = self.script.index('if (styleState.managerSelectionMode)')
-        detail_load = self.script.index('loadStyleDetail(style.id);', selection_branch)
+        selection_branch = self.script.index('if (styleState.managerSelectionMode && styleState.managerMode !== "shared")')
+        detail_load = self.script.index('renderStyleManagerDetail(style);', selection_branch)
         self.assertLess(selection_branch, detail_load)
         self.assertNotIn('return;', self.script[selection_branch:detail_load])
+
+    def test_comparison_groups_use_folder_gallery_progress_and_reacquire(self):
+        for marker in (
+            'id="comparisonProgress"',
+            'id="comparisonGallery"',
+            'id="comparisonResultGallery"',
+            'id="comparisonResultDetail"',
+            'id="editComparisonSelection"',
+            'id="deleteOpenComparison"',
+        ):
+            self.assertIn(marker, self.html)
+        for marker in (
+            '.comparison-folder',
+            '.comparison-gallery-view',
+            '.comparison-result-card',
+            '.comparison-result-detail',
+        ):
+            self.assertIn(marker, self.css)
+        for marker in (
+            'function setComparisonProgress(',
+            'function renderComparisonFolders(',
+            'function openComparisonGallery(',
+            'function renderComparisonResultDetail(',
+            'async function regenerateComparisonStyle(',
+            'defer_generation: true',
+            '/generate`',
+        ):
+            self.assertIn(marker, self.script)
 
     def test_workspace_uses_internal_scroll_and_responsive_grid(self):
         for marker in (

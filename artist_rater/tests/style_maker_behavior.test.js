@@ -42,13 +42,34 @@ const {
   buildEffectivePromptText,
   toggleSelectedStyleId,
   managerCombinedPromptText,
+  confirmedGeneratedSourceValues,
+  filterStyleManagerItems,
+  paginateStyleManagerItems,
+  normalizeStyleManagerPageSize,
   normalizeRatingTagRules,
   validateRatingTagRules,
   ratingTagRuleCount,
   normalizeRatingExcludeTags,
   validateRatingExcludeTags,
   opusFreeGenerationIssues,
+  normalizeComparisonCharacterPrompts,
+  normalizeNumericPromptClosers,
 } = require("../static/style_maker.js");
+
+test("numeric prompt closers keep weight openers and space numeric tag endings", () => {
+  assert.equal(
+    normalizeNumericPromptClosers("1.5::artist:matrix16::, 2::year 2025::, -3::clone::"),
+    "1.5::artist:matrix16 ::, 2::year 2025 ::, -3::clone::",
+  );
+});
+
+test("comparison character prompts allow none and normalize separate rows", () => {
+  assert.deepEqual(normalizeComparisonCharacterPrompts(null), []);
+  assert.deepEqual(
+    normalizeComparisonCharacterPrompts([" sakuragi mano, cowboy shot ", "", "asuka langley"]),
+    ["sakuragi mano, cowboy shot", "asuka langley"],
+  );
+});
 
 test("rating tag rules normalize multiple tags and count reserved artists", () => {
   const rules = normalizeRatingTagRules([
@@ -111,6 +132,64 @@ test("style manager combines the weighted artist prompt before quality tags", ()
     managerCombinedPromptText(image),
     "1.25::artist:sample artist::, masterpiece, best quality",
   );
+});
+
+test("generated style confirmation keeps its image and generation settings", () => {
+  const source = confirmedGeneratedSourceValues({
+    id: 12,
+    image_url: "/generated/4/sample.png",
+    artists: [{ artist: "sample_artist", weight: 1.25 }],
+    quality_prompt: "very aesthetic",
+    negative_prompt: "lowres",
+    sampler: "k_euler_ancestral",
+    noise_schedule: "karras",
+    steps: 28,
+    scale: 5,
+    cfg_rescale: 0.2,
+    variety_plus: true,
+    model: "nai-diffusion-4-5-full",
+  });
+
+  assert.equal(source.image_url, "/generated/4/sample.png");
+  assert.equal(source.sampler, "k_euler_ancestral");
+  assert.equal(source.noise_schedule, "karras");
+  assert.equal(source.steps, 28);
+  assert.equal(source.scale, 5);
+  assert.equal(source.cfg_rescale, 0.2);
+  assert.equal(source.variety_plus, true);
+  assert.equal(source.model, "nai-diffusion-4-5-full");
+  assert.equal(source.artist_prompt, "1.25::artist:sample artist::");
+});
+
+test("style manager filters each gallery mode and sorts visible cards", () => {
+  const generated = [
+    { id: 1, created_at: "2026-01-01", confirmed: false, artists: [{ artist: "alpha" }] },
+    { id: 2, created_at: "2026-01-02", confirmed: true, artists: [{ artist: "beta" }] },
+  ];
+  assert.deepEqual(
+    filterStyleManagerItems(generated, "generated", { query: "beta", scope: "confirmed", sort: "newest" }).map((item) => item.id),
+    [2],
+  );
+  const confirmed = [
+    { id: 3, updated_at: "2026-01-03", source_type: "manual", name: "직접 보관" },
+    { id: 4, updated_at: "2026-01-04", source_type: "shared", name: "공유 보관" },
+  ];
+  assert.deepEqual(
+    filterStyleManagerItems(confirmed, "confirmed", { scope: "shared", sort: "oldest" }).map((item) => item.id),
+    [4],
+  );
+});
+
+test("style manager pagination slices generated and confirmed records", () => {
+  assert.deepEqual(
+    paginateStyleManagerItems([{ id: 1 }, { id: 2 }, { id: 3 }], 2, 2).map((item) => item.id),
+    [3],
+  );
+});
+
+test("style manager accepts only supported page sizes", () => {
+  assert.equal(normalizeStyleManagerPageSize("48"), 48);
+  assert.equal(normalizeStyleManagerPageSize("13"), 24);
 });
 
 test("continuous random targets migrate old settings and keep four independent toggles", () => {
