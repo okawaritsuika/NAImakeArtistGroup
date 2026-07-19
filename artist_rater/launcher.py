@@ -79,6 +79,15 @@ def normalize_version(value):
     return tuple(parts or [0])
 
 
+def independent_frozen_environment(environment=None):
+    env = dict(os.environ if environment is None else environment)
+    for key in tuple(env):
+        if key.startswith("_PYI_") or key == "_MEIPASS2":
+            env.pop(key, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 class LauncherController:
     def __init__(
         self,
@@ -142,13 +151,15 @@ class LauncherController:
             return "서버가 이미 실행 중입니다."
         command = [str(self.executable), "--server"] if self.frozen else [sys.executable, "app.py"]
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self.process = self.popen(
-            command,
-            cwd=str(self.app_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
+        kwargs = {
+            "cwd": str(self.app_dir),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "creationflags": creationflags,
+        }
+        if self.frozen:
+            kwargs["env"] = independent_frozen_environment()
+        self.process = self.popen(command, **kwargs)
         return "서버를 시작했습니다."
 
     def stop_server(self):
@@ -229,21 +240,35 @@ class LauncherController:
         current_exe = self.executable
         lines = [
             "@echo off",
-            "timeout /t 2 /nobreak >nul",
-            f'copy /y "{downloaded_exe}" "{current_exe}" >nul',
+            'set "PYINSTALLER_RESET_ENVIRONMENT=1"',
+            "ping 127.0.0.1 -n 2 >nul",
+            "for /l %%i in (1,1,30) do (",
+            f'  copy /y "{downloaded_exe}" "{current_exe}" >nul 2>nul && goto updated',
+            "  ping 127.0.0.1 -n 2 >nul",
+            ")",
+            f'start "" "{current_exe}"',
+            "exit /b 1",
+            ":updated",
             f'start "" "{current_exe}"',
             f'del "{downloaded_exe}" >nul 2>nul',
             'del "%~f0" >nul 2>nul',
         ]
         script.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
-        subprocess.Popen(
+        self.popen(
             ["cmd", "/c", str(script)],
             cwd=str(script.parent),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=independent_frozen_environment(),
         )
         return "업데이트를 설치합니다. 리모콘을 종료합니다."
+
+
+def download_and_prepare_update(controller, update_info):
+    target = controller.download_update(update_info)
+    controller.stop_server()
+    return controller.prepare_update_install(target)
 
 
 class LauncherApp:
@@ -479,14 +504,12 @@ class LauncherApp:
         self.set_status("업데이트 파일을 받는 중입니다...")
 
         def action():
-            target = self.controller.download_update(self.latest_update)
-            return self.controller.prepare_update_install(target)
+            return download_and_prepare_update(self.controller, self.latest_update)
 
         def on_success(message):
             self.set_status(message)
             if self.controller.frozen:
-                time.sleep(0.2)
-                os._exit(0)
+                self.close_app()
 
         self.run_background(action, on_success)
 
