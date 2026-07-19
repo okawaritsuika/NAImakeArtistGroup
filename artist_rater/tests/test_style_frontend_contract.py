@@ -270,11 +270,8 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn("function setPromptViewMode", source)
         self.assertIn('setPromptViewMode("buttons")', source)
 
-    def test_collected_prompt_presets_support_auto_and_fixed_modes(self):
+    def test_collected_prompt_presets_follow_the_generation_random_targets(self):
         for marker in (
-            'id="promptPresetMode"',
-            '<option value="auto">자동 추천</option>',
-            '<option value="fixed">수동 고정</option>',
             'id="promptPresetSelect"',
             'id="applyPromptPreset"',
             'id="promptPresetStatus"',
@@ -283,12 +280,18 @@ class StyleFrontendContractTest(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
+        self.assertNotIn('id="promptPresetMode"', self.html)
+        self.assertNotIn('>자동 추천</option>', self.html)
+        self.assertNotIn('>수동 고정</option>', self.html)
+        self.assertNotIn('return applyPromptPreset(styleState.promptPresets[0])', self.script)
         for marker in (
             'apiFetch("/api/style-maker/prompt-presets"',
             "function applyPromptPreset",
-            "function refreshAutomaticPromptPreset",
+            "function refreshPromptPresetsForArtists",
             "function fixPromptPresetAfterManualEdit",
             "function restoreExcludedPromptTag",
+            'targets.has("quality")',
+            'targets.has("negative")',
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.script)
@@ -311,11 +314,30 @@ class StyleFrontendContractTest(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
-        self.assertIn('["basePrompt", "fixedPrompt", "negativePrompt"].forEach((id) => bindPromptTagAutocomplete', self.script)
+        self.assertIn('["basePrompt", "fixedPrompt", "negativePrompt"]', self.script)
         self.assertIn('autocomplete.className = "autocomplete prompt-tag-autocomplete hidden"', self.script)
         self.assertIn("bindPromptTagAutocomplete(input);", self.script)
-        self.assertIn('Number(item?.category) === 1 ? `artist:${name}` : name', self.script)
+        self.assertIn('return `artist:${/\\d$/.test(name) ? `${name} ` : name}`;', self.script)
         self.assertIn('fragment.replace(/^artist:/i, "")', self.script)
+
+    def test_rated_artist_tag_rules_open_in_a_modal_and_are_sent_with_style_requests(self):
+        for marker in (
+            'id="openRatingTagRules"',
+            'id="ratingTagRulesModal"',
+            'id="ratingTagRulesList"',
+            'id="addRatingTagRule"',
+            'id="saveRatingTagRules"',
+            'id="ratingTagExclusionsList"',
+            'id="addRatingTagExclusion"',
+        ):
+            self.assertIn(marker, self.html)
+        self.assertNotIn('id="ratingArtistTagFilter"', self.html)
+        self.assertIn('rating_tag_rules:', self.script)
+        self.assertIn('rating_exclude_tags:', self.script)
+        self.assertIn('function openRatingTagRulesModal()', self.script)
+        self.assertIn('bindPromptTagAutocomplete(tagInput);', self.script)
+        self.assertIn('tagInput.dataset.ratingTagAutocomplete = "true"', self.script)
+        self.assertIn('.rating-tag-rule-row .prompt-tag-autocomplete', self.css)
 
     def test_editor_script_exposes_state_and_required_operations(self):
         source = JS_PATH.read_text(encoding="utf-8")
@@ -338,6 +360,36 @@ class StyleFrontendContractTest(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
+
+    def test_style_manager_has_wide_gallery_inspector_and_batch_delete(self):
+        for marker in (
+            'id="beginStyleSelection"',
+            'id="deleteSelectedStyles"',
+            'id="cancelStyleSelection"',
+        ):
+            self.assertIn(marker, self.html)
+        for marker in (
+            'grid-template-columns: minmax(560px, 3fr) minmax(430px, 2fr)',
+            'grid-template-columns: 124px minmax(0, 1fr)',
+            '.manager-image-inspector',
+            '.manager-selected-image',
+        ):
+            self.assertIn(marker, self.css)
+        for marker in (
+            'apiFetch("/api/art-styles/delete-batch"',
+            'appendManagerPromptBlock(inspector, "작가 · 퀄리티", managerCombinedPromptText(item)',
+            'negativeToggle.textContent = styleState.managerNegativeExpanded',
+            'appendManagerPromptBlock(\n    inspector,\n    "캐릭터"',
+            'function renderStyleManagerImageSelection()',
+        ):
+            self.assertIn(marker, self.script)
+        self.assertIn('class="danger-button style-manager-delete-selected hidden"', self.html)
+        self.assertIn('.style-manager-delete-selected', self.css)
+        self.assertIn('min-width: 172px', self.css)
+        selection_branch = self.script.index('if (styleState.managerSelectionMode)')
+        detail_load = self.script.index('loadStyleDetail(style.id);', selection_branch)
+        self.assertLess(selection_branch, detail_load)
+        self.assertNotIn('return;', self.script[selection_branch:detail_load])
 
     def test_workspace_uses_internal_scroll_and_responsive_grid(self):
         for marker in (
@@ -422,6 +474,10 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn("await generateCurrentStyle()", source)
         self.assertIn("async function loadStyleManager()", source)
         self.assertIn("function renderGeneratedImageModal()", source)
+        self.assertIn("function opusFreeGenerationIssues", source)
+        self.assertIn('title: "Anlas가 차감될 수 있습니다"', source)
+        self.assertIn('await confirmGenerationAnlasRisk("single")', source)
+        self.assertIn('await confirmGenerationAnlasRisk("continuous")', source)
 
     def test_single_generation_randomizes_enabled_targets_before_generation(self):
         start = self.script.index("async function generateOneRandomizedStyle()")

@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 import tempfile
@@ -406,9 +407,29 @@ class WeightEngineTest(unittest.TestCase):
         )
 
         self.assertEqual([item["artist"] for item in weighted], [item["artist"] for item in self.artists[:5]])
-        self.assertLess(weighted[0]["weight"], weighted[2]["weight"])
-        self.assertGreater(weighted[2]["weight"], weighted[4]["weight"])
-        self.assertTrue(all(0.1 <= item["weight"] <= 2.3 for item in weighted))
+        self.assertEqual(
+            [item["weight"] for item in weighted],
+            [0.2, 1.1, 2.0, 1.3, 0.6],
+        )
+
+    def test_profile_mode_uses_explicit_total_prompt_positions_without_jitter(self):
+        weighted = assign_weights(
+            self.artists[:2],
+            "profile",
+            0.1,
+            2.3,
+            False,
+            [],
+            rng_seed=7,
+            profile=[
+                {"position": 0, "weight": 1.5},
+                {"position": 1 / 6, "weight": 1.0},
+                {"position": 1, "weight": 2.3},
+            ],
+            positions=[0, 1 / 6],
+        )
+
+        self.assertEqual([item["weight"] for item in weighted], [1.5, 1.0])
 
     def test_profile_mode_rejects_invalid_control_points(self):
         invalid_profiles = (
@@ -593,6 +614,127 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         self.assertIn("artist_prompt", data)
         self.assertIn("style_hash", data)
 
+    def test_endpoint_filters_rated_artists_by_saved_query_tag(self):
+        with closing(app.db()) as conn, conn:
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag IN (?, ?)",
+                (json.dumps(["dakimakura_(medium)"]), "alpha", "beta"),
+            )
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag = ?",
+                (json.dumps(["school_uniform"]), "gamma"),
+            )
+
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 2,
+                "scores": [1, 2, 3, 4, 5],
+                "rating_tag_filter": "dakimakura (medium)",
+                "rng_seed": 4,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            {item["artist"] for item in response.get_json()["artists"]},
+            {"alpha", "beta"},
+        )
+
+    def test_endpoint_reserves_multiple_tag_counts_and_fills_remainder_from_all_ratings(self):
+        with closing(app.db()) as conn, conn:
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag = ?",
+                (json.dumps(["dakimakura_(medium)"]), "alpha"),
+            )
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag = ?",
+                (json.dumps(["portrait"]), "beta"),
+            )
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag = ?",
+                (json.dumps(["white_sheet"]), "gamma"),
+            )
+
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 3,
+                "scores": [1, 2, 3, 4, 5],
+                "rating_tag_rules": [
+                    {"tag": "dakimakura (medium)", "count": 1},
+                    {"tag": "white sheet", "count": 1},
+                ],
+                "rng_seed": 9,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            {item["artist"] for item in response.get_json()["artists"]},
+            {"alpha", "beta", "gamma"},
+        )
+
+    def test_endpoint_rejects_tag_counts_that_exceed_remaining_slots(self):
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 2,
+                "scores": [1, 2, 3, 4, 5],
+                "rating_tag_rules": [
+                    {"tag": "dakimakura", "count": 2},
+                    {"tag": "white_sheet", "count": 1},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("남은 자리", response.get_json()["error"])
+
+    def test_endpoint_rejects_duplicate_or_invalid_rating_tag_rules(self):
+        payloads = (
+            [{"tag": "white_sheet", "count": 1}, {"tag": "WHITE SHEET", "count": 1}],
+            [{"tag": "white_sheet", "count": True}],
+            [{"tag": "", "count": 1}],
+        )
+        for rules in payloads:
+            with self.subTest(rules=rules):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json={"count": 3, "scores": [1, 2, 3, 4, 5], "rating_tag_rules": rules},
+                )
+                self.assertEqual(response.status_code, 400)
+
+    def test_endpoint_excludes_rated_artists_collected_with_selected_tags(self):
+        with closing(app.db()) as conn, conn:
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag = ?",
+                (json.dumps(["monochrome"]), "alpha"),
+            )
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag = ?",
+                (json.dumps(["portrait"]), "beta"),
+            )
+            conn.execute(
+                "UPDATE ratings SET query_tags_json = ? WHERE artist_tag = ?",
+                (json.dumps(["school_uniform"]), "gamma"),
+            )
+
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 2,
+                "scores": [1, 2, 3, 4, 5],
+                "rating_exclude_tags": ["monochrome"],
+                "rng_seed": 12,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            {item["artist"] for item in response.get_json()["artists"]},
+            {"beta", "gamma"},
+        )
+
     @patch("app.get_shared_style_artist_pool")
     def test_endpoint_can_fill_fixed_slots_from_shared_styles(self, shared_pool):
         shared_pool.return_value = [
@@ -613,6 +755,91 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         artists = response.get_json()["artists"]
         self.assertEqual({item["artist"] for item in artists}, {"shared_alpha", "shared_beta"})
         self.assertTrue(all(item["shared_style"] for item in artists))
+
+    @patch("app.get_shared_style_artist_pool")
+    def test_fixed_artists_reduce_the_remaining_shared_artist_slots(self, shared_pool):
+        shared_pool.return_value = [
+            {"artist": "shared_alpha", "sample_count": 8},
+            {"artist": "shared_beta", "sample_count": 5},
+        ]
+        fixed = [
+            {"artist": f"fixed_{index}", "weight": 0.5 + index * 0.1}
+            for index in range(5)
+        ]
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 7,
+                "scores": [1, 2, 3, 4, 5],
+                "shared_artist_min": 2,
+                "shared_artist_max": 2,
+                "fixed_artists": fixed,
+                "rng_seed": 5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual(len(artists), 7)
+        self.assertEqual(sum(bool(item.get("shared_style")) for item in artists), 2)
+        self.assertTrue({item["artist"] for item in fixed} <= {item["artist"] for item in artists})
+
+    def test_zero_shared_slots_fill_only_the_remainder_from_rated_artists(self):
+        fixed = [
+            {"artist": f"fixed_{index}", "weight": 0.5 + index * 0.1}
+            for index in range(5)
+        ]
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 7,
+                "scores": [4, 5],
+                "shared_artist_min": 0,
+                "shared_artist_max": 0,
+                "fixed_artists": fixed,
+                "rng_seed": 7,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual(len(artists), 7)
+        self.assertEqual({item["artist"] for item in artists if item.get("score")}, {"alpha", "beta"})
+        self.assertFalse(any(item.get("shared_style") for item in artists))
+
+    def test_profile_uses_open_total_slots_when_fixed_artists_occupy_later_positions(self):
+        fixed = [
+            {"artist": f"fixed_{index}", "weight": 0.7 + index * 0.1, "slot": index + 3}
+            for index in range(5)
+        ]
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 7,
+                "scores": [4, 5],
+                "shared_artist_min": 0,
+                "shared_artist_max": 0,
+                "fixed_artists": fixed,
+                "weight_mode": "profile",
+                "min_weight": 0.1,
+                "max_weight": 2.3,
+                "weight_profile": [
+                    {"position": 0, "weight": 1.5},
+                    {"position": 1 / 6, "weight": 1.0},
+                    {"position": 1, "weight": 2.3},
+                ],
+                "rng_seed": 7,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        random_artists = [item for item in artists if not item["artist"].startswith("fixed_")]
+        self.assertEqual([item["weight"] for item in random_artists], [1.5, 1.0])
+        self.assertEqual(
+            [item["weight"] for item in artists if item["artist"].startswith("fixed_")],
+            [round(item["weight"], 2) for item in fixed],
+        )
 
     @patch("app.get_shared_style_artist_pool")
     def test_endpoint_can_build_twelve_artists_only_from_shared_styles(self, shared_pool):
@@ -811,6 +1038,45 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertTrue(set(names).isdisjoint({"alpha", "beta"}))
         self.assertEqual([item["weight"] for item in artists], [1.7, 0.4])
+
+    def test_artist_reroll_replaces_only_slots_remaining_after_fixed_artists(self):
+        with closing(app.db()) as conn, conn:
+            for artist, score in (("delta", 4), ("epsilon", 3)):
+                conn.execute(
+                    """
+                    INSERT INTO ratings (
+                        artist_tag, score, mode, created_at, updated_at
+                    ) VALUES (?, ?, 'manual', ?, ?)
+                    """,
+                    (artist, score, app.now_text(), app.now_text()),
+                )
+        fixed = [
+            {"artist": f"fixed_{index}", "weight": 0.5 + index * 0.1}
+            for index in range(5)
+        ]
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "reroll": "artists",
+                "artists": fixed + [
+                    {"artist": "alpha", "score": 5, "weight": 1.7},
+                    {"artist": "beta", "score": 4, "weight": 0.4},
+                ],
+                "fixed_artists": fixed,
+                "count": 7,
+                "scores": [2, 3, 4, 5],
+                "rng_seed": 9,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        artists = response.get_json()["artists"]
+        self.assertEqual(len(artists), 7)
+        self.assertTrue({item["artist"] for item in fixed} <= {item["artist"] for item in artists})
+        random_artists = [item for item in artists if not item["artist"].startswith("fixed_")]
+        self.assertEqual(len(random_artists), 2)
+        self.assertTrue({item["artist"] for item in random_artists}.isdisjoint({"alpha", "beta"}))
+        self.assertEqual([item["weight"] for item in random_artists], [1.7, 0.4])
 
     def test_endpoint_returns_400_for_invalid_user_input(self):
         invalid_payloads = (

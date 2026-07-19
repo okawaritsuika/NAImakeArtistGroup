@@ -205,6 +205,7 @@ def assign_weights(
     ranges,
     rng_seed=None,
     profile=None,
+    positions=None,
 ):
     try:
         minimum = float(minimum)
@@ -231,15 +232,27 @@ def assign_weights(
         items.append(normalized)
     if mode == "profile":
         points = validate_weight_profile(profile, minimum, maximum)
-        spread = (maximum - minimum) * 0.04
         last_index = max(1, len(items) - 1)
+        if positions is not None:
+            if (
+                not isinstance(positions, list)
+                or len(positions) != len(items)
+                or any(
+                    not isinstance(position, (int, float))
+                    or isinstance(position, bool)
+                    or not math.isfinite(position)
+                    or not 0 <= position <= 1
+                    for position in positions
+                )
+            ):
+                raise ValueError("가중치 그래프 자리 정보를 확인하세요.")
         result = []
         for index, item in enumerate(items):
-            target = interpolate_weight_profile(points, index / last_index)
-            jittered = min(maximum, max(minimum, target + rng.uniform(-spread, spread)))
+            position = positions[index] if positions is not None else index / last_index
+            target = interpolate_weight_profile(points, position)
             result.append(
                 {key: value for key, value in item.items() if key != "_index"}
-                | {"weight": round(jittered, 2)}
+                | {"weight": round(target, 2)}
             )
         return result
     if mode == "random" or (mode == "custom" and not ranges):

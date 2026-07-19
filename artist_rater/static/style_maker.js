@@ -6,6 +6,7 @@ const styleState = {
   styleArtistAutocompleteItems: [],
   styleArtistAutocompleteIndex: -1,
   styleArtistAutocompleteTimer: null,
+  styleArtistAutocompleteRequestToken: 0,
   promptTagAutocompleteItems: [],
   promptTagAutocompleteIndex: -1,
   promptTagAutocompleteTimer: null,
@@ -25,9 +26,17 @@ const styleState = {
   managerDirty: true,
   managerImages: [],
   managerImageIndex: 0,
+  managerStyles: [],
+  managerDetail: null,
+  managerSelectionMode: false,
+  selectedStyleIds: new Set(),
+  managerNegativeExpanded: false,
+  ratingTagRules: [],
+  ratingTagRuleDraft: [],
+  ratingExcludeTags: [],
+  ratingExcludeTagDraft: [],
   promptGroups: [],
   promptPresets: [],
-  promptPresetMode: "auto",
   selectedPromptPresetKey: "",
   promptPresetRequestToken: 0,
   lastPromptPresetArtistSignature: "",
@@ -42,6 +51,8 @@ const styleState = {
 const PROMPT_STORAGE_KEY = "naiArtistRater.prompts.v1";
 const PROMPT_PRESET_STORAGE_KEY = "naiArtistRater.promptPreset.v1";
 const RANDOM_STYLE_TARGETS = ["artists", "weights", "quality", "negative"];
+const OPUS_FREE_MAX_STEPS = 28;
+const OPUS_FREE_MAX_PIXELS = 1024 * 1024;
 
 const STYLE_REQUEST_CONTROL_IDS = [
   "rerollStyleArtists",
@@ -52,6 +63,7 @@ const STYLE_REQUEST_CONTROL_IDS = [
   "styleArtistCount",
   "sharedStyleArtistMin",
   "sharedStyleArtistMax",
+  "openRatingTagRules",
   "styleScoreAll",
   "weightMode",
   "styleMinWeight",
@@ -117,6 +129,14 @@ function normalizeSelectedScores(scores) {
 
 function buildStyleRequestPayload(options, artists, reroll) {
   const payload = { ...options, reroll };
+  payload.fixed_artists = artists
+    .filter((item) => item.fixed === true)
+    .map(({ artist, score, weight, slot }) => ({
+      artist,
+      score,
+      weight,
+      ...(Number.isInteger(Number(slot)) ? { slot: Number(slot) } : {}),
+    }));
   if (reroll !== "all") {
     payload.artists = artists.map(({ artist, score, weight }) => ({ artist, score, weight }));
   }
@@ -201,15 +221,23 @@ function formatArtistPromptTag(artist) {
 }
 
 function parseStyleArtistNames(text) {
+  return parseStyleArtistEntries(text).map((item) => item.artist);
+}
+
+function parseStyleArtistEntries(text) {
   const names = [];
   const seen = new Set();
   String(text || "")
     .split(/[,\n;]+/)
     .map((item) => item.trim())
     .filter(Boolean)
-    .forEach((artist) => {
+    .forEach((value) => {
+      const match = value.match(/^(?:(\d+(?:\.\d+)?)::)?(?:artist:)?(.+?)(?:::)?$/i);
+      const artist = (match?.[2] || "").trim();
+      if (!artist) return;
       if (seen.has(artist)) return;
-      names.push(artist);
+      const weight = match?.[1] === undefined ? undefined : Number(match[1]);
+      names.push(Number.isFinite(weight) && weight > 0 ? { artist, weight } : { artist });
       seen.add(artist);
     });
   return names;
@@ -225,7 +253,21 @@ function insertStyleArtistsAtPosition(currentArtists, artistNames, options = {})
     : current.length + 1;
   const remaining = current.map((item) => ({ ...item }));
   const additions = [];
-  parseStyleArtistNames(artistNames.join("\n")).forEach((artist) => {
+  const requestedArtists = (Array.isArray(artistNames) ? artistNames : [artistNames]).flatMap((item) => (
+    item && typeof item === "object"
+      ? [{ artist: String(item.artist || "").trim(), weight: item.weight }]
+      : parseStyleArtistEntries(item)
+  ));
+  const sequentialSlots = requestedArtists.length > 1
+    && requestedArtists.every((entry) => Number.isFinite(Number(entry.weight)) && Number(entry.weight) > 0);
+  requestedArtists.forEach((entry, entryIndex) => {
+    const artist = entry.artist;
+    if (!artist) return;
+    const artistSlot = sequentialSlots ? slot + entryIndex : slot;
+    const entryWeight = Number(entry.weight);
+    const artistWeight = Number.isFinite(entryWeight) && entryWeight > 0
+      ? Number(entryWeight.toFixed(2))
+      : normalizedWeight;
     const existingIndex = remaining.findIndex((item) => item.artist === artist);
     if (existingIndex >= 0) {
       const [existing] = remaining.splice(existingIndex, 1);
@@ -233,10 +275,10 @@ function insertStyleArtistsAtPosition(currentArtists, artistNames, options = {})
         remaining.splice(existingIndex, 0, existing);
         return;
       }
-      additions.push({ ...existing, weight: normalizedWeight, fixed: true, slot });
+      additions.push({ ...existing, weight: artistWeight, fixed: true, slot: artistSlot });
       return;
     }
-    additions.push({ artist, weight: normalizedWeight, fixed: true, slot });
+    additions.push({ artist, weight: artistWeight, fixed: true, slot: artistSlot });
   });
   const insertAt = Number.isInteger(requestedPosition)
     ? Math.min(remaining.length, Math.max(0, requestedPosition - 1))
@@ -324,6 +366,22 @@ function fixedStyleArtistEntries(artists) {
   return (Array.isArray(artists) ? artists : [])
     .map((artist, index) => ({ artist, index }))
     .filter((entry) => entry.artist.fixed === true);
+}
+
+function limitArtistsToTotalCount(artists, totalCount) {
+  const source = Array.isArray(artists) ? artists : [];
+  const count = Math.max(1, Math.trunc(Number(totalCount)));
+  const fixedCount = source.filter((item) => item.fixed === true).length;
+  if (fixedCount > count) {
+    throw new Error(`고정 작가 ${fixedCount}명이 전체 작가 수 ${count}명보다 많습니다.`);
+  }
+  let remainingRandom = count - fixedCount;
+  return source.filter((item) => {
+    if (item.fixed === true) return true;
+    if (remainingRandom < 1) return false;
+    remainingRandom -= 1;
+    return true;
+  });
 }
 
 function fixedArtistSlotEntries(artists) {
@@ -458,6 +516,59 @@ function combinePromptSections(...sections) {
     .join(", ");
 }
 
+function normalizeRatingTagRules(rules) {
+  if (!Array.isArray(rules)) return [];
+  return rules.map((rule) => ({
+    tag: String(rule?.tag || "").trim().replace(/\s+/g, "_"),
+    count: Number(rule?.count),
+  })).filter((rule) => rule.tag && Number.isInteger(rule.count) && rule.count > 0);
+}
+
+function normalizeRatingExcludeTags(tags) {
+  if (!Array.isArray(tags)) return [];
+  const seen = new Set();
+  return tags.map((tag) => String(tag || "").trim().replace(/\s+/g, "_"))
+    .filter((tag) => {
+      const key = tag.toLowerCase();
+      if (!tag || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function validateRatingExcludeTags(tags) {
+  if (!Array.isArray(tags)) throw new Error("제외 태그 설정을 확인하세요.");
+  if (tags.length > 20) throw new Error("제외 태그는 최대 20개까지 지정할 수 있습니다.");
+  const normalized = normalizeRatingExcludeTags(tags);
+  if (normalized.length !== tags.length) {
+    throw new Error("제외 태그를 비우거나 같은 태그를 두 번 지정할 수 없습니다.");
+  }
+  return normalized;
+}
+
+function validateRatingTagRules(rules) {
+  if (!Array.isArray(rules)) throw new Error("태그별 인원 설정을 확인하세요.");
+  const normalized = [];
+  const seen = new Set();
+  rules.forEach((rule) => {
+    const tag = String(rule?.tag || "").trim().replace(/\s+/g, "_");
+    const count = Number(rule?.count);
+    if (!tag) throw new Error("태그를 입력하세요.");
+    if (!Number.isInteger(count) || count < 1 || count > 50) {
+      throw new Error("태그별 인원은 1명부터 50명 사이의 정수여야 합니다.");
+    }
+    const key = tag.toLowerCase();
+    if (seen.has(key)) throw new Error(`같은 태그를 두 번 지정할 수 없습니다: ${tag}`);
+    seen.add(key);
+    normalized.push({ tag, count });
+  });
+  return normalized;
+}
+
+function ratingTagRuleCount(rules) {
+  return normalizeRatingTagRules(rules).reduce((sum, rule) => sum + rule.count, 0);
+}
+
 function promptTagFragmentBounds(value, cursorPosition = String(value || "").length) {
   const text = String(value || "");
   const cursor = Math.max(0, Math.min(text.length, Number(cursorPosition) || 0));
@@ -493,9 +604,10 @@ function replaceCurrentPromptTagFragment(value, replacement, cursorPosition) {
   };
 }
 
-function formatPromptAutocompleteTag(item) {
-  const name = String(item?.name || "");
-  return Number(item?.category) === 1 ? `artist:${name}` : name;
+function formatPromptAutocompleteTag(item, prefixArtist = true) {
+  const name = String(item?.name || "").replaceAll("_", " ");
+  if (Number(item?.category) !== 1 || !prefixArtist) return name;
+  return `artist:${/\d$/.test(name) ? `${name} ` : name}`;
 }
 
 function readGenerationSettings() {
@@ -514,6 +626,8 @@ function readGenerationSettings() {
     generation_count: Number(styleElement("generationCount")?.value || 10),
     shared_artist_min: Number(styleElement("sharedStyleArtistMin")?.value || 0),
     shared_artist_max: Number(styleElement("sharedStyleArtistMax")?.value || 0),
+    rating_tag_rules: styleState.ratingTagRules.map((rule) => ({ ...rule })),
+    rating_exclude_tags: [...styleState.ratingExcludeTags],
     random_targets: [...selectedRandomTargets()],
   };
 }
@@ -538,6 +652,13 @@ function applyGenerationSettings(settings = {}) {
   setValue("generationCount", settings.generation_count);
   setValue("sharedStyleArtistMin", settings.shared_artist_min ?? 0);
   setValue("sharedStyleArtistMax", settings.shared_artist_max);
+  styleState.ratingTagRules = normalizeRatingTagRules(
+    Array.isArray(settings.rating_tag_rules)
+      ? settings.rating_tag_rules
+      : (settings.rating_tag_filter ? [{ tag: settings.rating_tag_filter, count: 1 }] : []),
+  );
+  styleState.ratingExcludeTags = normalizeRatingExcludeTags(settings.rating_exclude_tags);
+  renderRatingTagRulesSummary();
   setRandomTargets(settings.random_targets, settings.style_change_mode);
   const fixed = styleElement("generationSeedFixed");
   if (fixed && typeof settings.seed_fixed === "boolean") fixed.checked = settings.seed_fixed;
@@ -621,22 +742,20 @@ function loadPromptDraft() {
 function savePromptPresetSettings() {
   if (typeof localStorage === "undefined") return;
   const payload = {
-    mode: styleState.promptPresetMode === "fixed" ? "fixed" : "auto",
     selected_key: styleState.selectedPromptPresetKey || "",
   };
   try { localStorage.setItem(PROMPT_PRESET_STORAGE_KEY, JSON.stringify(payload)); } catch (_) { /* Storage can be disabled. */ }
 }
 
 function loadPromptPresetSettings() {
-  if (typeof localStorage === "undefined") return { mode: "auto", selected_key: "" };
+  if (typeof localStorage === "undefined") return { selected_key: "" };
   try {
     const value = JSON.parse(localStorage.getItem(PROMPT_PRESET_STORAGE_KEY) || "null");
     return {
-      mode: value?.mode === "fixed" ? "fixed" : "auto",
       selected_key: typeof value?.selected_key === "string" ? value.selected_key : "",
     };
   } catch (_) {
-    return { mode: "auto", selected_key: "" };
+    return { selected_key: "" };
   }
 }
 
@@ -674,7 +793,7 @@ function restoreExcludedPromptTag(index) {
   fixPromptPresetAfterManualEdit();
   persistAndRenderPromptControls();
   renderExcludedPromptTags();
-  setPromptPresetStatus(`제외했던 ${item.tag || prompt} 태그를 복원하고 수동 고정했습니다.`, "ok");
+  setPromptPresetStatus(`제외했던 ${item.tag || prompt} 태그를 복원했습니다. 랜덤 대상이 꺼져 있으면 그대로 유지됩니다.`, "ok");
   return true;
 }
 
@@ -721,13 +840,8 @@ function renderPromptPresetOptions() {
   if (applyButton) applyButton.disabled = false;
 }
 
-function applyPromptPreset(preset, { fixed = false } = {}) {
+function applyPromptPreset(preset) {
   if (!preset) return false;
-  if (fixed) {
-    styleState.promptPresetMode = "fixed";
-    const mode = styleElement("promptPresetMode");
-    if (mode) mode.value = "fixed";
-  }
   styleElement("basePrompt").value = preset.base_prompt || preset.quality_prompt || "";
   styleElement("negativePrompt").value = preset.negative_prompt || "";
   styleState.excludedPromptTags = Array.isArray(preset.excluded_tags)
@@ -745,7 +859,7 @@ function applyPromptPreset(preset, { fixed = false } = {}) {
   return true;
 }
 
-async function loadPromptPresets({ force = false, applyAutomatic = true } = {}) {
+async function loadPromptPresets({ force = false } = {}) {
   if (!styleState.artists.length) return false;
   const artists = chooseArtistsForPrompt(styleState.artists).map((item) => item.artist);
   const signature = [...artists].sort().join("\n");
@@ -767,10 +881,7 @@ async function loadPromptPresets({ force = false, applyAutomatic = true } = {}) 
       setPromptPresetStatus("네거티브까지 포함된 수집 프롬프트 세트가 없습니다.", "error");
       return false;
     }
-    if (styleState.promptPresetMode === "auto" && applyAutomatic) {
-      return applyPromptPreset(styleState.promptPresets[0]);
-    }
-    setPromptPresetStatus("세트를 고른 뒤 적용하면 현재 프롬프트로 고정됩니다.");
+    setPromptPresetStatus("세트를 직접 적용하거나, 아래 랜덤 대상에서 퀄리티·네거 프롬을 켜세요.");
     return true;
   } catch (error) {
     if (token === styleState.promptPresetRequestToken) setPromptPresetStatus(error.message, "error");
@@ -778,18 +889,13 @@ async function loadPromptPresets({ force = false, applyAutomatic = true } = {}) 
   }
 }
 
-function refreshAutomaticPromptPreset() {
-  if (styleState.promptPresetMode !== "auto" || styleState.suppressAutomaticPromptPreset) return;
+function refreshPromptPresetsForArtists() {
+  if (styleState.suppressAutomaticPromptPreset) return;
   void loadPromptPresets();
 }
 
 function fixPromptPresetAfterManualEdit() {
-  if (styleState.promptPresetMode !== "auto") return;
-  styleState.promptPresetMode = "fixed";
-  const mode = styleElement("promptPresetMode");
-  if (mode) mode.value = "fixed";
-  savePromptPresetSettings();
-  setPromptPresetStatus("직접 수정한 프롬프트를 수동 고정했습니다.");
+  setPromptPresetStatus("직접 수정한 프롬프트를 유지합니다. 아래 랜덤 대상이 켜진 항목만 생성할 때 바뀝니다.");
 }
 
 function isPromptItemDisabled(item) {
@@ -926,8 +1032,15 @@ function renderPromptGroups() {
     rename.className = "icon-button small";
     rename.title = "그룹 이름 변경";
     rename.textContent = "✎";
-    rename.addEventListener("click", () => {
-      const next = prompt("그룹 이름", group.name);
+    rename.addEventListener("click", async () => {
+      const next = await globalThis.appDialog.prompt({
+        title: "프롬프트 그룹 이름 변경",
+        message: "그룹을 구분할 새 이름을 입력하세요.",
+        inputLabel: "그룹 이름",
+        defaultValue: group.name,
+        confirmLabel: "변경",
+        tone: "info",
+      });
       if (!next?.trim()) return;
       group.name = next.trim();
       persistAndRenderPromptControls();
@@ -1059,6 +1172,205 @@ function validateCustomRanges() {
   return ranges;
 }
 
+function ratingTagComposition(rules = styleState.ratingTagRules) {
+  const total = Number(styleElement("styleArtistCount")?.value || 0);
+  const fixed = fixedStyleArtistEntries(styleState.artists).length;
+  const tagged = ratingTagRuleCount(rules);
+  const sharedMin = Number(styleElement("sharedStyleArtistMin")?.value || 0);
+  const sharedMax = Number(styleElement("sharedStyleArtistMax")?.value || 0);
+  return {
+    total,
+    fixed,
+    tagged,
+    sharedMin,
+    sharedMax,
+    unrestrictedMin: Math.max(0, total - fixed - tagged - sharedMax),
+    unrestrictedMax: Math.max(0, total - fixed - tagged - sharedMin),
+  };
+}
+
+function renderRatingTagRulesSummary() {
+  const summary = styleElement("ratingTagRulesSummary");
+  if (!summary) return;
+  const rules = normalizeRatingTagRules(styleState.ratingTagRules);
+  const exclusions = normalizeRatingExcludeTags(styleState.ratingExcludeTags);
+  const ruleText = rules.length
+    ? rules.map((rule) => `${rule.tag} ${rule.count}명`).join(" · ")
+    : "태그별 인원 설정 없음 · 남은 자리는 전체 평가 작가에서 선택";
+  const exclusionText = exclusions.length ? ` · 제외 ${exclusions.join(", ")}` : "";
+  summary.textContent = `${ruleText}${exclusionText}`;
+}
+
+function renderRatingTagRuleCountSummary() {
+  const target = styleElement("ratingTagRulesCountSummary");
+  if (!target) return;
+  const counts = ratingTagComposition(styleState.ratingTagRuleDraft);
+  const unrestricted = counts.unrestrictedMin === counts.unrestrictedMax
+    ? `${counts.unrestrictedMax}명`
+    : `${counts.unrestrictedMin}~${counts.unrestrictedMax}명`;
+  target.textContent = `전체 ${counts.total}명 · 고정 ${counts.fixed}명 · 태그 지정 ${counts.tagged}명 · 공유 ${counts.sharedMin}~${counts.sharedMax}명 · 전체 평가 작가 ${unrestricted}`;
+}
+
+function renderRatingTagRuleRows() {
+  const list = styleElement("ratingTagRulesList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!styleState.ratingTagRuleDraft.length) {
+    const empty = document.createElement("p");
+    empty.className = "help-text";
+    empty.textContent = "태그 조건이 없습니다. 모든 남은 자리를 전체 평가 작가에서 뽑습니다.";
+    list.append(empty);
+  }
+  styleState.ratingTagRuleDraft.forEach((rule, index) => {
+    const row = document.createElement("div");
+    row.className = "rating-tag-rule-row";
+    const tagField = document.createElement("label");
+    tagField.className = "field";
+    const tagLabel = document.createElement("span");
+    tagLabel.textContent = "평가 태그";
+    const tagInput = document.createElement("input");
+    tagInput.type = "text";
+    tagInput.autocomplete = "off";
+    tagInput.dataset.prefixArtist = "false";
+    tagInput.dataset.ratingTagAutocomplete = "true";
+    tagInput.setAttribute("aria-label", `평가 태그 ${index + 1}`);
+    tagInput.placeholder = "예: dakimakura_(medium)";
+    tagInput.value = rule.tag || "";
+    const autocomplete = document.createElement("div");
+    autocomplete.className = "autocomplete prompt-tag-autocomplete hidden";
+    tagInput.addEventListener("input", () => {
+      styleState.ratingTagRuleDraft[index].tag = tagInput.value;
+      renderRatingTagRuleCountSummary();
+    });
+    tagField.append(tagLabel, tagInput, autocomplete);
+    const countField = document.createElement("label");
+    countField.className = "field";
+    const countLabel = document.createElement("span");
+    countLabel.textContent = "인원";
+    const countInput = document.createElement("input");
+    countInput.type = "number";
+    countInput.min = "1";
+    countInput.max = "50";
+    countInput.step = "1";
+    countInput.value = String(rule.count || 1);
+    countInput.addEventListener("input", () => {
+      styleState.ratingTagRuleDraft[index].count = Number(countInput.value);
+      renderRatingTagRuleCountSummary();
+    });
+    countField.append(countLabel, countInput);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "rating-tag-rule-remove danger-button";
+    remove.title = "태그 조건 삭제";
+    remove.setAttribute("aria-label", "태그 조건 삭제");
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
+      styleState.ratingTagRuleDraft.splice(index, 1);
+      hidePromptTagAutocomplete();
+      renderRatingTagRuleRows();
+      renderRatingTagRuleCountSummary();
+    });
+    row.append(tagField, countField, remove);
+    list.append(row);
+    bindPromptTagAutocomplete(tagInput);
+  });
+  renderRatingTagRuleCountSummary();
+}
+
+function renderRatingTagExclusionRows() {
+  const list = styleElement("ratingTagExclusionsList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!styleState.ratingExcludeTagDraft.length) {
+    const empty = document.createElement("p");
+    empty.className = "help-text";
+    empty.textContent = "제외 태그가 없습니다.";
+    list.append(empty);
+  }
+  styleState.ratingExcludeTagDraft.forEach((tag, index) => {
+    const row = document.createElement("div");
+    row.className = "rating-tag-rule-row rating-tag-exclusion-row";
+    const field = document.createElement("label");
+    field.className = "field";
+    const label = document.createElement("span");
+    label.textContent = "제외할 수집 태그";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.autocomplete = "off";
+    input.dataset.prefixArtist = "false";
+    input.placeholder = "예: monochrome";
+    input.value = tag || "";
+    const autocomplete = document.createElement("div");
+    autocomplete.className = "autocomplete prompt-tag-autocomplete hidden";
+    input.addEventListener("input", () => {
+      styleState.ratingExcludeTagDraft[index] = input.value;
+    });
+    field.append(label, input, autocomplete);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "rating-tag-rule-remove danger-button";
+    remove.title = "제외 태그 삭제";
+    remove.setAttribute("aria-label", "제외 태그 삭제");
+    remove.textContent = "×";
+    remove.addEventListener("click", () => {
+      styleState.ratingExcludeTagDraft.splice(index, 1);
+      hidePromptTagAutocomplete();
+      renderRatingTagExclusionRows();
+    });
+    row.append(field, remove);
+    list.append(row);
+    bindPromptTagAutocomplete(input);
+  });
+}
+
+function openRatingTagRulesModal() {
+  styleState.ratingTagRuleDraft = styleState.ratingTagRules.length
+    ? styleState.ratingTagRules.map((rule) => ({ ...rule }))
+    : [{ tag: "", count: 1 }];
+  styleState.ratingExcludeTagDraft = [...styleState.ratingExcludeTags];
+  const status = styleElement("ratingTagRulesStatus");
+  if (status) status.textContent = "";
+  renderRatingTagRuleRows();
+  renderRatingTagExclusionRows();
+  styleElement("ratingTagRulesModal")?.classList.remove("hidden");
+}
+
+function closeRatingTagRulesModal() {
+  hidePromptTagAutocomplete();
+  styleElement("ratingTagRulesModal")?.classList.add("hidden");
+  styleState.ratingTagRuleDraft = [];
+  styleState.ratingExcludeTagDraft = [];
+}
+
+function addRatingTagRule() {
+  styleState.ratingTagRuleDraft.push({ tag: "", count: 1 });
+  renderRatingTagRuleRows();
+}
+
+function addRatingTagExclusion() {
+  styleState.ratingExcludeTagDraft.push("");
+  renderRatingTagExclusionRows();
+}
+
+function saveRatingTagRules() {
+  const status = styleElement("ratingTagRulesStatus");
+  try {
+    const rules = validateRatingTagRules(styleState.ratingTagRuleDraft);
+    const exclusions = validateRatingExcludeTags(styleState.ratingExcludeTagDraft);
+    const counts = ratingTagComposition(rules);
+    if (counts.fixed + counts.tagged + counts.sharedMin > counts.total) {
+      throw new Error("고정 작가, 태그 지정 인원, 공유 작가 최소 인원의 합이 전체 작가 수를 넘습니다.");
+    }
+    styleState.ratingTagRules = rules;
+    styleState.ratingExcludeTags = exclusions;
+    renderRatingTagRulesSummary();
+    savePromptDraft();
+    closeRatingTagRulesModal();
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
 function readStyleOptions() {
   const count = Number(styleElement("styleArtistCount")?.value);
   const minWeight = Number(styleElement("styleMinWeight")?.value);
@@ -1084,6 +1396,19 @@ function readStyleOptions() {
   if (sharedArtistMin > count) {
     throw new Error("공유 그림체 작가 최소 인원은 전체 작가 수보다 클 수 없습니다.");
   }
+  const fixedArtistCount = fixedStyleArtistEntries(styleState.artists).length;
+  if (fixedArtistCount > count) {
+    throw new Error(`고정 작가 ${fixedArtistCount}명이 전체 작가 수 ${count}명보다 많습니다.`);
+  }
+  if (sharedArtistMin > count - fixedArtistCount) {
+    throw new Error("공유 그림체 작가 최소 인원은 고정 작가를 제외한 남은 자리보다 클 수 없습니다.");
+  }
+  const ratingTagRules = validateRatingTagRules(styleState.ratingTagRules);
+  const ratingExcludeTags = validateRatingExcludeTags(styleState.ratingExcludeTags);
+  const taggedArtistCount = ratingTagRuleCount(ratingTagRules);
+  if (fixedArtistCount + sharedArtistMin + taggedArtistCount > count) {
+    throw new Error("고정 작가, 태그 지정 인원, 공유 작가 최소 인원의 합이 전체 작가 수를 넘습니다.");
+  }
 
   const mode = styleElement("weightMode")?.value || "balanced";
   return {
@@ -1097,6 +1422,8 @@ function readStyleOptions() {
     weight_profile: mode === "profile" ? styleState.weightProfile : undefined,
     shared_artist_min: sharedArtistMin,
     shared_artist_max: sharedArtistMax,
+    rating_tag_rules: ratingTagRules,
+    rating_exclude_tags: ratingExcludeTags,
   };
 }
 
@@ -1637,7 +1964,7 @@ function renderWeightGraph() {
     renderWeightGraphFixedArtistOverlays(graph);
     renderWeightProfilePreview();
     updateArtistPrompt();
-    refreshAutomaticPromptPreset();
+    refreshPromptPresetsForArtists();
     return;
   }
   const min = styleNumber("styleMinWeight", 0.1);
@@ -1742,7 +2069,7 @@ function renderWeightGraph() {
   });
   renderWeightGraphFixedArtistOverlays(graph);
   updateArtistPrompt();
-  refreshAutomaticPromptPreset();
+  refreshPromptPresetsForArtists();
 }
 
 function currentStyleArtistFragment(value) {
@@ -1759,6 +2086,7 @@ function replaceCurrentStyleArtistFragment(value, artist) {
 function hideStyleArtistAutocomplete() {
   const box = styleElement("styleArtistAutocomplete");
   box?.classList.add("hidden");
+  styleState.styleArtistAutocompleteRequestToken += 1;
   styleState.styleArtistAutocompleteItems = [];
   styleState.styleArtistAutocompleteIndex = -1;
 }
@@ -1791,8 +2119,10 @@ async function updateStyleArtistAutocomplete() {
     hideStyleArtistAutocomplete();
     return;
   }
+  const requestToken = ++styleState.styleArtistAutocompleteRequestToken;
   try {
     const items = await apiFetch(`/api/tags/autocomplete?q=${encodeURIComponent(query)}&category=1`);
+    if (requestToken !== styleState.styleArtistAutocompleteRequestToken) return;
     styleState.styleArtistAutocompleteItems = Array.isArray(items) ? items : [];
     styleState.styleArtistAutocompleteIndex = -1;
     box.replaceChildren();
@@ -1833,6 +2163,7 @@ function handleStyleArtistAutocompleteKeydown(event) {
 
 function hidePromptTagAutocomplete() {
   styleState.promptTagAutocompleteBox?.classList.add("hidden");
+  styleState.promptTagAutocompleteRequestToken += 1;
   styleState.promptTagAutocompleteItems = [];
   styleState.promptTagAutocompleteIndex = -1;
   styleState.promptTagAutocompleteInput = null;
@@ -1852,7 +2183,11 @@ function applyPromptTagAutocomplete(index = styleState.promptTagAutocompleteInde
   const input = styleState.promptTagAutocompleteInput;
   const item = styleState.promptTagAutocompleteItems[index];
   if (!input || !item) return;
-  const result = replaceCurrentPromptTagFragment(input.value, formatPromptAutocompleteTag(item), input.selectionStart);
+  const result = replaceCurrentPromptTagFragment(
+    input.value,
+    formatPromptAutocompleteTag(item, input.dataset.prefixArtist !== "false"),
+    input.selectionStart,
+  );
   input.value = result.value;
   input.setSelectionRange(result.cursor, result.cursor);
   hidePromptTagAutocomplete();
@@ -1949,13 +2284,22 @@ function renderRatedArtistSelect() {
 function addStyleArtist() {
   const input = styleElement("styleArtistSearch");
   const selectedArtist = styleElement("styleArtistSelect")?.value || "";
-  const names = parseStyleArtistNames(input?.value || selectedArtist);
-  if (!names.length && selectedArtist) names.push(selectedArtist);
-  if (!names.length) return;
+  const entries = parseStyleArtistEntries(input?.value || selectedArtist);
+  if (!entries.length && selectedArtist) entries.push({ artist: selectedArtist });
+  if (!entries.length) return;
   const beforeFixedCount = fixedStyleArtistEntries(styleState.artists).length;
   const position = Math.trunc(Number(styleElement("styleArtistPosition")?.value || styleState.artists.length + 1));
   const weight = clampStyleWeight(styleElement("styleArtistWeight")?.value || 1);
-  styleState.artists = insertStyleArtistsAtPosition(styleState.artists, names, { position, weight });
+  const inserted = insertStyleArtistsAtPosition(styleState.artists, entries, { position, weight });
+  try {
+    styleState.artists = limitArtistsToTotalCount(
+      inserted,
+      Math.trunc(Number(styleElement("styleArtistCount")?.value || inserted.length)),
+    );
+  } catch (error) {
+    showStyleStatus(error.message, "error");
+    return;
+  }
   const added = fixedStyleArtistEntries(styleState.artists).length - beforeFixedCount;
   if (input && added > 0) input.value = "";
   hideStyleArtistAutocomplete();
@@ -2119,6 +2463,43 @@ function buildGenerationRequest(requestId = createRequestId()) {
   return payload;
 }
 
+function opusFreeGenerationIssues({ width, height, steps }) {
+  const issues = [];
+  if (Number(steps) > OPUS_FREE_MAX_STEPS) {
+    issues.push(`스텝 ${steps}: Opus 무료 기준인 ${OPUS_FREE_MAX_STEPS}스텝을 초과합니다.`);
+  }
+  const pixels = Number(width) * Number(height);
+  if (Number.isFinite(pixels) && pixels > OPUS_FREE_MAX_PIXELS) {
+    issues.push(`해상도 ${width}×${height}: ${pixels.toLocaleString("ko-KR")}픽셀로 1,048,576픽셀을 초과합니다.`);
+  }
+  return issues;
+}
+
+async function confirmGenerationAnlasRisk(mode) {
+  const width = generationNumber("generationWidth", 832);
+  const height = generationNumber("generationHeight", 1216);
+  const steps = generationNumber("generationSteps", 28);
+  const issues = opusFreeGenerationIssues({ width, height, steps });
+  if (!issues.length) return true;
+  const limitMode = styleElement("generationLimitMode")?.value || "count";
+  const requestedCount = Math.max(1, Math.trunc(generationNumber("generationCount", 1)));
+  const runDescription = mode === "continuous"
+    ? (limitMode === "unlimited" ? "중지할 때까지 연속 생성" : `${requestedCount}장 연속 생성`)
+    : "1장 생성";
+  return globalThis.appDialog.confirm({
+    title: "Anlas가 차감될 수 있습니다",
+    message: `${runDescription} 요청이 Opus 무료 이미지 생성 기준을 벗어납니다. 그래도 생성할까요?`,
+    details: [
+      ...issues,
+      "Opus 무료 기준: 한 번에 1장 · 베이스 이미지 없음 · 28스텝 이하 · 최대 1,048,576픽셀",
+      "이 프로그램은 이미지를 한 번에 1장씩 요청합니다.",
+    ],
+    cancelLabel: "설정 다시 확인",
+    confirmLabel: "Anlas 사용 가능성 확인 후 생성",
+    tone: "warning",
+  });
+}
+
 function normalizeRandomTargets(values, legacyMode = "weights") {
   if (!Array.isArray(values)) {
     return legacyMode === "artists_and_weights" ? ["artists", "weights"] : ["weights"];
@@ -2225,7 +2606,7 @@ function renderQueueState() {
 
 async function randomizePromptTargets(targets) {
   if (!targets.has("quality") && !targets.has("negative")) return true;
-  await loadPromptPresets({ force: true, applyAutomatic: false });
+  await loadPromptPresets({ force: true });
   if (!styleState.promptPresets.length) throw new Error("랜덤으로 사용할 수집 프롬프트가 없습니다.");
   const qualityPreset = targets.has("quality") ? pickRandomPreset(styleState.promptPresets) : null;
   const negativePreset = targets.has("negative") ? pickRandomPreset(styleState.promptPresets) : null;
@@ -2263,12 +2644,14 @@ async function randomizeSelectedStyleParts() {
 
 async function generateOneRandomizedStyle() {
   if (styleState.running || styleState.generating) return null;
+  if (!await confirmGenerationAnlasRisk("single")) return null;
   await randomizeSelectedStyleParts();
   return generateCurrentStyle();
 }
 
 async function runContinuousGeneration() {
   if (styleState.running || styleState.generating) return;
+  if (!await confirmGenerationAnlasRisk("continuous")) return;
   styleState.running = true;
   styleState.paused = false;
   styleState.stopRequested = false;
@@ -2332,7 +2715,12 @@ async function testNovelAiKey() {
 }
 
 async function deleteNovelAiKey() {
-  if (!confirm("저장된 NovelAI App Key를 삭제할까요?")) return;
+  if (!await globalThis.appDialog.confirm({
+    title: "NovelAI App Key 삭제",
+    message: "저장된 App Key를 이 프로그램에서 삭제할까요?",
+    confirmLabel: "키 삭제",
+    tone: "danger",
+  })) return;
   const status = styleElement("novelAiSettingsStatus");
   try {
     await apiFetch("/api/settings/novelai", { method: "DELETE" });
@@ -2350,6 +2738,14 @@ function renderStyleManagerList(styles) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "style-manager-item";
+    button.classList.toggle("selection-mode", styleState.managerSelectionMode);
+    button.classList.toggle("selected", styleState.selectedStyleIds.has(style.id));
+    button.setAttribute("aria-pressed", String(styleState.selectedStyleIds.has(style.id)));
+    const selectionMark = document.createElement("span");
+    selectionMark.className = "style-manager-selection-mark";
+    selectionMark.textContent = styleState.selectedStyleIds.has(style.id) ? "✓" : "";
+    selectionMark.setAttribute("aria-hidden", "true");
+    button.append(selectionMark);
     if (style.representative_image_url) {
       const image = document.createElement("img");
       image.src = style.representative_image_url;
@@ -2365,16 +2761,58 @@ function renderStyleManagerList(styles) {
     info.textContent = `작가 ${style.artists.length}명 · 이미지 ${style.image_count}장`;
     body.append(title, info);
     button.append(body);
-    button.addEventListener("click", () => loadStyleDetail(style.id));
+    button.addEventListener("click", () => {
+      if (styleState.managerSelectionMode) {
+        styleState.selectedStyleIds = toggleSelectedStyleId(styleState.selectedStyleIds, style.id);
+        renderStyleManagerList(styleState.managerStyles);
+        syncStyleSelectionControls();
+      }
+      loadStyleDetail(style.id);
+    });
     list.append(button);
   });
+}
+
+function toggleSelectedStyleId(selectedIds, styleId) {
+  const next = new Set(selectedIds);
+  if (next.has(styleId)) next.delete(styleId);
+  else next.add(styleId);
+  return next;
+}
+
+function syncStyleSelectionControls() {
+  const count = styleState.selectedStyleIds.size;
+  const begin = styleElement("beginStyleSelection");
+  const remove = styleElement("deleteSelectedStyles");
+  const cancel = styleElement("cancelStyleSelection");
+  begin?.classList.toggle("active", styleState.managerSelectionMode);
+  begin?.setAttribute("aria-pressed", String(styleState.managerSelectionMode));
+  remove?.classList.toggle("hidden", !styleState.managerSelectionMode);
+  cancel?.classList.toggle("hidden", !styleState.managerSelectionMode);
+  if (remove) {
+    remove.disabled = count === 0;
+    remove.textContent = `선택 삭제 (${count})`;
+  }
+}
+
+function setStyleSelectionMode(enabled) {
+  styleState.managerSelectionMode = Boolean(enabled);
+  styleState.selectedStyleIds = new Set();
+  syncStyleSelectionControls();
+  renderStyleManagerList(styleState.managerStyles);
 }
 
 async function loadStyleManager() {
   const status = styleElement("styleManagerStatus");
   try {
     const styles = await apiFetch("/api/art-styles");
+    styleState.managerStyles = styles;
+    const availableIds = new Set(styles.map((style) => style.id));
+    styleState.selectedStyleIds = new Set(
+      [...styleState.selectedStyleIds].filter((styleId) => availableIds.has(styleId)),
+    );
     renderStyleManagerList(styles);
+    syncStyleSelectionControls();
     styleState.managerDirty = false;
     if (status) status.textContent = styles.length ? `${styles.length}개 그림체` : "저장된 그림체가 없습니다.";
   } catch (error) {
@@ -2402,11 +2840,19 @@ function resetStyleManagerDetail() {
   target.append(placeholder);
   styleState.managerImages = [];
   styleState.managerImageIndex = 0;
+  styleState.managerDetail = null;
+  styleState.managerNegativeExpanded = false;
   closeGeneratedImage();
 }
 
 async function deleteManagedStyle(styleId) {
-  if (!confirm("그림체를 삭제할까요? 생성 이미지도 함께 삭제됩니다.")) return;
+  if (!await globalThis.appDialog.confirm({
+    title: "그림체 삭제",
+    message: "이 그림체와 함께 저장된 생성 이미지를 모두 삭제할까요?",
+    details: ["생성 이미지도 함께 삭제됩니다.", "삭제한 그림체와 생성 이미지는 복구할 수 없습니다."],
+    confirmLabel: "그림체 삭제",
+    tone: "danger",
+  })) return;
   const status = styleElement("styleManagerStatus");
   try {
     await apiFetch(`/api/art-styles/${styleId}`, { method: "DELETE" });
@@ -2418,11 +2864,144 @@ async function deleteManagedStyle(styleId) {
   }
 }
 
+async function deleteSelectedManagedStyles() {
+  const styleIds = [...styleState.selectedStyleIds].sort((left, right) => left - right);
+  if (!styleIds.length) return;
+  if (!await globalThis.appDialog.confirm({
+    title: `그림체 ${styleIds.length}개 삭제`,
+    message: "선택한 그림체와 함께 저장된 생성 이미지를 모두 삭제할까요?",
+    details: ["삭제한 그림체와 생성 이미지는 복구할 수 없습니다."],
+    confirmLabel: `${styleIds.length}개 삭제`,
+    tone: "danger",
+  })) return;
+  const status = styleElement("styleManagerStatus");
+  try {
+    const result = await apiFetch("/api/art-styles/delete-batch", {
+      method: "POST",
+      body: JSON.stringify({ style_ids: styleIds }),
+    });
+    const deletedIds = new Set(result.deleted_ids || []);
+    if (styleState.managerDetail && deletedIds.has(styleState.managerDetail.id)) {
+      resetStyleManagerDetail();
+    }
+    setStyleSelectionMode(false);
+    await loadStyleManager();
+    if (status) status.textContent = `그림체 ${deletedIds.size}개와 생성 이미지를 삭제했습니다.`;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+  }
+}
+
+function managerArtistText(item) {
+  if (item?.artist_prompt) return item.artist_prompt;
+  const artists = Array.isArray(item?.artists) ? item.artists : [];
+  return artists
+    .map((artist) => `${formatStyleWeight(artist.weight)}::artist:${formatArtistPromptTag(artist.artist)}::`)
+    .join(", ") || "없음";
+}
+
+function managerCombinedPromptText(item) {
+  if (!item) return "이미지를 선택하세요.";
+  return combinePromptSections(managerArtistText(item), item.base_prompt) || "없음";
+}
+
+function appendManagerPromptBlock(parent, label, value, className = "") {
+  const section = document.createElement("section");
+  section.className = `manager-prompt-block ${className}`.trim();
+  const heading = document.createElement("h3");
+  heading.textContent = label;
+  const content = document.createElement("div");
+  content.className = "manager-info-content";
+  content.textContent = value || "없음";
+  section.append(heading, content);
+  parent.append(section);
+}
+
+function renderStyleManagerImageSelection() {
+  const detail = styleState.managerDetail;
+  const stage = styleElement("styleManagerImageStage");
+  const inspector = styleElement("styleManagerImageInspector");
+  if (!detail || !stage || !inspector) return;
+  const item = detail.images[styleState.managerImageIndex];
+  stage.replaceChildren();
+  inspector.replaceChildren();
+  if (!item) {
+    const empty = document.createElement("div");
+    empty.className = "latest-result-placeholder";
+    empty.textContent = "저장된 이미지가 없습니다.";
+    stage.append(empty);
+    return;
+  }
+  const image = document.createElement("img");
+  image.className = "manager-selected-image";
+  image.src = item.image_url;
+  image.alt = `선택한 생성 이미지 ${styleState.managerImageIndex + 1}`;
+  image.addEventListener("click", () => openGeneratedImage(detail.images, styleState.managerImageIndex));
+  stage.append(image);
+  const imageActions = document.createElement("div");
+  imageActions.className = "manager-image-actions";
+  if (detail.images.length > 1) {
+    const previous = document.createElement("button");
+    previous.type = "button";
+    previous.textContent = "이전";
+    previous.addEventListener("click", () => {
+      styleState.managerImageIndex = (styleState.managerImageIndex - 1 + detail.images.length) % detail.images.length;
+      renderStyleManagerImageSelection();
+    });
+    const position = document.createElement("span");
+    position.textContent = `${styleState.managerImageIndex + 1} / ${detail.images.length}`;
+    const next = document.createElement("button");
+    next.type = "button";
+    next.textContent = "다음";
+    next.addEventListener("click", () => {
+      styleState.managerImageIndex = (styleState.managerImageIndex + 1) % detail.images.length;
+      renderStyleManagerImageSelection();
+    });
+    imageActions.append(previous, position, next);
+  }
+  const fullButton = document.createElement("button");
+  fullButton.type = "button";
+  fullButton.textContent = "크게 보기";
+  fullButton.addEventListener("click", () => openGeneratedImage(detail.images, styleState.managerImageIndex));
+  imageActions.append(fullButton);
+  stage.append(imageActions);
+
+  appendManagerPromptBlock(inspector, "작가 · 퀄리티", managerCombinedPromptText(item), "manager-primary-prompt");
+  appendManagerPromptBlock(
+    inspector,
+    "캐릭터",
+    (item.character_prompts || []).join("\n\n") || "없음",
+  );
+  const negativeToggle = document.createElement("button");
+  negativeToggle.type = "button";
+  negativeToggle.className = "manager-negative-toggle";
+  negativeToggle.textContent = styleState.managerNegativeExpanded ? "▲ 네거티브 접기" : "▼ 네거티브 보기";
+  negativeToggle.setAttribute("aria-expanded", String(styleState.managerNegativeExpanded));
+  negativeToggle.addEventListener("click", () => {
+    styleState.managerNegativeExpanded = !styleState.managerNegativeExpanded;
+    renderStyleManagerImageSelection();
+  });
+  inspector.append(negativeToggle);
+  if (styleState.managerNegativeExpanded) {
+    appendManagerPromptBlock(inspector, "네거티브", item.negative_prompt || "없음", "manager-negative-prompt");
+  }
+  const generation = document.createElement("div");
+  generation.className = "manager-generation-summary";
+  generation.textContent = `${item.width}×${item.height} · ${item.sampler} / ${item.noise_schedule || "native"} · ${item.steps} steps · CFG ${item.scale} · Rescale ${item.cfg_rescale} · Seed ${item.seed}`;
+  inspector.append(generation);
+}
+
 async function loadStyleDetail(styleId) {
   const detail = await apiFetch(`/api/art-styles/${styleId}`);
   const target = styleElement("styleManagerDetail");
   if (!target) return;
   target.replaceChildren();
+  styleState.managerDetail = detail;
+  styleState.managerImages = detail.images;
+  styleState.managerImageIndex = 0;
+  styleState.managerNegativeExpanded = false;
+  const head = document.createElement("div");
+  head.className = "style-manager-detail-head";
   const heading = document.createElement("h2");
   heading.textContent = `그림체 #${detail.id}`;
   const deleteButton = document.createElement("button");
@@ -2430,31 +3009,18 @@ async function loadStyleDetail(styleId) {
   deleteButton.className = "danger-button";
   deleteButton.textContent = "그림체 삭제";
   deleteButton.addEventListener("click", () => deleteManagedStyle(detail.id));
-  const prompt = document.createElement("textarea");
-  prompt.readOnly = true;
-  prompt.value = detail.artist_prompt;
-  prompt.className = "manager-prompt";
-  const artists = document.createElement("div");
-  artists.className = "manager-artists";
-  detail.artists.forEach((item, index) => {
-    const row = document.createElement("span");
-    row.textContent = `${index + 1}. ${item.artist} · ${formatStyleWeight(item.weight)}`;
-    artists.append(row);
-  });
-  const gallery = document.createElement("div");
-  gallery.className = "manager-gallery";
-  detail.images.forEach((item, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    const image = document.createElement("img");
-    image.src = item.image_url;
-    image.alt = `생성 이미지 ${index + 1}`;
-    image.loading = "lazy";
-    button.append(image);
-    button.addEventListener("click", () => openGeneratedImage(detail.images, index));
-    gallery.append(button);
-  });
-  target.append(heading, deleteButton, artists, prompt, gallery);
+  head.append(heading, deleteButton);
+  const detailGrid = document.createElement("div");
+  detailGrid.className = "style-manager-detail-grid";
+  const imageStage = document.createElement("section");
+  imageStage.id = "styleManagerImageStage";
+  imageStage.className = "manager-image-stage";
+  const inspector = document.createElement("section");
+  inspector.id = "styleManagerImageInspector";
+  inspector.className = "manager-image-inspector";
+  detailGrid.append(imageStage, inspector);
+  target.append(head, detailGrid);
+  renderStyleManagerImageSelection();
 }
 
 function openGeneratedImage(images, index) {
@@ -2551,6 +3117,13 @@ function initializeStyleMaker() {
     if (input && event.target.value) input.value = event.target.value;
   });
   styleElement("addStyleArtist")?.addEventListener("click", addStyleArtist);
+  styleElement("openRatingTagRules")?.addEventListener("click", openRatingTagRulesModal);
+  styleElement("closeRatingTagRules")?.addEventListener("click", closeRatingTagRulesModal);
+  styleElement("cancelRatingTagRules")?.addEventListener("click", closeRatingTagRulesModal);
+  document.querySelectorAll("[data-close-rating-tag-rules]").forEach((item) => item.addEventListener("click", closeRatingTagRulesModal));
+  styleElement("addRatingTagRule")?.addEventListener("click", addRatingTagRule);
+  styleElement("addRatingTagExclusion")?.addEventListener("click", addRatingTagExclusion);
+  styleElement("saveRatingTagRules")?.addEventListener("click", saveRatingTagRules);
   styleElement("addCharacterPrompt")?.addEventListener("click", () => {
     addCharacterPrompt();
     persistAndRenderPromptControls();
@@ -2574,19 +3147,15 @@ function initializeStyleMaker() {
     persistAndRenderPromptControls();
   }));
   styleElement("fixedPrompt")?.addEventListener("input", savePromptDraft);
-  ["basePrompt", "fixedPrompt", "negativePrompt"].forEach((id) => bindPromptTagAutocomplete(styleElement(id)));
-  styleElement("promptPresetMode")?.addEventListener("change", (event) => {
-    styleState.promptPresetMode = event.target.value === "fixed" ? "fixed" : "auto";
-    savePromptPresetSettings();
-    void loadPromptPresets({ force: true, applyAutomatic: styleState.promptPresetMode === "auto" });
-  });
+  ["basePrompt", "fixedPrompt", "negativePrompt"]
+    .forEach((id) => bindPromptTagAutocomplete(styleElement(id)));
   styleElement("promptPresetSelect")?.addEventListener("change", (event) => {
     styleState.selectedPromptPresetKey = event.target.value;
     savePromptPresetSettings();
   });
   styleElement("applyPromptPreset")?.addEventListener("click", () => {
     const key = styleElement("promptPresetSelect")?.value;
-    applyPromptPreset(styleState.promptPresets.find((preset) => preset.key === key), { fixed: true });
+    applyPromptPreset(styleState.promptPresets.find((preset) => preset.key === key));
   });
   styleElement("toggleGenerationParameters")?.addEventListener("click", () => {
     const panel = styleElement("generationParameters");
@@ -2635,6 +3204,18 @@ function initializeStyleMaker() {
       savePromptDraft();
     });
   });
+  document.addEventListener("pointerdown", (event) => {
+    const target = event.target;
+    const artistInput = styleElement("styleArtistSearch");
+    const artistBox = styleElement("styleArtistAutocomplete");
+    if (!artistInput?.contains(target) && !artistBox?.contains(target)) hideStyleArtistAutocomplete();
+
+    const promptInput = styleState.promptTagAutocompleteInput;
+    const promptBox = styleState.promptTagAutocompleteBox;
+    if (promptInput && !promptInput.contains(target) && !promptBox?.contains(target)) {
+      hidePromptTagAutocomplete();
+    }
+  });
   [
     "generationWidth",
     "generationHeight",
@@ -2646,18 +3227,22 @@ function initializeStyleMaker() {
     "generationCount",
     "sharedStyleArtistMin",
     "sharedStyleArtistMax",
-  ].forEach((id) => styleElement(id)?.addEventListener("change", savePromptDraft));
+  ].forEach((id) => styleElement(id)?.addEventListener("change", () => {
+    savePromptDraft();
+    renderRatingTagRuleCountSummary();
+  }));
   ["styleMinWeight", "styleMaxWeight"].forEach((id) => styleElement(id)?.addEventListener("change", renderWeightGraph));
-  styleElement("styleArtistCount")?.addEventListener("change", renderWeightGraph);
+  styleElement("styleArtistCount")?.addEventListener("change", () => {
+    renderWeightGraph();
+    renderRatingTagRuleCountSummary();
+  });
   styleElement("openWeightGraph")?.addEventListener("click", openWeightGraphModal);
   styleElement("closeWeightGraph")?.addEventListener("click", closeWeightGraphModal);
   document.querySelectorAll("[data-close-weight-graph]").forEach((item) => item.addEventListener("click", closeWeightGraphModal));
 
   const storedPrompts = loadPromptDraft();
   const storedPreset = loadPromptPresetSettings();
-  styleState.promptPresetMode = storedPreset.mode;
   styleState.selectedPromptPresetKey = storedPreset.selected_key;
-  styleElement("promptPresetMode").value = styleState.promptPresetMode;
   styleState.promptGroups = storedPrompts.prompt_groups;
   applyGenerationSettings(storedPrompts.generation_settings);
   styleElement("basePrompt").value = storedPrompts.base_prompt;
@@ -2692,6 +3277,11 @@ if (typeof document !== "undefined") {
   styleElement("testNovelAiKey")?.addEventListener("click", testNovelAiKey);
   styleElement("deleteNovelAiKey")?.addEventListener("click", deleteNovelAiKey);
   styleElement("refreshStyleManager")?.addEventListener("click", loadStyleManager);
+  styleElement("beginStyleSelection")?.addEventListener("click", () => {
+    if (!styleState.managerSelectionMode) setStyleSelectionMode(true);
+  });
+  styleElement("cancelStyleSelection")?.addEventListener("click", () => setStyleSelectionMode(false));
+  styleElement("deleteSelectedStyles")?.addEventListener("click", deleteSelectedManagedStyles);
   styleElement("generatedImageClose")?.addEventListener("click", closeGeneratedImage);
   document.querySelectorAll("[data-close-generated-image]").forEach((item) => item.addEventListener("click", closeGeneratedImage));
   styleElement("generatedImagePrev")?.addEventListener("click", () => moveGeneratedImage(-1));
@@ -2721,10 +3311,12 @@ if (typeof module !== "undefined" && module.exports) {
     interpolateWeightProfile,
     formatArtistPromptTag,
     parseStyleArtistNames,
+    parseStyleArtistEntries,
     insertStyleArtistsAtPosition,
     updateStyleArtistAtIndex,
     moveStyleArtistToPosition,
     fixedStyleArtistEntries,
+    limitArtistsToTotalCount,
     fixedArtistSlotEntries,
     chooseArtistsForPrompt,
     fixedArtistOverlayCoordinates,
@@ -2744,5 +3336,13 @@ if (typeof module !== "undefined" && module.exports) {
     cleanPromptGroups,
     buildEffectivePromptText,
     reachedGenerationLimit,
+    toggleSelectedStyleId,
+    managerCombinedPromptText,
+    normalizeRatingTagRules,
+    validateRatingTagRules,
+    ratingTagRuleCount,
+    normalizeRatingExcludeTags,
+    validateRatingExcludeTags,
+    opusFreeGenerationIssues,
   };
 }

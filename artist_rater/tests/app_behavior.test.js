@@ -85,6 +85,7 @@ test("rating cards render hostile stored data as inert text and reject unsafe im
     artist_post_count: 12,
     matched_post_count: 3,
     created_at: hostile,
+    query_text: hostile,
     prompt_text: hostile,
     thumbnail_url: "javascript:alert(1)",
   });
@@ -93,6 +94,7 @@ test("rating cards render hostile stored data as inert text and reject unsafe im
   assert.equal(card.querySelector("h3").textContent, hostile);
   assert.equal(card.querySelector(".memo-preview").textContent, `memo ${hostile}`);
   assert.equal(card.querySelector('[data-edit="memo"]').value, `memo ${hostile}`);
+  assert.equal(card.querySelector('[data-edit="query-text"]').value, hostile);
   for (const action of ["copy", "edit", "delete", "apply"]) {
     assert.equal(typeof card.querySelector(`[data-action="${action}"]`).listeners.click, "function");
   }

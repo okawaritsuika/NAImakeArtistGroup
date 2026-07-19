@@ -1620,7 +1620,13 @@ async function saveArcaStyle() {
 }
 
 async function deleteArcaStyle(id = arcaState.selectedId) {
-  if (!id || !confirm("이 수집 항목을 삭제할까요?")) return;
+  if (!id || !await globalThis.appDialog.confirm({
+    title: "수집 그림체 삭제",
+    message: "선택한 수집 그림체를 삭제할까요?",
+    details: ["날짜 정보가 있는 항목은 다음 수집 때 다시 검색될 수 있습니다."],
+    confirmLabel: "수집 항목 삭제",
+    tone: "danger",
+  })) return;
   try {
     const result = await arcaFetch(`/api/arca-styles/${id}`, { method: "DELETE" });
     if (arcaState.selectedId === id) {

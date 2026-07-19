@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NovelAI 그림체 가이드 이미지 편집기</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0f172a; color: #e2e8f0; font-family: Arial, "Noto Sans KR", sans-serif; }
+    .editor-toolbar { position: sticky; top: 0; z-index: 1000; padding: 14px 18px; border-bottom: 1px solid #334155; background: rgba(15,23,42,.97); box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+    .editor-toolbar h1 { margin: 0 0 8px; font-size: 19px; }
+    .editor-toolbar p { margin: 4px 0; color: #94a3b8; font-size: 13px; }
+    .editor-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .editor-actions button { min-height: 38px; padding: 8px 12px; border: 1px solid #475569; border-radius: 8px; background: #1e293b; color: #f8fafc; font-weight: 700; cursor: pointer; }
+    .editor-actions button.primary { border-color: #60a5fa; background: #2563eb; }
+    .editor-actions button.danger { border-color: #f87171; background: #7f1d1d; }
+    .editor-progress { display: inline-flex; align-items: center; margin-left: 8px; padding: 3px 8px; border-radius: 999px; background: #334155; color: #bfdbfe; font-size: 12px; }
+    .editor-status { min-height: 22px; margin-top: 8px; color: #86efac; font-size: 13px; }
+    #articleCanvas { padding: 28px 14px 80px; }
+    [data-media-slot] { position: relative; outline: none; transition: border-color .15s, box-shadow .15s; }
+    [data-media-slot].editor-active { border-color: #f59e0b !important; box-shadow: 0 0 0 4px rgba(245,158,11,.2); }
+    [data-media-slot].editor-filled { border-style: solid !important; border-color: #22c55e !important; }
+    [data-slot-placeholder][hidden] { display: none !important; }
+    .slot-editor-hint { margin: 10px 0 0; padding: 9px; border-radius: 8px; background: #e0f2fe; color: #0c4a6e; font-size: 12px; text-align: left; }
+    .slot-editor-controls { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; margin-top: 10px; }
+    .slot-editor-controls button { padding: 7px 10px; border: 1px solid #94a3b8; border-radius: 7px; background: #f8fafc; color: #0f172a; cursor: pointer; }
+    .slot-editor-controls button.remove { border-color: #fca5a5; color: #991b1b; }
+    .slot-media-list { display: grid; gap: 10px; margin: 0 auto; }
+    .slot-media-item { position: relative; padding: 8px; border: 1px solid #cbd5e1; border-radius: 10px; background: #fff; }
+    .slot-media-item img { display: block; max-width: 100%; max-height: 720px; margin: 0 auto; border-radius: 8px; object-fit: contain; }
+    .slot-media-item button { position: absolute; top: 12px; right: 12px; width: 32px; height: 32px; border: 0; border-radius: 50%; background: rgba(127,29,29,.9); color: #fff; font-weight: 700; cursor: pointer; }
+    .slot-caption-label { display: grid; gap: 5px; margin-top: 10px; color: #334155; font-size: 12px; text-align: left; }
+    .slot-caption-label input { width: 100%; padding: 8px 9px; border: 1px solid #94a3b8; border-radius: 7px; background: #fff; color: #0f172a; }
+    .drop-highlight { background: #fef3c7 !important; }
+    @media (max-width: 720px) {
+      .editor-toolbar { position: static; }
+      #articleCanvas { padding: 12px 4px 50px; }
+      .editor-actions button { flex: 1 1 160px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="editor-toolbar">
+    <h1>그림체 가이드 이미지 편집기 <span id="progress" class="editor-progress">0 / 0칸 완료</span></h1>
+    <p>이미지 칸을 클릭한 뒤 Ctrl+V로 붙여넣거나, 파일 선택·드래그 앤 드롭을 사용하세요. GIF 파일도 가능하지만 아카라이브 용량을 고려해 정지 이미지를 권장합니다.</p>
+    <p>한 칸에 여러 이미지를 붙이면 입력 순서대로 세로 배치됩니다. 비교 이미지가 많으면 먼저 한 장의 비교표로 합치는 편이 게시글 용량을 줄이기 좋습니다.</p>
+    <div class="editor-actions">
+      <button id="nextEmpty">다음 빈칸</button>
+      <button id="copyRich" class="primary">글 전체 복사</button>
+      <button id="copySource">HTML 소스 복사</button>
+      <button id="downloadArticle">게시용 HTML 다운로드</button>
+      <button id="saveWork">이미지 포함 작업본 저장</button>
+      <button id="resetAll" class="danger">이미지 전체 삭제</button>
+    </div>
+    <div id="editorStatus" class="editor-status" aria-live="polite"></div>
+  </header>
+
+  <main id="articleCanvas">
+<div style="max-width:980px;margin:0 auto;padding:24px;background:#f6f8fc;color:#172033;font-family:Arial,'Noto Sans KR',sans-serif;line-height:1.75;word-break:keep-all;">
+  <div style="padding:28px;border-radius:18px;background:linear-gradient(135deg,#172554,#1d4ed8);color:#ffffff;">
+    <p style="margin:0 0 8px;font-size:14px;opacity:.85;">NovelAI를 처음 쓰는 사람을 위한 순서형 가이드</p>
+    <h1 style="margin:0;font-size:34px;line-height:1.25;">Danbooru Artist Rater로 그림체 만들기<br>with 다키마쿠라</h1>
+    <p style="margin:16px 0 0;font-size:17px;">작가 이름을 하나도 몰라도 시작해서, 마음에 드는 작가 조합을 찾고 가중치를 다듬어 재사용 가능한 그림체로 저장하는 방법을 설명합니다.</p>
+  </div>
+
+  <div style="margin-top:18px;padding:16px 18px;border:1px solid #93c5fd;border-radius:12px;background:#eff6ff;">
+    <p style="margin:0 0 8px;font-weight:700;color:#1e3a8a;">이 글에서 사용하는 프로그램</p>
+    <p style="margin:0;">이 글은 <strong>Danbooru Artist Rater v0.1.2</strong>의 <strong>그림체 제작</strong> 기능을 기준으로 작성했습니다. 프로그램 다운로드와 실행법은 <a href="https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.2" style="color:#1d4ed8;font-weight:700;">GitHub v0.1.2 릴리스</a>에서 확인할 수 있습니다.</p>
+  </div>
+
+  <div style="margin-top:12px;padding:16px 18px;border:1px solid #c4b5fd;border-radius:12px;background:#f5f3ff;">
+    <p style="margin:0 0 8px;font-weight:700;color:#5b21b6;">참고 자료</p>
+    <p style="margin:0 0 8px;">NovelAI의 그림체 구성, 작가 태그 순서, 가중치, 구도와 프롬프트 기초 설명은 <a href="https://arca.live/b/aiart/159947900" style="color:#6d28d9;font-weight:700;">AI 그림 기초 가이드 + 그림체 1,000+@ 종 (NAI 4.5)</a>을 참고했습니다.</p>
+    <p style="margin:0;">다키마쿠라 부분은 <a href="https://arca.live/b/dakimakura/172664262" style="color:#6d28d9;font-weight:700;">AI 다키 만드는 거 도와주는 프로그램 + 사용법</a>의 상반신 원본 제작 흐름을 참고했습니다. 두 자료를 그대로 옮긴 것이 아니라, 해당 원리를 이 프로그램에서 적용하는 순서에 맞춰 다시 구성했습니다.</p>
+  </div>
+
+  <div data-media-slot="01" data-caption="프로그램으로 만든 서로 다른 그림체 결과 예시. 같은 캐릭터를 사용하면 그림체 차이를 보기 쉽습니다." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 01 · 완성 결과 모음</p>
+    <p style="margin:8px 0 0;color:#64748b;">권장: 같은 캐릭터로 만든 서로 다른 그림체 4~6장을 한 장의 비교표로 넣기</p>
+  </div>
+
+  <div style="padding:18px;border-radius:12px;background:#fff7ed;border:1px solid #fdba74;">
+    <h2 style="margin:0 0 10px;font-size:23px;color:#9a3412;">먼저 알아둘 점</h2>
+    <ul style="margin:0;padding-left:22px;">
+      <li>이미지 생성에는 NovelAI 계정과 이미지 생성이 가능한 구독이 필요합니다.</li>
+      <li>연속 생성은 편리하지만 생성 장수만큼 Anlas가 소비될 수 있습니다. 처음에는 1장 생성으로 화면과 프롬프트를 확인하세요.</li>
+      <li>App Key, 개인 경로, 로그인 정보가 보이는 화면은 글에 올리기 전에 반드시 가리세요.</li>
+      <li>좋은 결과 한 장보다 여러 캐릭터와 구도에서 비슷한 느낌을 유지하는 조합을 좋은 그림체로 판단하는 것이 안전합니다.</li>
+    </ul>
+  </div>
+
+  <div style="margin-top:24px;padding:20px;border:1px solid #cbd5e1;border-radius:14px;background:#ffffff;">
+    <h2 style="margin:0 0 12px;font-size:25px;color:#0f172a;">진짜 급한 사람을 위한 7줄 요약</h2>
+    <ol style="margin:0;padding-left:24px;">
+      <li>EXE를 실행하고 리모콘에서 서버를 켭니다.</li>
+      <li>설정에서 NovelAI App Key를 저장하고 연결 테스트를 합니다.</li>
+      <li><strong>그림체 제작</strong>에서 작가 수를 7명으로 설정합니다.</li>
+      <li>평가한 작가가 없으면 공유 7~7, 있으면 공유 4~5와 원하는 평점을 선택합니다.</li>
+      <li><strong>전체 ↻</strong>를 눌러 작가와 가중치를 뽑습니다.</li>
+      <li>캐릭터 프롬프트를 입력하고 <strong>1장 생성</strong>을 누릅니다.</li>
+      <li>마음에 드는 결과가 나오면 작가는 유지한 채 가중치만 바꿔 좁혀 갑니다.</li>
+    </ol>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">1. 그림체가 만들어지는 원리</h2>
+  <p style="margin:8px 0;">이 프로그램에서 그림체는 대략 네 가지가 합쳐져 만들어집니다.</p>
+  <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0;">
+    <div style="padding:14px;border-radius:10px;background:#dbeafe;"><strong>① 작가 조합</strong><br>어떤 작가들을 함께 사용하는가</div>
+    <div style="padding:14px;border-radius:10px;background:#dcfce7;"><strong>② 작가 순서</strong><br>프롬프트에서 어느 자리에 놓이는가</div>
+    <div style="padding:14px;border-radius:10px;background:#fef3c7;"><strong>③ 작가 가중치</strong><br>각 작가의 영향력을 얼마나 줄 것인가</div>
+    <div style="padding:14px;border-radius:10px;background:#f3e8ff;"><strong>④ 나머지 프롬프트</strong><br>퀄리티·고정·네거티브·캐릭터 태그</div>
+  </div>
+  <p style="margin:8px 0;"><strong>가중치가 높다는 말은 그림 품질이 높다는 뜻이 아닙니다.</strong> 해당 작가 태그의 영향력을 강하게 요청한다는 뜻입니다. 작가가 많다고 항상 좋아지는 것도 아닙니다. 여러 특징이 섞여 개성이 약해질 수도 있습니다.</p>
+
+  <div data-media-slot="02" data-caption="같은 시드와 캐릭터에서 작가 수 또는 가중치만 바꾼 비교." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 02 · 같은 조건에서 작가 조합만 바꾼 비교</p>
+    <p style="margin:8px 0 0;color:#64748b;">권장: 같은 작가 7명을 유지하고 가중치만 바꾼 결과 3장</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">2. 프로그램 받기와 실행</h2>
+  <ol style="margin:8px 0;padding-left:24px;">
+    <li><a href="https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.2" style="color:#1d4ed8;font-weight:700;">v0.1.2 릴리스</a>에서 <strong>DanbooruArtistRater.exe</strong>를 받습니다.</li>
+    <li>원하는 폴더에 EXE를 둡니다. 실행하면 같은 위치에 개인 설정과 결과를 저장하는 data 폴더가 생길 수 있으므로, 다운로드 폴더보다는 전용 폴더를 권장합니다.</li>
+    <li>EXE를 실행하고 리모콘에서 <strong>서버 켜기</strong>를 누릅니다.</li>
+    <li><strong>웹사이트 열기</strong>를 누르면 로컬 프로그램 화면이 브라우저에 열립니다.</li>
+    <li>종료할 때는 먼저 서버를 끄고 리모콘을 닫습니다.</li>
+  </ol>
+
+  <div data-media-slot="03" data-caption="GitHub 릴리스에서 DanbooruArtistRater.exe를 받는 위치." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 03 · EXE 다운로드 위치</p>
+    <p style="margin:8px 0 0;color:#64748b;">파일 이름과 Assets 위치가 보이게 촬영</p>
+  </div>
+
+  <div data-media-slot="04" data-caption="리모콘에서 서버를 켜고 웹사이트를 여는 순서." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 04 · 리모콘 사용 순서</p>
+    <p style="margin:8px 0 0;color:#64748b;">① 서버 켜기 → ② 웹사이트 열기 순서로 번호 표시</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">3. NovelAI App Key 연결</h2>
+  <p style="margin:8px 0;">작가 평가와 저장된 공유 자료 구경은 App Key 없이도 가능하지만, 이 프로그램에서 NovelAI 이미지를 생성하려면 App Key가 필요합니다.</p>
+  <ol style="margin:8px 0;padding-left:24px;">
+    <li>프로그램 화면 오른쪽 위의 설정 버튼을 누릅니다.</li>
+    <li>NovelAI에서 확인한 App Key를 입력합니다.</li>
+    <li><strong>연결 테스트</strong>를 눌러 인증 성공 여부를 확인합니다.</li>
+    <li>성공하면 저장합니다. 키는 브라우저 화면이나 생성 기록에 다시 표시되지 않습니다.</li>
+  </ol>
+  <div style="margin:12px 0;padding:12px 14px;border-left:4px solid #ef4444;background:#fef2f2;color:#991b1b;"><strong>중요:</strong> App Key가 보이는 캡처는 절대 그대로 공유하지 마세요. 설명용 화면에서는 입력칸 전체를 가리는 것이 안전합니다.</div>
+
+  <div data-media-slot="05" data-caption="설정에서 App Key를 입력하고 연결 테스트를 누르는 위치. 실제 키는 가린 화면." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 05 · App Key 설정</p>
+    <p style="margin:8px 0 0;color:#64748b;">실제 키는 검은색 박스 등으로 완전히 가리기</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">4. 그림체 제작 화면 한눈에 보기</h2>
+  <ul style="margin:8px 0;padding-left:22px;">
+    <li><strong>왼쪽 그림체 설정:</strong> 작가 수, 공유 작가 수, 허용 평점, 가중치 방식을 정합니다.</li>
+    <li><strong>가운데 작가 편집:</strong> 뽑힌 작가, 순서, 가중치, 최근 결과를 확인합니다.</li>
+    <li><strong>오른쪽 프롬프트와 생성:</strong> 퀄리티·고정·네거티브·캐릭터 프롬프트와 생성 설정을 다룹니다.</li>
+    <li><strong>설정 내부 접기:</strong> 작가 구성, 허용 평점, 가중치 설정, 가중치 표를 각각 접을 수 있습니다.</li>
+    <li><strong>설정 스크롤:</strong> 설정이 길어지면 그림체 설정 영역 전체를 스크롤합니다.</li>
+  </ul>
+
+  <div data-media-slot="06" data-caption="그림체 제작 화면의 왼쪽·가운데·오른쪽 역할." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 06 · 전체 화면 번호 설명</p>
+    <p style="margin:8px 0 0;color:#64748b;">전체 화면에 ① 설정 ② 작가 편집 ③ 프롬프트·생성 번호를 표시</p>
+  </div>
+
+  <div data-media-slot="07" data-caption="그림체 설정의 네 가지 내부 항목을 접고 펼치는 모습." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 07 · 설정 접기와 전체 스크롤</p>
+    <p style="margin:8px 0 0;color:#64748b;">정지 이미지 두 장 또는 아주 짧고 작은 GIF 사용 가능</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">5. 작가 7명으로 첫 그림체 만들기</h2>
+  <p style="margin:8px 0;">처음 시작할 때는 전체 <strong>작가 수를 7명</strong>으로 둡니다. 아직 평가한 작가가 없다면 공유 그림체 작가만 사용하고, 마음에 드는 작가를 이미 평가했다면 공유 작가에 개인 평가 작가 몇 명을 섞습니다.</p>
+  <table style="width:100%;border-collapse:collapse;margin:14px 0;background:#ffffff;">
+    <tr><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">항목</th><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">A. 공유 그림체만</th><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">B. 평가한 작가 섞기</th></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">작가 수</td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>7</strong></td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>7</strong></td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">공유 작가 최소 / 최대</td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>7 / 7</strong></td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>4 / 5</strong></td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">허용 평점</td><td style="padding:10px;border:1px solid #cbd5e1;">전체 선택</td><td style="padding:10px;border:1px solid #cbd5e1;">섞고 싶은 평점 선택<br><span style="color:#64748b;">예: 마음에 든 작가를 4·5점으로 평가했다면 4·5 선택</span></td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">가중치 방식</td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>균형</strong></td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>균형</strong></td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">가중치 최소 / 최대</td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>0.1 / 2.3</strong></td><td style="padding:10px;border:1px solid #cbd5e1;"><strong>0.1 / 2.3</strong></td></tr>
+  </table>
+  <p style="margin:8px 0;"><strong>A는 공유 작가 7명만</strong> 뽑는 가장 간단한 시작법입니다. <strong>B는 공유 작가 4~5명과 개인 평가 작가 2~3명</strong>을 섞는 방법입니다. 전체 ↻를 누를 때 선택한 허용 평점 안에서 개인 작가가 나머지 자리를 채웁니다.</p>
+  <p style="margin:8px 0;">B를 안정적으로 사용하려면 선택한 평점에 해당하는 개인 평가 작가가 최소 3명은 있어야 합니다. 해당 작가가 2명뿐이면 공유 최소·최대를 <strong>5 / 5</strong>로, 1명뿐이면 <strong>6 / 6</strong>으로 맞추세요. 아직 평가 자료가 없다면 A로 시작한 뒤, 작가 뽑기에서 마음에 드는 작가를 평가하고 B로 넘어가면 됩니다.</p>
+  <p style="margin:8px 0;">12명은 특징이 많이 겹치거나 흐려질 수 있으므로 이 글에서는 7명을 시작값으로 사용합니다. 입력이 끝나면 가운데 위쪽의 <strong>전체 ↻</strong>를 눌러 작가 7명과 가중치를 뽑습니다.</p>
+
+  <div data-media-slot="08" data-caption="작가 수 7명에서 공유만 사용하는 7~7 설정과 개인 평가 작가를 섞는 공유 4~5 설정 비교." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 08 · 두 가지 시작 설정</p>
+    <p style="margin:8px 0 0;color:#64748b;">공유 7/7 설정과 공유 4/5·허용 평점 설정을 나란히 촬영</p>
+  </div>
+
+  <div data-media-slot="09" data-caption="전체 다시 뽑기 버튼과 공유·개인 평가 작가가 섞여 뽑힌 작가 7명." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 09 · 전체 ↻ 결과</p>
+    <p style="margin:8px 0 0;color:#64748b;">전체 ↻ 버튼, 작가 목록, 작가 프롬프트 미리보기가 함께 보이면 좋음</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">6. 네 종류의 프롬프트 이해하기</h2>
+  <table style="width:100%;border-collapse:collapse;margin:14px 0;background:#ffffff;">
+    <tr><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">칸</th><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">넣을 것</th><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">처음 사용법</th></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>퀄리티 프롬프트</strong></td><td style="padding:10px;border:1px solid #cbd5e1;">화질, 렌더링, 분위기, 표현 방식</td><td style="padding:10px;border:1px solid #cbd5e1;">자동 추천을 그대로 사용</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>고정 태그</strong></td><td style="padding:10px;border:1px solid #cbd5e1;">매번 반드시 유지할 구도·배경·확인 조건</td><td style="padding:10px;border:1px solid #cbd5e1;">필요할 때만 직접 입력</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>네거티브 프롬프트</strong></td><td style="padding:10px;border:1px solid #cbd5e1;">피하고 싶은 오류와 표현</td><td style="padding:10px;border:1px solid #cbd5e1;">자동 추천을 그대로 사용</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>캐릭터 프롬프트</strong></td><td style="padding:10px;border:1px solid #cbd5e1;">인원, 캐릭터 이름, 머리·눈·옷·행동</td><td style="padding:10px;border:1px solid #cbd5e1;">그릴 대상을 이곳에 입력</td></tr>
+  </table>
+  <p style="margin:8px 0;">최종 포지티브 프롬프트에서는 <strong>작가 태그 → 퀄리티 → 고정 태그</strong> 순서로 합쳐집니다. 캐릭터 프롬프트는 NovelAI의 개별 캐릭터 입력으로 전달됩니다.</p>
+  <p style="margin:8px 0;">텍스트 편집으로 전환해 두 글자 이상 입력하면 Danbooru 태그 자동완성이 나타납니다. 일반 태그는 그대로 들어가고, Danbooru에서 작가로 분류된 태그는 <strong>artist:작가명</strong> 형식으로 입력됩니다. 방향키 위·아래와 Enter로도 선택할 수 있습니다.</p>
+
+  <div data-media-slot="10" data-caption="퀄리티, 고정 태그, 네거티브, 캐릭터 프롬프트의 위치." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 10 · 네 종류의 프롬프트 위치</p>
+    <p style="margin:8px 0 0;color:#64748b;">각 칸에 ①~④ 번호를 표시</p>
+  </div>
+
+  <div data-media-slot="11" data-caption="프롬프트 입력 중 Danbooru 태그 자동완성이 나타난 모습. 작가는 artist: 접두사로 입력됩니다." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 11 · Danbooru 태그 자동완성</p>
+    <p style="margin:8px 0 0;color:#64748b;">일반 태그 제안과 artist 분류 제안을 각각 보여 주면 좋음</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">7. 첫 이미지 생성하기</h2>
+  <ol style="margin:8px 0;padding-left:24px;">
+    <li>수집 그림체 프롬프트는 <strong>자동 추천</strong>으로 둡니다.</li>
+    <li>캐릭터 프롬프트에 간단한 대상을 입력합니다. 예: <code style="padding:2px 6px;border-radius:5px;background:#e2e8f0;">1girl, solo, black hair, blue eyes, school uniform, looking at viewer</code></li>
+    <li>해상도는 처음에는 기본 세로 해상도 832×1216을 사용합니다.</li>
+    <li>Sampler, Scheduler, Steps, CFG는 기본값을 유지합니다.</li>
+    <li>시드는 비워 두고 <strong>1장 생성</strong>을 누릅니다.</li>
+    <li>결과가 나오면 이미지와 작가 조합이 자동 저장됩니다.</li>
+  </ol>
+  <div style="margin:12px 0;padding:12px 14px;border-left:4px solid #3b82f6;background:#eff6ff;color:#1e3a8a;"><strong>처음 한 장의 목표:</strong> 완벽한 그림을 만드는 것이 아니라 App Key, 프롬프트, 작가 조합, 저장 흐름이 정상인지 확인하는 것입니다.</div>
+
+  <div data-media-slot="12" data-caption="첫 생성에 사용할 간단한 캐릭터 프롬프트와 기본 생성 설정." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 12 · 첫 생성 직전 화면</p>
+    <p style="margin:8px 0 0;color:#64748b;">캐릭터 프롬프트, 해상도, 1장 생성 버튼을 함께 표시</p>
+  </div>
+
+  <div data-media-slot="13" data-caption="처음 생성된 이미지와 자동 저장 완료 상태." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 13 · 첫 생성 성공</p>
+    <p style="margin:8px 0 0;color:#64748b;">최근 결과와 자동 저장 완료 문구가 보이게 촬영</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">8. 세 가지 다시 뽑기 버튼의 차이</h2>
+  <ul style="margin:8px 0;padding-left:22px;">
+    <li><strong>작가 ↻:</strong> 고정하지 않은 작가를 새로 뽑고 현재 가중치 흐름은 유지합니다.</li>
+    <li><strong>가중치 ↻:</strong> 현재 작가들은 유지하고 가중치만 다시 뽑습니다.</li>
+    <li><strong>전체 ↻:</strong> 작가와 가중치를 모두 새로 뽑습니다.</li>
+  </ul>
+  <p style="margin:8px 0;">완전히 새로운 후보를 찾을 때는 전체, 작가 조합은 마음에 드는데 느낌이 애매할 때는 가중치, 가중치 흐름은 괜찮지만 작가들이 마음에 안 들 때는 작가 버튼을 사용합니다.</p>
+
+  <div data-media-slot="14" data-caption="작가, 가중치, 전체 다시 뽑기 버튼의 위치." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 14 · 세 가지 다시 뽑기 버튼</p>
+    <p style="margin:8px 0 0;color:#64748b;">세 버튼 아래에 각각 무엇이 바뀌는지 짧게 표시</p>
+  </div>
+
+  <div data-media-slot="15" data-caption="같은 캐릭터와 시드에서 전체, 작가만, 가중치만 바꾼 결과 비교." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 15 · 세 버튼 결과 비교</p>
+    <p style="margin:8px 0 0;color:#64748b;">동일 시드 비교표 권장</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">9. 공정하게 비교하는 방법</h2>
+  <p style="margin:8px 0;">그림체를 조절할 때 가장 흔한 실수는 여러 조건을 한꺼번에 바꾸는 것입니다. 무엇 때문에 결과가 달라졌는지 알 수 없게 됩니다.</p>
+  <ol style="margin:8px 0;padding-left:24px;">
+    <li>마음에 드는 결과의 시드를 확인합니다.</li>
+    <li>생성 설정의 시드 칸에 넣고 <strong>고정</strong>을 체크합니다.</li>
+    <li>캐릭터·퀄리티·고정·네거티브 프롬프트와 해상도를 그대로 둡니다.</li>
+    <li>작가, 가중치, 순서 중 하나만 바꿉니다.</li>
+    <li>2~4장을 생성해 비교한 뒤 더 나은 방향만 남깁니다.</li>
+  </ol>
+  <p style="margin:8px 0;"><strong>시드 고정은 그림을 완전히 같게 만드는 기능이 아니라 비교 조건을 최대한 비슷하게 만드는 기능</strong>이라고 생각하면 됩니다.</p>
+
+  <div data-media-slot="16" data-caption="시드 값을 입력하고 고정을 체크한 화면." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 16 · 시드 고정 위치</p>
+    <p style="margin:8px 0 0;color:#64748b;">시드 숫자는 예시 값으로 사용</p>
+  </div>
+
+  <div data-media-slot="17" data-caption="같은 시드에서 가중치 하나만 바꾼 전후 비교." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 17 · 한 번에 하나만 바꾸기</p>
+    <p style="margin:8px 0 0;color:#64748b;">변경한 작가와 가중치를 이미지 아래에 적기</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">10. 작가 순서와 가중치 직접 조절</h2>
+  <ul style="margin:8px 0;padding-left:22px;">
+    <li>가중치 표에서 숫자를 직접 바꿀 수 있습니다.</li>
+    <li>자리별 가중치 그래프를 열어 각 자리의 가중치 흐름을 조절할 수 있습니다.</li>
+    <li>고정 작가를 원하는 위치에 추가하고 다른 자리로 이동할 수 있습니다.</li>
+    <li>가중치 오름차순·내림차순 정렬로 빠르게 순서를 바꿀 수 있습니다.</li>
+  </ul>
+  <p style="margin:8px 0;">한 작가의 특징이 지나치게 강하면 그 작가의 가중치를 낮추고, 원하는 특징이 거의 보이지 않으면 조금씩 높입니다. 0.1에서 2.3 끝까지 한 번에 움직이기보다 0.1~0.3씩 바꿔 비교하는 편이 원인을 찾기 쉽습니다.</p>
+  <p style="margin:8px 0;"><strong>고정 작가도 전체 작가 수에 포함됩니다.</strong> 예를 들어 작가 수가 7명이고 고정 작가가 5명이면 다시 뽑는 자리는 2개입니다. 이때 공유 작가 최소·최대를 2/2로 두면 두 자리 모두 공유 그림체에서 뽑고, 0/0으로 두면 허용 평점과 평가 작가 태그 필터에 맞는 개인 평가 작가 중에서 두 명을 뽑습니다.</p>
+
+  <div data-media-slot="18" data-caption="자리별 가중치 그래프와 가중치 표의 관계." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 18 · 자리별 가중치 그래프</p>
+    <p style="margin:8px 0 0;color:#64748b;">가로가 작가 자리, 세로가 가중치라는 설명 표시</p>
+  </div>
+
+  <div data-media-slot="19" data-caption="원하는 작가를 검색해 위치와 가중치를 정한 뒤 고정 추가하는 과정." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 19 · 원하는 작가 고정 추가</p>
+    <p style="margin:8px 0 0;color:#64748b;">검색 → 위치 → 가중치 → ＋ 순서로 번호 표시</p>
+  </div>
+
+  <div data-media-slot="20" data-caption="고정 작가를 설정한 작가 자리 사이에서 이동한 전후." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 20 · 고정 작가 순서 이동</p>
+    <p style="margin:8px 0 0;color:#64748b;">1번 이후 원하는 자리로 이동되는 모습</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">11. 실제 그림체 탐색 3단계</h2>
+  <h3 style="margin:18px 0 8px;font-size:21px;color:#1d4ed8;">1단계 · 넓게 찾기</h3>
+  <p style="margin:8px 0;">작가 수 7명과 균형 가중치로 전체를 여러 번 다시 뽑습니다. 처음에는 공유 작가 7명만 사용해도 되고, 평가한 작가가 있다면 공유 작가 4~5명과 개인 평가 작가 2~3명을 섞어도 됩니다. 이때는 세부 오류보다 전체 색감, 선, 얼굴, 채색 분위기가 마음에 드는지 봅니다.</p>
+  <h3 style="margin:18px 0 8px;font-size:21px;color:#1d4ed8;">2단계 · 작가를 유지하고 가중치 찾기</h3>
+  <p style="margin:8px 0;">마음에 드는 결과가 나오면 작가는 유지합니다. 같은 시드에서 가중치만 다시 뽑아 어떤 분배가 가장 안정적인지 찾습니다.</p>
+  <h3 style="margin:18px 0 8px;font-size:21px;color:#1d4ed8;">3단계 · 수동 미세 조정</h3>
+  <p style="margin:8px 0;">너무 강한 작가를 낮추고, 필요한 작가를 직접 추가하거나 순서를 옮깁니다. 이 단계부터는 매번 변경한 내용을 메모하면 되돌아가기 쉽습니다.</p>
+  <div style="margin:14px 0;padding:16px;border-radius:12px;background:#ecfdf5;border:1px solid #6ee7b7;text-align:center;font-weight:700;color:#065f46;">전체 탐색 → 마음에 드는 작가 조합 발견 → 작가 유지 → 가중치 탐색 → 수동 조정 → 다른 구도로 검증</div>
+
+  <div data-media-slot="21" data-caption="넓게 찾기, 가중치 좁히기, 수동 조정의 3단계 결과." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 21 · 3단계 발전 과정</p>
+    <p style="margin:8px 0 0;color:#64748b;">초기 후보 / 가중치 조정 / 최종 결과를 나란히 배치</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">12. 연속 생성으로 후보를 빠르게 찾기</h2>
+  <ol style="margin:8px 0;padding-left:24px;">
+    <li>처음에는 생성 장수를 10~20장 정도로 둡니다.</li>
+    <li>넓게 찾을 때는 매 장 랜덤 변경에서 <strong>작가</strong>와 <strong>가중치</strong>를 켭니다.</li>
+    <li>퀄리티와 네거티브까지 동시에 바꾸면 비교 변수가 많아지므로 처음에는 끄는 편이 쉽습니다.</li>
+    <li>연속 생성을 시작하고 결과를 관찰합니다.</li>
+    <li>마음에 드는 작가 조합을 발견하면 일시정지하고 그 조합을 확인합니다.</li>
+    <li>다음 탐색에서는 작가는 끄고 가중치만 켜서 범위를 좁힙니다.</li>
+  </ol>
+  <div style="margin:12px 0;padding:12px 14px;border-left:4px solid #f59e0b;background:#fffbeb;color:#92400e;"><strong>비용 주의:</strong> 무제한 생성은 중지할 때까지 계속될 수 있습니다. 처음에는 지정 장수를 사용하고 생성 상태를 확인하세요.</div>
+
+  <div data-media-slot="22" data-caption="연속 생성 장수와 매 장 랜덤 변경 버튼 설정." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 22 · 연속 생성 추천 설정</p>
+    <p style="margin:8px 0 0;color:#64748b;">작가·가중치 켬, 퀄리티·네거티브 끔 상태 표시</p>
+  </div>
+
+  <div data-media-slot="23" data-caption="연속 생성으로 얻은 후보 여러 장과 선택한 한 장." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 23 · 후보를 고르는 예시</p>
+    <p style="margin:8px 0 0;color:#64748b;">후보 6~9장 중 선택한 결과에 테두리 표시</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">13. 그림체 관리에서 비교하고 보관하기</h2>
+  <p style="margin:8px 0;">생성에 성공한 이미지는 별도 저장 버튼을 누르지 않아도 자동 저장됩니다. <strong>그림체 관리</strong>에서는 다음 정보를 다시 확인할 수 있습니다.</p>
+  <ul style="margin:8px 0;padding-left:22px;">
+    <li>작가 조합과 순서</li>
+    <li>각 작가의 가중치</li>
+    <li>퀄리티·고정 태그가 합쳐진 기본 프롬프트</li>
+    <li>네거티브와 캐릭터 프롬프트</li>
+    <li>시드, 해상도, Sampler, Steps, CFG 등 생성 설정</li>
+  </ul>
+  <p style="margin:8px 0;">한 캐릭터 얼굴만 잘 나온 조합을 바로 확정하지 말고, 얼굴 중심·상반신·전신 또는 배경 포함 장면으로 다시 생성해 그림체가 유지되는지 확인합니다.</p>
+
+  <div data-media-slot="24" data-caption="그림체 관리에서 대표 이미지와 작가·가중치·생성 정보를 확인하는 화면." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 24 · 그림체 관리</p>
+    <p style="margin:8px 0 0;color:#64748b;">대표 이미지와 상세 정보 영역을 함께 촬영</p>
+  </div>
+
+  <div data-media-slot="25" data-caption="같은 그림체로 얼굴 중심, 상반신, 배경 포함 장면을 생성한 검증." style="margin:18px 0;padding:24px;border:2px dashed #60a5fa;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#1d4ed8;">🖼️ 이미지 25 · 다른 구도로 최종 검증</p>
+    <p style="margin:8px 0 0;color:#64748b;">가능하면 같은 캐릭터로 3종 비교</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">14. with 다키마쿠라 · 전신 제작에 쓸 상반신 원본 만들기</h2>
+  <p style="margin:8px 0;">여기서 다키마쿠라 태그를 쓰는 목적은 단순히 그림체를 비교하는 데서 끝나지 않습니다. 먼저 얼굴, 머리카락, 피부와 옷의 디테일이 좋은 <strong>고품질 상반신 원본</strong>을 만들고, 이후 긴 전신 그림으로 확장할 때 기준 이미지로 사용하기 위해서입니다. 다키마쿠라는 실제로 상반신을 가장 자주 보게 되므로 이 첫 원본의 완성도가 중요합니다.</p>
+  <div style="margin:14px 0;padding:16px;border-radius:12px;background:#faf5ff;border:1px solid #c4b5fd;">
+    <p style="margin:0 0 6px;font-weight:700;color:#6b21a8;">이 프로그램이 맡는 범위</p>
+    <p style="margin:0;">이 글에서는 다키마쿠라에 어울리는 작가 조합을 찾고, 상반신 원본을 생성해 고르는 단계까지 설명합니다. 원본을 긴 캔버스로 확장하고 하반신을 인페인팅한 뒤 2500×8000, 5000×16000 등으로 업스케일·보정하는 작업은 별도의 이미지 편집 도구가 필요한 다음 단계입니다.</p>
+  </div>
+
+  <h3 style="margin:18px 0 8px;font-size:21px;color:#7c3aed;">14-1. 다키마쿠라 관련 작가 후보 찾기</h3>
+  <ol style="margin:8px 0;padding-left:24px;">
+    <li><strong>작가 뽑기</strong> 화면으로 이동합니다.</li>
+    <li>태그/프롬프트 검색에 <code style="padding:2px 6px;border-radius:5px;background:#ede9fe;">dakimakura_(medium)</code>을 입력합니다.</li>
+    <li>후보 작가 수와 샘플 수를 정하고 작가 후보를 뽑습니다.</li>
+    <li>샘플을 보면서 원하는 선, 얼굴, 채색과 가까운 작가에게 점수를 줍니다.</li>
+    <li>한 명만 고르기보다 마음에 드는 작가를 여럿 평가하고, 공유 작가와 함께 전체 7명 조합에 일부 섞어 봅니다.</li>
+  </ol>
+
+  <div data-media-slot="26" data-caption="작가 뽑기에서 dakimakura_(medium) 태그로 검색하는 화면." style="margin:18px 0;padding:24px;border:2px dashed #8b5cf6;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#7c3aed;">🖼️ 이미지 26 · dakimakura_(medium) 검색</p>
+    <p style="margin:8px 0 0;color:#64748b;">검색어와 후보 조건이 보이게 촬영</p>
+  </div>
+
+  <div data-media-slot="27" data-caption="다키마쿠라 검색으로 찾은 작가 샘플을 보고 평가하는 예시." style="margin:18px 0;padding:24px;border:2px dashed #8b5cf6;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#7c3aed;">🖼️ 이미지 27 · 작가 샘플 평가</p>
+    <p style="margin:8px 0 0;color:#64748b;">공개 가능한 샘플과 점수 버튼을 표시</p>
+  </div>
+
+  <h3 style="margin:18px 0 8px;font-size:21px;color:#7c3aed;">14-2. 상반신 원본용 프롬프트 만들기</h3>
+  <p style="margin:8px 0;">그림체 제작에서 방금 평가한 작가를 사용하거나 고정 작가로 추가합니다. 자신이 만들 캐릭터의 이름·외형·복장을 캐릭터 프롬프트에 넣고, 다키마쿠라 조건과 상반신 구도는 고정 태그에 넣습니다.</p>
+  <table style="width:100%;border-collapse:collapse;margin:14px 0;background:#ffffff;">
+    <tr><th style="padding:10px;border:1px solid #cbd5e1;background:#ede9fe;text-align:left;">입력칸</th><th style="padding:10px;border:1px solid #cbd5e1;background:#ede9fe;text-align:left;">예시</th></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>캐릭터 프롬프트</strong></td><td style="padding:10px;border:1px solid #cbd5e1;"><code>1girl, solo, 캐릭터 이름, 머리색, 눈색, 원하는 복장, looking at viewer</code></td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>고정 태그 · 다키 조건</strong></td><td style="padding:10px;border:1px solid #cbd5e1;"><code>3::dakimakura (medium), white sheet, lying::</code></td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>고정 태그 · 구도</strong></td><td style="padding:10px;border:1px solid #cbd5e1;"><code>3::bust shot::</code> 또는 <code>close-up, upper body</code></td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;"><strong>퀄리티·네거티브</strong></td><td style="padding:10px;border:1px solid #cbd5e1;">처음에는 자동 추천 유지</td></tr>
+  </table>
+  <p style="margin:8px 0;"><strong>bust shot</strong>, <strong>close-up</strong>, <strong>upper body</strong>는 얼굴과 상체가 화면에서 충분히 크게 나오도록 돕습니다. 긴 전신을 처음부터 한 번에 뽑는 것보다 상반신을 먼저 크게 생성해야 얼굴과 머리카락, 옷의 세부 묘사를 확보하기 쉽습니다.</p>
+  <p style="margin:8px 0;"><code style="padding:2px 6px;border-radius:5px;background:#ede9fe;">3::dakimakura (medium), white sheet, lying::</code>는 다키마쿠라 매체, 흰 시트, 누운 자세를 한 묶음으로 강조하는 시작값입니다. 결과에서 다키마쿠라 느낌이 지나치게 강하거나 약하면 숫자를 조금씩 바꿔 비교하세요. 작가 검색에 쓰는 Danbooru 태그 <code style="padding:2px 6px;border-radius:5px;background:#ede9fe;">dakimakura_(medium)</code>과 NovelAI 프롬프트 표기는 다르므로 구분해야 합니다.</p>
+  <p style="margin:8px 0;"><strong>white sheet</strong>는 복잡한 배경을 줄이고 흰 시트 위에 누운 구도를 유도합니다. 캐릭터 외형과 작가 조합을 비교할 때 배경의 영향을 줄이는 데도 도움이 됩니다.</p>
+
+  <div data-media-slot="28" data-caption="상반신 원본용 캐릭터 프롬프트와 3::dakimakura (medium), white sheet, lying:: 및 3::bust shot:: 고정 태그." style="margin:18px 0;padding:24px;border:2px dashed #8b5cf6;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#7c3aed;">🖼️ 이미지 28 · 상반신 원본 프롬프트 입력</p>
+    <p style="margin:8px 0 0;color:#64748b;">캐릭터 프롬프트와 고정 태그 칸을 함께 촬영</p>
+  </div>
+
+  <h3 style="margin:18px 0 8px;font-size:21px;color:#7c3aed;">14-3. 1024×1024로 후보를 뽑고 고해상도로 다시 만들기</h3>
+  <ol style="margin:8px 0;padding-left:24px;">
+    <li>해상도를 <strong>1024×1024</strong>로 두고 같은 캐릭터와 그림체로 여러 장 생성합니다.</li>
+    <li>얼굴, 머리카락, 손, 피부, 옷 주름이 선명하고 캐릭터 특징이 잘 유지된 결과를 고릅니다.</li>
+    <li>마음에 드는 결과의 프롬프트와 그림체를 유지한 채 사용자 지정 해상도 <strong>1600×1536</strong> 또는 <strong>1600×1472</strong>로 다시 생성합니다.</li>
+    <li>고해상도 결과에서도 얼굴과 상반신이 무너지지 않았는지 확인하고, 가장 좋은 한 장을 이후 전신 확장 작업의 원본으로 저장합니다.</li>
+  </ol>
+  <p style="margin:8px 0;">무작정 생성 장수를 크게 잡으면 Anlas가 많이 들 수 있습니다. 처음에는 1장 생성으로 구도와 태그가 맞는지 확인한 뒤, 필요한 만큼만 연속 생성하세요. 고해상도 재생성은 선택한 후보에만 하는 편이 효율적입니다.</p>
+
+  <div data-media-slot="29" data-caption="1024×1024에서 생성한 여러 상반신 후보와 얼굴·머리카락·손·옷 디테일을 비교해 고르는 예시." style="margin:18px 0;padding:24px;border:2px dashed #8b5cf6;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#7c3aed;">🖼️ 이미지 29 · 1024×1024 상반신 후보 고르기</p>
+    <p style="margin:8px 0 0;color:#64748b;">같은 캐릭터로 만든 후보 4~6장에 선택 이유를 짧게 표시</p>
+  </div>
+
+  <div data-media-slot="30" data-caption="선택한 1024×1024 후보와 같은 프롬프트로 다시 생성한 1600×1536 또는 1600×1472 고해상도 상반신 원본 비교." style="margin:18px 0;padding:24px;border:2px dashed #8b5cf6;border-radius:14px;background:#ffffff;text-align:center;">
+    <p style="margin:0;font-size:18px;font-weight:700;color:#7c3aed;">🖼️ 이미지 30 · 선택 후보와 고해상도 원본 비교</p>
+    <p style="margin:8px 0 0;color:#64748b;">저해상도 후보 / 고해상도 재생성 / 확대 디테일을 나란히 표시</p>
+  </div>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">15. 결과가 이상할 때 빠른 해결표</h2>
+  <table style="width:100%;border-collapse:collapse;margin:14px 0;background:#ffffff;">
+    <tr><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">문제</th><th style="padding:10px;border:1px solid #cbd5e1;background:#e2e8f0;text-align:left;">먼저 할 일</th></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">그림이 너무 뒤섞여 보임</td><td style="padding:10px;border:1px solid #cbd5e1;">작가 수를 줄이거나 영향이 강한 작가 가중치를 낮춤</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">한 작가 느낌만 지나치게 강함</td><td style="padding:10px;border:1px solid #cbd5e1;">해당 작가 가중치를 0.1~0.3씩 낮추며 비교</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">작가를 바꿔도 차이가 작음</td><td style="padding:10px;border:1px solid #cbd5e1;">시드를 고정하고 작가·가중치 외 조건이 바뀌지 않았는지 확인</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">캐릭터가 자꾸 달라짐</td><td style="padding:10px;border:1px solid #cbd5e1;">캐릭터 프롬프트를 고정하고 외형 태그를 구체화</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">가로와 세로에서 느낌이 다름</td><td style="padding:10px;border:1px solid #cbd5e1;">이상 현상이 아니라 구도 영향일 수 있으므로 두 비율에서 각각 검증</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">자동완성이 안 뜸</td><td style="padding:10px;border:1px solid #cbd5e1;">텍스트 편집인지, 두 글자 이상인지, 인터넷 연결이 되는지 확인</td></tr>
+    <tr><td style="padding:10px;border:1px solid #cbd5e1;">생성이 안 됨</td><td style="padding:10px;border:1px solid #cbd5e1;">App Key 연결 테스트, 구독 상태, 오류 문구를 순서대로 확인</td></tr>
+  </table>
+
+  <h2 style="margin:34px 0 12px;font-size:28px;color:#111827;">16. 처음 사용하는 사람용 최종 확인표</h2>
+  <ul style="margin:8px 0;padding-left:22px;">
+    <li>서버를 켜고 웹사이트를 열었는가?</li>
+    <li>NovelAI App Key 연결 테스트가 성공했는가?</li>
+    <li>작가 수를 7명으로 두고, 공유 7/7 또는 공유 4/5와 개인 평가 작가 혼합 중 하나를 선택했는가?</li>
+    <li>캐릭터 태그는 캐릭터 프롬프트에 넣었는가?</li>
+    <li>계속 유지할 구도·배경 태그는 고정 태그에 넣었는가?</li>
+    <li>비교할 때 시드와 나머지 프롬프트를 고정했는가?</li>
+    <li>한 번에 한 종류의 설정만 바꿨는가?</li>
+    <li>좋은 작가 조합을 찾은 뒤 가중치만 다시 뽑아 보았는가?</li>
+    <li>얼굴·상반신·배경 포함 구도로 최종 그림체를 검증했는가?</li>
+    <li>연속 생성 장수와 Anlas 소비를 확인했는가?</li>
+  </ul>
+
+  <div style="margin-top:28px;padding:20px;border-radius:14px;background:#172554;color:#ffffff;text-align:center;">
+    <p style="margin:0 0 8px;font-size:20px;font-weight:700;">가장 중요한 한 줄</p>
+    <p style="margin:0;font-size:17px;">넓게 뽑고 → 마음에 드는 작가를 남기고 → 같은 시드에서 가중치를 좁히고 → 다른 구도로 다시 검증하세요.</p>
+  </div>
+</div>
+  </main>
+
+  <input id="mediaPicker" type="file" accept="image/*" multiple hidden>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById("articleCanvas");
+      const picker = document.getElementById("mediaPicker");
+      const status = document.getElementById("editorStatus");
+      let activeSlot = null;
+
+      function setStatus(message, isError = false) {
+        status.textContent = message || "";
+        status.style.color = isError ? "#fca5a5" : "#86efac";
+      }
+
+      function slots() {
+        return [...canvas.querySelectorAll("[data-media-slot]")];
+      }
+
+      function mediaList(slot) {
+        return slot.querySelector(":scope > .slot-media-list");
+      }
+
+      function imagesIn(slot) {
+        return [...slot.querySelectorAll("img[data-pasted-media]")];
+      }
+
+      function updateProgress() {
+        const all = slots();
+        const filled = all.filter((slot) => imagesIn(slot).length > 0).length;
+        document.getElementById("progress").textContent = `${filled} / ${all.length}칸 완료`;
+        all.forEach((slot) => slot.classList.toggle("editor-filled", imagesIn(slot).length > 0));
+      }
+
+      function activateSlot(slot) {
+        if (!slot) return;
+        slots().forEach((item) => item.classList.toggle("editor-active", item === slot));
+        activeSlot = slot;
+        slot.focus({ preventScroll: true });
+        setStatus(`이미지 ${slot.dataset.mediaSlot} 칸 선택됨 · Ctrl+V로 붙여넣을 수 있습니다.`);
+      }
+
+      function ensurePlaceholder(slot) {
+        let placeholder = slot.querySelector(":scope > [data-slot-placeholder]");
+        if (placeholder) return placeholder;
+        placeholder = document.createElement("div");
+        placeholder.dataset.slotPlaceholder = "true";
+        const movable = [...slot.childNodes].filter((node) => {
+          return !(node.nodeType === Node.ELEMENT_NODE && (
+            node.matches(".slot-media-list") || node.hasAttribute("data-editor-control")
+          ));
+        });
+        movable.forEach((node) => placeholder.append(node));
+        slot.prepend(placeholder);
+        return placeholder;
+      }
+
+      function ensureMediaList(slot) {
+        let list = mediaList(slot);
+        if (!list) {
+          list = document.createElement("div");
+          list.className = "slot-media-list";
+          slot.append(list);
+        }
+        return list;
+      }
+
+      function renderSlot(slot) {
+        slot.querySelectorAll(":scope > [data-editor-control]").forEach((item) => item.remove());
+        const placeholder = ensurePlaceholder(slot);
+        const list = ensureMediaList(slot);
+        const hasImages = imagesIn(slot).length > 0;
+        placeholder.hidden = hasImages;
+        list.hidden = !hasImages;
+
+        const caption = document.createElement("label");
+        caption.className = "slot-caption-label";
+        caption.dataset.editorControl = "caption";
+        caption.textContent = "이미지 아래 설명";
+        const captionInput = document.createElement("input");
+        captionInput.value = slot.dataset.caption || "";
+        captionInput.addEventListener("input", () => { slot.dataset.caption = captionInput.value; });
+        caption.append(captionInput);
+
+        const hint = document.createElement("div");
+        hint.className = "slot-editor-hint";
+        hint.dataset.editorControl = "hint";
+        hint.textContent = "이 칸을 클릭하고 Ctrl+V · 이미지/GIF 드래그 · 아래 파일 선택을 사용하세요.";
+
+        const controls = document.createElement("div");
+        controls.className = "slot-editor-controls";
+        controls.dataset.editorControl = "controls";
+        const choose = document.createElement("button");
+        choose.type = "button";
+        choose.textContent = "이미지·GIF 선택";
+        choose.addEventListener("click", (event) => {
+          event.stopPropagation();
+          activateSlot(slot);
+          picker.click();
+        });
+        const clear = document.createElement("button");
+        clear.type = "button";
+        clear.className = "remove";
+        clear.textContent = "이 칸 이미지 삭제";
+        clear.disabled = !hasImages;
+        clear.addEventListener("click", (event) => {
+          event.stopPropagation();
+          if (!imagesIn(slot).length || !confirm(`이미지 ${slot.dataset.mediaSlot} 칸의 이미지를 모두 지울까요?`)) return;
+          list.replaceChildren();
+          renderSlot(slot);
+          updateProgress();
+        });
+        controls.append(choose, clear);
+        if (hasImages) slot.append(caption);
+        slot.append(hint, controls);
+      }
+
+      function bindMediaItem(slot, item) {
+        item.querySelectorAll(":scope > button").forEach((button) => button.remove());
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.title = "이 이미지만 삭제";
+        remove.addEventListener("click", (event) => {
+          event.stopPropagation();
+          item.remove();
+          renderSlot(slot);
+          updateProgress();
+        });
+        item.append(remove);
+      }
+
+      function addImageSource(slot, src, alt = "붙여넣은 이미지") {
+        const list = ensureMediaList(slot);
+        const item = document.createElement("div");
+        item.className = "slot-media-item";
+        const img = document.createElement("img");
+        img.dataset.pastedMedia = "true";
+        img.src = src;
+        img.alt = alt;
+        item.append(img);
+        bindMediaItem(slot, item);
+        list.append(item);
+        renderSlot(slot);
+        updateProgress();
+        activateSlot(slot);
+      }
+
+      function addImageFile(slot, file) {
+        if (!file || !file.type.startsWith("image/")) return;
+        if (file.size > 10 * 1024 * 1024) {
+          const size = (file.size / 1024 / 1024).toFixed(1);
+          if (!confirm(`${file.name || "이미지"}은 ${size}MB입니다. 큰 GIF나 이미지는 아카라이브 업로드가 어려울 수 있습니다. 그래도 넣을까요?`)) return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => addImageSource(slot, String(reader.result), file.name || "붙여넣은 이미지");
+        reader.onerror = () => setStatus("이미지 파일을 읽지 못했습니다.", true);
+        reader.readAsDataURL(file);
+      }
+
+      function bindSlot(slot) {
+        slot.tabIndex = 0;
+        slot.querySelectorAll(":scope > [data-editor-control]").forEach((item) => item.remove());
+        ensurePlaceholder(slot);
+        ensureMediaList(slot);
+        slot.querySelectorAll(":scope > .slot-media-list > .slot-media-item").forEach((item) => bindMediaItem(slot, item));
+        slot.addEventListener("click", () => activateSlot(slot));
+        slot.addEventListener("focus", () => activateSlot(slot));
+        slot.addEventListener("dragover", (event) => {
+          event.preventDefault();
+          slot.classList.add("drop-highlight");
+        });
+        slot.addEventListener("dragleave", () => slot.classList.remove("drop-highlight"));
+        slot.addEventListener("drop", (event) => {
+          event.preventDefault();
+          slot.classList.remove("drop-highlight");
+          activateSlot(slot);
+          [...event.dataTransfer.files].filter((file) => file.type.startsWith("image/")).forEach((file) => addImageFile(slot, file));
+        });
+        renderSlot(slot);
+      }
+
+      document.addEventListener("paste", (event) => {
+        if (!activeSlot) return;
+        const files = [...event.clipboardData.items]
+          .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+          .map((item) => item.getAsFile())
+          .filter(Boolean);
+        if (files.length) {
+          event.preventDefault();
+          files.forEach((file) => addImageFile(activeSlot, file));
+          return;
+        }
+        const html = event.clipboardData.getData("text/html");
+        if (html) {
+          const parsed = new DOMParser().parseFromString(html, "text/html");
+          const source = parsed.querySelector("img")?.src;
+          if (source) {
+            event.preventDefault();
+            addImageSource(activeSlot, source, "붙여넣은 이미지");
+          }
+        }
+      });
+
+      picker.addEventListener("change", () => {
+        if (activeSlot) [...picker.files].forEach((file) => addImageFile(activeSlot, file));
+        picker.value = "";
+      });
+
+      function exportArticleNode() {
+        const source = canvas.firstElementChild;
+        const clone = source.cloneNode(true);
+        clone.querySelectorAll("[data-media-slot]").forEach((slot) => {
+          const pasted = [...slot.querySelectorAll("img[data-pasted-media]")];
+          const caption = slot.dataset.caption || "";
+          slot.removeAttribute("data-media-slot");
+          slot.removeAttribute("data-caption");
+          slot.removeAttribute("tabindex");
+          slot.removeAttribute("class");
+          if (!pasted.length) {
+            slot.querySelectorAll("[data-editor-control], .slot-media-list").forEach((item) => item.remove());
+            const placeholder = slot.querySelector("[data-slot-placeholder]");
+            if (placeholder) placeholder.replaceWith(...placeholder.childNodes);
+            return;
+          }
+          slot.replaceChildren();
+          slot.style.cssText = "margin:18px 0;padding:12px;border:1px solid #cbd5e1;border-radius:14px;background:#ffffff;text-align:center;";
+          pasted.forEach((image) => {
+            const img = document.createElement("img");
+            img.src = image.src;
+            img.alt = image.alt || caption || "설명 이미지";
+            img.style.cssText = "display:block;max-width:100%;height:auto;margin:0 auto 10px;border-radius:10px;";
+            slot.append(img);
+          });
+          if (caption) {
+            const text = document.createElement("p");
+            text.style.cssText = "margin:6px 0 0;color:#64748b;font-size:13px;text-align:center;";
+            text.textContent = caption;
+            slot.append(text);
+          }
+        });
+        clone.querySelectorAll("[data-slot-placeholder],[data-editor-control],[data-pasted-media]").forEach((item) => {
+          item.removeAttribute("data-slot-placeholder");
+          item.removeAttribute("data-editor-control");
+          item.removeAttribute("data-pasted-media");
+        });
+        return clone;
+      }
+
+      function exportHtml() {
+        return exportArticleNode().outerHTML;
+      }
+
+      function warnIncomplete() {
+        const empty = slots().filter((slot) => !imagesIn(slot).length).length;
+        return !empty || confirm(`${empty}개의 이미지 칸이 비어 있습니다. 빈 칸은 촬영 안내 상자로 남습니다. 계속할까요?`);
+      }
+
+      function copyFallback(html) {
+        const holder = document.createElement("div");
+        holder.contentEditable = "true";
+        holder.style.position = "fixed";
+        holder.style.left = "-100000px";
+        holder.innerHTML = html;
+        document.body.append(holder);
+        const range = document.createRange();
+        range.selectNodeContents(holder);
+        const selection = getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        const ok = document.execCommand("copy");
+        selection.removeAllRanges();
+        holder.remove();
+        return ok;
+      }
+
+      async function copyRichArticle() {
+        if (!warnIncomplete()) return;
+        const html = exportHtml();
+        try {
+          if (navigator.clipboard?.write && window.ClipboardItem) {
+            const plain = exportArticleNode().innerText;
+            await navigator.clipboard.write([new ClipboardItem({
+              "text/html": new Blob([html], { type: "text/html" }),
+              "text/plain": new Blob([plain], { type: "text/plain" }),
+            })]);
+          } else if (!copyFallback(html)) {
+            throw new Error("copy failed");
+          }
+          setStatus("글 전체를 복사했습니다. 아카라이브 글 편집기에 붙여넣으세요.");
+        } catch {
+          if (copyFallback(html)) setStatus("글 전체를 복사했습니다. 아카라이브 글 편집기에 붙여넣으세요.");
+          else setStatus("자동 복사에 실패했습니다. HTML 소스 복사 또는 다운로드를 사용하세요.", true);
+        }
+      }
+
+      async function copySource() {
+        if (!warnIncomplete()) return;
+        const html = exportHtml();
+        try {
+          await navigator.clipboard.writeText(html);
+          setStatus("아카라이브용 HTML 소스를 복사했습니다.");
+        } catch {
+          const textarea = document.createElement("textarea");
+          textarea.value = html;
+          document.body.append(textarea);
+          textarea.select();
+          const ok = document.execCommand("copy");
+          textarea.remove();
+          setStatus(ok ? "아카라이브용 HTML 소스를 복사했습니다." : "HTML 소스 복사에 실패했습니다.", !ok);
+        }
+      }
+
+      function downloadText(name, text, type = "text/html") {
+        const url = URL.createObjectURL(new Blob([text], { type }));
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = name;
+        anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      function saveWorkFile() {
+        const clone = document.documentElement.cloneNode(true);
+        clone.querySelectorAll("[data-media-slot]").forEach((slot) => {
+          slot.classList.remove("editor-active", "drop-highlight");
+          slot.querySelectorAll(":scope > [data-editor-control]").forEach((item) => item.remove());
+          slot.querySelectorAll(".slot-media-item > button").forEach((item) => item.remove());
+        });
+        const saved = `<!DOCTYPE html>\n${clone.outerHTML}`;
+        downloadText("arca_novelai_style_guide_editor_work.html", saved);
+        setStatus("현재 이미지가 포함된 작업본 HTML을 저장했습니다. 파일이 크면 저장에 시간이 걸릴 수 있습니다.");
+      }
+
+      document.getElementById("nextEmpty").addEventListener("click", () => {
+        const all = slots();
+        const start = Math.max(0, all.indexOf(activeSlot) + 1);
+        const next = [...all.slice(start), ...all.slice(0, start)].find((slot) => !imagesIn(slot).length);
+        if (!next) return setStatus("모든 이미지 칸이 채워졌습니다.");
+        activateSlot(next);
+        next.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+      document.getElementById("copyRich").addEventListener("click", copyRichArticle);
+      document.getElementById("copySource").addEventListener("click", copySource);
+      document.getElementById("downloadArticle").addEventListener("click", () => {
+        if (!warnIncomplete()) return;
+        downloadText("arca_novelai_style_guide_complete.html", exportHtml());
+        setStatus("게시용 HTML을 다운로드했습니다.");
+      });
+      document.getElementById("saveWork").addEventListener("click", saveWorkFile);
+      document.getElementById("resetAll").addEventListener("click", () => {
+        if (!confirm("모든 이미지 칸의 붙여넣은 이미지를 삭제할까요? 이 작업은 되돌릴 수 없습니다.")) return;
+        slots().forEach((slot) => {
+          ensureMediaList(slot).replaceChildren();
+          renderSlot(slot);
+        });
+        updateProgress();
+        setStatus("붙여넣은 이미지를 모두 삭제했습니다.");
+      });
+
+      slots().forEach(bindSlot);
+      updateProgress();
+      const first = slots()[0];
+      if (first) activateSlot(first);
+    })();
+  </script>
+</body>
+</html>

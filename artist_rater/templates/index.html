@@ -237,7 +237,13 @@
                       <input id="sharedStyleArtistMax" type="number" min="0" max="50" value="0">
                     </label>
                   </div>
-                  <p class="help-text">공유 그림체에서 최소~최대 명을 무작위로 넣습니다. 둘을 같게 하면 고정 인원입니다.</p>
+                  <p class="help-text">고정 작가를 제외한 남은 자리에 공유 그림체 작가를 최소~최대 명 넣습니다. 둘을 같게 하면 고정 인원이며 0/0이면 남은 자리를 평가 작가에서 뽑습니다.</p>
+                  <div class="field">
+                    <span>평가 작가 태그별 인원</span>
+                    <button id="openRatingTagRules" type="button">태그별 인원 설정</button>
+                    <div id="ratingTagRulesSummary" class="rating-tag-rules-summary">설정 없음 · 남은 자리는 전체 평가 작가에서 선택</div>
+                  </div>
+                  <p class="help-text">여러 태그에 각각 몇 명을 넣을지 정할 수 있습니다. 지정한 인원을 제외한 남은 자리는 모든 평가 작가에서 무작위로 뽑습니다.</p>
                 </div>
               </details>
               <details class="style-settings-section" open>
@@ -315,7 +321,7 @@
             <div class="artist-add-row">
               <label class="field style-artist-search-field">
                 <span>추가할 작가</span>
-                <textarea id="styleArtistSearch" autocomplete="off" placeholder="작가 이름, 쉼표나 줄바꿈으로 여러 명"></textarea>
+                <textarea id="styleArtistSearch" autocomplete="off" placeholder="작가 이름 또는 0.1::artist:작가명:: 형식, 쉼표나 줄바꿈으로 여러 명"></textarea>
                 <div id="styleArtistAutocomplete" class="autocomplete hidden"></div>
               </label>
               <label class="field style-artist-select-field">
@@ -359,16 +365,12 @@
                 <section class="prompt-preset-control" aria-labelledby="promptPresetTitle">
                   <div class="prompt-preset-head">
                     <strong id="promptPresetTitle">수집 그림체 프롬프트</strong>
-                    <select id="promptPresetMode" aria-label="수집 프롬프트 적용 방식">
-                      <option value="auto">자동 추천</option>
-                      <option value="fixed">수동 고정</option>
-                    </select>
                   </div>
                   <div class="prompt-preset-row">
                     <select id="promptPresetSelect" aria-label="수집 프롬프트 세트"><option value="">수집 세트를 불러오는 중...</option></select>
                     <button id="applyPromptPreset" type="button">적용</button>
                   </div>
-                  <p id="promptPresetStatus" class="prompt-preset-status">자동 추천은 작가 구성이 바뀔 때 인물 태그를 뺀 포지티브와 네거티브를 갱신합니다.</p>
+                  <p id="promptPresetStatus" class="prompt-preset-status">아래 랜덤 대상에서 퀄리티 프롬·네거 프롬을 켜면 생성할 때마다 수집 세트에서 무작위로 바뀝니다.</p>
                   <div id="excludedPromptTags" class="excluded-prompt-tags hidden">
                     <span>인물·신체 태그 제외됨 · 누르면 복원</span>
                     <div id="excludedPromptTagList" class="excluded-prompt-tag-list"></div>
@@ -385,7 +387,7 @@
                     <span>고정 태그 · 퀄리티 프롬프트 다음에 항상 포함</span>
                     <textarea id="fixedPrompt" autocomplete="off" placeholder="upper body, white sheet"></textarea>
                     <div id="fixedPromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
-                    <span class="help-text">자동 추천이나 매 장 랜덤 변경의 영향을 받지 않습니다.</span>
+                    <span class="help-text">수집 세트 적용이나 매 장 랜덤 변경의 영향을 받지 않습니다.</span>
                   </label>
                 </section>
                 <label id="negativePromptPanel" class="field prompt-editor negative hidden" role="tabpanel" aria-labelledby="negativePromptTab">
@@ -451,7 +453,15 @@
 
       <section id="style-manager-tab" class="view style-manager-view">
         <aside class="style-manager-list-pane">
-          <div class="style-pane-head"><h2>그림체 목록</h2><button id="refreshStyleManager" type="button">새로고침</button></div>
+          <div class="style-pane-head style-manager-list-head">
+            <h2>그림체 목록</h2>
+            <div class="style-manager-list-actions">
+              <button id="beginStyleSelection" type="button">여러 개 삭제</button>
+              <button id="deleteSelectedStyles" class="danger-button style-manager-delete-selected hidden" type="button" disabled>선택 삭제 (0)</button>
+              <button id="cancelStyleSelection" class="ghost hidden" type="button">취소</button>
+              <button id="refreshStyleManager" type="button">새로고침</button>
+            </div>
+          </div>
           <div id="styleManagerStatus" class="status"></div>
           <div id="styleManagerList" class="style-manager-list"></div>
         </aside>
@@ -701,6 +711,30 @@
       </section>
     </div>
 
+    <div id="ratingTagRulesModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="ratingTagRulesTitle">
+      <div class="modal-backdrop" data-close-rating-tag-rules></div>
+      <section class="modal-dialog rating-tag-rules-dialog">
+        <div class="modal-head">
+          <div><h2 id="ratingTagRulesTitle">평가 작가 태그별 인원</h2><p>평가 관리에서 해당 태그로 평가한 작가를 지정한 인원만큼 선택합니다.</p></div>
+          <button id="closeRatingTagRules" class="ghost" type="button">닫기</button>
+        </div>
+        <div id="ratingTagRulesCountSummary" class="rating-tag-count-summary"></div>
+        <div id="ratingTagRulesList" class="rating-tag-rules-list"></div>
+        <button id="addRatingTagRule" type="button">+ 태그 조건 추가</button>
+        <div class="rating-tag-exclusion-head">
+          <strong>수집 태그로 작가 제외</strong>
+          <span class="help-text">아래 태그로 평가·수집한 작가는 태그 지정 자리와 남은 전체 평가 작가 자리에서 모두 제외합니다.</span>
+        </div>
+        <div id="ratingTagExclusionsList" class="rating-tag-rules-list rating-tag-exclusions-list"></div>
+        <button id="addRatingTagExclusion" type="button">+ 제외 태그 추가</button>
+        <div id="ratingTagRulesStatus" class="status" role="status"></div>
+        <div class="modal-actions">
+          <button id="cancelRatingTagRules" class="ghost" type="button">취소</button>
+          <button id="saveRatingTagRules" class="primary" type="button">적용</button>
+        </div>
+      </section>
+    </div>
+
     <div id="weightGraphModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="weightGraphTitle">
       <div class="modal-backdrop" data-close-weight-graph></div>
       <section class="modal-dialog weight-graph-dialog">
@@ -746,6 +780,28 @@
             </div>
           </div>
           <button id="manualPreviewNext" class="arrow" aria-label="다음 이미지">›</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="appDialog" class="modal app-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle" aria-describedby="appDialogMessage">
+      <div class="modal-backdrop" data-app-dialog-cancel></div>
+      <section class="modal-dialog app-dialog-panel">
+        <div class="app-dialog-heading">
+          <span id="appDialogIcon" class="app-dialog-icon" aria-hidden="true">!</span>
+          <div>
+            <h2 id="appDialogTitle">확인</h2>
+            <p id="appDialogMessage"></p>
+          </div>
+        </div>
+        <ul id="appDialogDetails" class="app-dialog-details hidden"></ul>
+        <label id="appDialogInputField" class="field app-dialog-input hidden">
+          <span id="appDialogInputLabel">입력</span>
+          <input id="appDialogInput" type="text" autocomplete="off">
+        </label>
+        <div class="modal-actions app-dialog-actions">
+          <button id="appDialogCancel" class="ghost" type="button">취소</button>
+          <button id="appDialogConfirm" class="primary" type="button">확인</button>
         </div>
       </section>
     </div>

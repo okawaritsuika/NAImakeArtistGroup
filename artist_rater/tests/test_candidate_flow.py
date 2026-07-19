@@ -55,6 +55,32 @@ class CandidateFlowTest(unittest.TestCase):
         self.assertEqual(item["mode"], "manual")
         self.assertEqual(item["query_tags"], ["dakimakura_(medium)", "solo"])
 
+    def test_rating_query_prompt_can_be_updated_and_cleared(self):
+        self.client.post(
+            "/api/ratings",
+            json={
+                "artist_tag": "editable_artist",
+                "score": 4,
+                "query_text": "old_tag",
+                "query_tags": ["old_tag"],
+            },
+        )
+
+        response = self.client.patch(
+            "/api/ratings/1",
+            json={"query_text": "dakimakura_(medium), white_sheet"},
+        )
+        self.assertEqual(response.status_code, 200)
+        item = self.client.get("/api/ratings").get_json()[0]
+        self.assertEqual(item["query_text"], "dakimakura_(medium), white_sheet")
+        self.assertEqual(item["query_tags"], ["dakimakura_(medium)", "white_sheet"])
+
+        response = self.client.patch("/api/ratings/1", json={"query_text": ""})
+        self.assertEqual(response.status_code, 200)
+        item = self.client.get("/api/ratings").get_json()[0]
+        self.assertEqual(item["query_text"], "")
+        self.assertEqual(item["query_tags"], [])
+
     def test_missing_rating_thumbnail_can_be_fetched_from_danbooru(self):
         self.client.post("/api/ratings", json={"artist_tag": "manual_artist", "score": 4, "mode": "manual"})
         sample = {"id": 77, "preview_url": "https://example.test/77.jpg", "large_url": "https://example.test/77-large.jpg"}

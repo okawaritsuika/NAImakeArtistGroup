@@ -56,7 +56,7 @@ def _connection_error_message(exc):
 
 def combine_base_prompt(base_prompt, artist_prompt):
     return ", ".join(
-        part for part in (base_prompt.strip(), artist_prompt.strip()) if part
+        part for part in (artist_prompt.strip(), base_prompt.strip()) if part
     )
 
 

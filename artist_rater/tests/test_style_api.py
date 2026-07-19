@@ -356,7 +356,7 @@ class NovelAIGenerationTest(unittest.TestCase):
     def test_combine_base_prompt_has_no_dangling_commas(self):
         from novelai import combine_base_prompt
 
-        self.assertEqual(combine_base_prompt(" base ", " artist "), "base, artist")
+        self.assertEqual(combine_base_prompt(" base ", " artist "), "artist, base")
         self.assertEqual(combine_base_prompt("base", ""), "base")
         self.assertEqual(combine_base_prompt("", "artist"), "artist")
         self.assertEqual(combine_base_prompt("", ""), "")
@@ -368,7 +368,7 @@ class NovelAIGenerationTest(unittest.TestCase):
         self.assertEqual(
             payload,
             {
-                "input": "masterpiece, 1.2::artist::",
+                "input": "1.2::artist::, masterpiece",
                 "model": "nai-diffusion-4-5-full",
                 "action": "generate",
                 "parameters": {
@@ -395,7 +395,7 @@ class NovelAIGenerationTest(unittest.TestCase):
                     },
                     "v4_prompt": {
                         "caption": {
-                            "base_caption": "masterpiece, 1.2::artist::",
+                            "base_caption": "1.2::artist::, masterpiece",
                             "char_captions": [
                                 {"char_caption": "hero", "centers": [{"x": 0.5, "y": 0.5}]},
                                 {"char_caption": "villain", "centers": [{"x": 0.5, "y": 0.5}]},
@@ -607,7 +607,7 @@ class GenerationApiTest(StyleApiTest):
         self.assertEqual(image["base_prompt"], "masterpiece")
         self.assertEqual(image["negative_prompt"], "lowres")
         self.assertEqual(image["character_prompts"], ["hero", "villain"])
-        self.assertEqual(image["combined_prompt"], f'masterpiece, {data["artist_prompt"]}')
+        self.assertEqual(image["combined_prompt"], f'{data["artist_prompt"]}, masterpiece')
         self.assertEqual(image["artists"], self.request_payload()["artists"])
         self.assertEqual(image["seed"], 123456)
         self.assertEqual(image["width"], 832)
@@ -980,6 +980,37 @@ class GenerationApiTest(StyleApiTest):
             404,
         )
         self.assertFalse(image_path.exists())
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_batch_delete_art_styles_removes_selected_styles(self, generate):
+        self.save_key()
+        first = self.client.post(
+            "/api/style-maker/generate",
+            json=self.request_payload(request_id="batch-delete-1"),
+        ).get_json()
+        second = self.client.post(
+            "/api/style-maker/generate",
+            json=self.request_payload(
+                request_id="batch-delete-2",
+                artists=[{"artist": "artist_a", "score": 5, "weight": 1.7}],
+            ),
+        ).get_json()
+
+        response = self.client.post(
+            "/api/art-styles/delete-batch",
+            json={"style_ids": [first["style_id"], second["style_id"], first["style_id"], 999999]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["deleted_ids"], [first["style_id"], second["style_id"]])
+        self.assertEqual(response.get_json()["missing_ids"], [999999])
+        self.assertEqual(self.client.get("/api/art-styles").get_json(), [])
+
+    def test_batch_delete_art_styles_rejects_invalid_ids(self):
+        for payload in ({}, {"style_ids": []}, {"style_ids": [True]}, {"style_ids": [0]}):
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/art-styles/delete-batch", json=payload)
+                self.assertEqual(response.status_code, 400)
 
     def test_unknown_style_returns_404(self):
         for method in (self.client.get, self.client.delete):
