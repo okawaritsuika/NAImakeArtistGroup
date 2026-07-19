@@ -38,6 +38,23 @@ class FakeResponse:
 
 
 class LauncherControllerTest(unittest.TestCase):
+    def test_packaged_version_matches_next_release(self):
+        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.4")
+
+    def test_independent_frozen_environment_removes_parent_bootloader_state(self):
+        env = launcher.independent_frozen_environment({
+            "PATH": "C:/Windows",
+            "_PYI_APPLICATION_HOME_DIR": "C:/Temp/_MEI123",
+            "_PYI_PARENT_PROCESS_LEVEL": "1",
+            "_MEIPASS2": "C:/Temp/_MEI123",
+        })
+
+        self.assertEqual(env["PATH"], "C:/Windows")
+        self.assertEqual(env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertNotIn("_PYI_APPLICATION_HOME_DIR", env)
+        self.assertNotIn("_PYI_PARENT_PROCESS_LEVEL", env)
+        self.assertNotIn("_MEIPASS2", env)
+
     def test_launcher_theme_uses_light_apple_style_tokens(self):
         self.assertEqual(launcher.LAUNCHER_THEME["window_bg"], "#f5f5f7")
         self.assertEqual(launcher.LAUNCHER_THEME["card_bg"], "#ffffff")
@@ -86,6 +103,20 @@ class LauncherControllerTest(unittest.TestCase):
         controller.start_server()
 
         self.assertEqual(launched[0], [str(Path("C:/App/DanbooruArtistRater.exe")), "--server"])
+
+    def test_frozen_server_starts_with_an_independent_bootloader_environment(self):
+        launched = []
+        controller = launcher.LauncherController(
+            frozen=True,
+            executable=Path("C:/App/DanbooruArtistRater.exe"),
+            popen=lambda command, **kwargs: launched.append((command, kwargs)) or FakeProcess(),
+        )
+
+        controller.start_server()
+
+        env = launched[0][1]["env"]
+        self.assertEqual(env["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        self.assertFalse(any(key.startswith("_PYI_") for key in env))
 
     def test_frozen_stop_terminates_the_whole_server_process_tree(self):
         calls = []
@@ -190,6 +221,79 @@ class LauncherControllerTest(unittest.TestCase):
 
             self.assertEqual(target.read_bytes(), b"exe-bytes")
             self.assertEqual(target.name, "DanbooruArtistRater.exe")
+
+    def test_update_install_stops_server_before_preparing_replacement(self):
+        events = []
+
+        class Controller:
+            def download_update(self, update_info):
+                events.append("download")
+                return Path("C:/App/data/updates/DanbooruArtistRater.exe")
+
+            def stop_server(self):
+                events.append("stop")
+
+            def prepare_update_install(self, target):
+                events.append(("prepare", target.name))
+                return "ready"
+
+        self.assertEqual(launcher.download_and_prepare_update(Controller(), object()), "ready")
+        self.assertEqual(events, ["download", "stop", ("prepare", "DanbooruArtistRater.exe")])
+
+    def test_frozen_update_script_retries_copy_before_restarting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            downloaded = data_dir / "updates" / launcher.RELEASE_ASSET_NAME
+            downloaded.parent.mkdir(parents=True)
+            downloaded.write_bytes(b"new-exe")
+            launched = []
+            controller = launcher.LauncherController(
+                data_dir=data_dir,
+                frozen=True,
+                executable=Path(temp_dir) / launcher.RELEASE_ASSET_NAME,
+                popen=lambda command, **kwargs: launched.append((command, kwargs)) or FakeProcess(),
+            )
+
+            controller.prepare_update_install(downloaded)
+
+            script = (data_dir / "updates" / "install_update.bat").read_text(encoding="utf-8")
+            self.assertIn("for /l %%i in (1,1,30)", script)
+            self.assertIn("copy /y", script)
+            self.assertIn("&& goto updated", script)
+            self.assertIn("ping 127.0.0.1 -n 2", script)
+            self.assertNotIn("timeout /t", script)
+            self.assertIn('set "PYINSTALLER_RESET_ENVIRONMENT=1"', script)
+            self.assertLess(script.index(":updated"), script.index(f'start "" "{controller.executable}"', script.index(":updated")))
+            self.assertEqual(launched[0][0][:2], ["cmd", "/c"])
+            self.assertEqual(launched[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+
+    def test_successful_frozen_update_closes_launcher_normally(self):
+        events = []
+
+        class Controller:
+            frozen = True
+
+            def download_update(self, update_info):
+                events.append("download")
+                return Path("C:/App/data/updates/DanbooruArtistRater.exe")
+
+            def stop_server(self):
+                events.append("stop")
+
+            def prepare_update_install(self, target):
+                events.append("prepare")
+                return "ready"
+
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.controller = Controller()
+        app.latest_update = object()
+        app.set_status = lambda message: events.append(("status", message))
+        app.close_app = lambda: events.append("close")
+        app.run_background = lambda action, on_success: on_success(action())
+
+        app.install_update()
+
+        self.assertEqual(events[-1], "close")
 
 
 if __name__ == "__main__":

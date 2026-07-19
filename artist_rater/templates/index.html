@@ -17,6 +17,7 @@
         <button class="tab" data-tab="ratings">평가 관리</button>
         <button class="tab" data-tab="style-maker">그림체 제작</button>
         <button class="tab" data-tab="style-manager">그림체 관리</button>
+        <button class="tab" data-tab="comparison">비교군 관리</button>
         <button class="tab" data-tab="arca-style-collector">공유 그림체 수집</button>
         <button class="tab" data-tab="arca-style-statistics">작가·퀄리티 분석</button>
         <button id="openSettings" class="icon-button" type="button" title="NovelAI 설정" aria-label="NovelAI 설정">⚙</button>
@@ -220,68 +221,89 @@
               <button id="toggleStyleSettings" class="icon-button ghost" type="button" title="설정 패널 닫기" aria-label="설정 패널 닫기">‹</button>
             </div>
             <div class="style-settings-body">
-              <label class="field">
-                <span>작가 수</span>
-                <input id="styleArtistCount" type="number" min="1" value="12">
-              </label>
-              <div class="compact-fields">
-                <label class="field">
-                  <span>공유 작가 최소</span>
-                  <input id="sharedStyleArtistMin" type="number" min="0" max="50" value="0">
-                </label>
-                <label class="field">
-                  <span>공유 작가 최대</span>
-                  <input id="sharedStyleArtistMax" type="number" min="0" max="50" value="0">
-                </label>
-              </div>
-              <p class="help-text">공유 그림체에서 최소~최대 명을 무작위로 넣습니다. 둘을 같게 하면 고정 인원입니다.</p>
-              <fieldset class="style-fieldset">
-                <legend>허용 평점</legend>
-                <div id="styleScoreButtons" class="segmented" aria-label="허용 평점 다중 선택">
-                  <button class="active" type="button" data-score="1" aria-pressed="true">1</button>
-                  <button class="active" type="button" data-score="2" aria-pressed="true">2</button>
-                  <button class="active" type="button" data-score="3" aria-pressed="true">3</button>
-                  <button class="active" type="button" data-score="4" aria-pressed="true">4</button>
-                  <button class="active" type="button" data-score="5" aria-pressed="true">5</button>
+              <details class="style-settings-section" open>
+                <summary>작가 구성</summary>
+                <div class="style-settings-section-body">
+                  <label class="field">
+                    <span>작가 수</span>
+                    <input id="styleArtistCount" type="number" min="1" value="12">
+                  </label>
+                  <div class="compact-fields">
+                    <label class="field">
+                      <span>공유 작가 최소</span>
+                      <input id="sharedStyleArtistMin" type="number" min="0" max="50" value="0">
+                    </label>
+                    <label class="field">
+                      <span>공유 작가 최대</span>
+                      <input id="sharedStyleArtistMax" type="number" min="0" max="50" value="0">
+                    </label>
+                  </div>
+                  <p class="help-text">고정 작가를 제외한 남은 자리에 공유 그림체 작가를 최소~최대 명 넣습니다. 둘을 같게 하면 고정 인원이며 0/0이면 남은 자리를 평가 작가에서 뽑습니다.</p>
+                  <div class="field">
+                    <span>평가 작가 태그별 인원</span>
+                    <button id="openRatingTagRules" type="button">태그별 인원 설정</button>
+                    <div id="ratingTagRulesSummary" class="rating-tag-rules-summary">설정 없음 · 남은 자리는 전체 평가 작가에서 선택</div>
+                  </div>
+                  <p class="help-text">여러 태그에 각각 몇 명을 넣을지 정할 수 있습니다. 지정한 인원을 제외한 남은 자리는 모든 평가 작가에서 무작위로 뽑습니다.</p>
                 </div>
-                <label class="check-row"><input id="styleScoreAll" type="checkbox" checked> 전체 선택</label>
-              </fieldset>
-              <label class="field">
-                <span>가중치 방식</span>
-                <select id="weightMode">
-                  <option value="random">랜덤</option>
-                  <option value="balanced" selected>균형</option>
-                  <option value="profile">사용자 그래프</option>
-                </select>
-              </label>
-              <div class="compact-fields">
-                <label class="field">
-                  <span>최소</span>
-                  <input id="styleMinWeight" type="number" min="0.1" max="2.3" step="0.1" value="0.1">
-                </label>
-                <label class="field">
-                  <span>최대</span>
-                  <input id="styleMaxWeight" type="number" min="0.1" max="2.3" step="0.1" value="2.3">
-                </label>
-              </div>
-              <label class="check-row"><input id="preferHighScores" type="checkbox"> 높은 평점 우선</label>
-              <button id="openWeightGraph" class="weight-graph-preview-button" type="button" title="가중치 그래프 편집">
-                <span>자리별 가중치 그래프</span>
-                <svg id="weightGraphPreview" viewBox="0 0 240 100" aria-hidden="true"></svg>
-              </button>
-              <section class="style-artist-list-section" aria-label="추가된 작가 편집">
-                <div class="style-subhead compact">
-                  <h3>가중치 표</h3>
-                  <span>여기서도 바로 수정</span>
+              </details>
+              <details class="style-settings-section" open>
+                <summary>허용 평점</summary>
+                <fieldset class="style-fieldset style-settings-section-body">
+                  <legend>점수 선택</legend>
+                  <div id="styleScoreButtons" class="segmented" aria-label="허용 평점 다중 선택">
+                    <button class="active" type="button" data-score="1" aria-pressed="true">1</button>
+                    <button class="active" type="button" data-score="2" aria-pressed="true">2</button>
+                    <button class="active" type="button" data-score="3" aria-pressed="true">3</button>
+                    <button class="active" type="button" data-score="4" aria-pressed="true">4</button>
+                    <button class="active" type="button" data-score="5" aria-pressed="true">5</button>
+                  </div>
+                  <label class="check-row"><input id="styleScoreAll" type="checkbox" checked> 전체 선택</label>
+                </fieldset>
+              </details>
+              <details class="style-settings-section" open>
+                <summary>가중치 설정</summary>
+                <div class="style-settings-section-body">
+                  <label class="field">
+                    <span>가중치 방식</span>
+                    <select id="weightMode">
+                      <option value="random">랜덤</option>
+                      <option value="balanced" selected>균형</option>
+                      <option value="profile">사용자 그래프</option>
+                    </select>
+                  </label>
+                  <div class="compact-fields">
+                    <label class="field">
+                      <span>최소</span>
+                      <input id="styleMinWeight" type="number" min="0.1" max="2.3" step="0.1" value="0.1">
+                    </label>
+                    <label class="field">
+                      <span>최대</span>
+                      <input id="styleMaxWeight" type="number" min="0.1" max="2.3" step="0.1" value="2.3">
+                    </label>
+                  </div>
+                  <label class="check-row"><input id="preferHighScores" type="checkbox"> 높은 평점 우선</label>
+                  <button id="openWeightGraph" class="weight-graph-preview-button" type="button" title="가중치 그래프 편집">
+                    <span>자리별 가중치 그래프</span>
+                    <svg id="weightGraphPreview" viewBox="0 0 240 100" aria-hidden="true"></svg>
+                  </button>
                 </div>
-                <div class="style-artist-row style-artist-row-head" aria-hidden="true">
-                  <span>순서</span>
-                  <span>작가</span>
-                  <span>가중치</span>
-                  <span></span>
+              </details>
+              <details class="style-settings-section style-artist-list-section" open>
+                <summary>가중치 표</summary>
+                <div class="style-settings-section-body">
+                  <div class="style-subhead compact">
+                    <span>여기서도 바로 수정</span>
+                  </div>
+                  <div class="style-artist-row style-artist-row-head" aria-hidden="true">
+                    <span>순서</span>
+                    <span>작가</span>
+                    <span>가중치</span>
+                    <span></span>
+                  </div>
+                  <div id="styleArtistList" class="style-artist-list"></div>
                 </div>
-                <div id="styleArtistList" class="style-artist-list"></div>
-              </section>
+              </details>
               <div id="styleSettingsError" class="status" role="alert"></div>
             </div>
           </aside>
@@ -300,7 +322,7 @@
             <div class="artist-add-row">
               <label class="field style-artist-search-field">
                 <span>추가할 작가</span>
-                <textarea id="styleArtistSearch" autocomplete="off" placeholder="작가 이름, 쉼표나 줄바꿈으로 여러 명"></textarea>
+                <textarea id="styleArtistSearch" autocomplete="off" placeholder="작가 이름 또는 0.1::artist:작가명:: 형식, 쉼표나 줄바꿈으로 여러 명"></textarea>
                 <div id="styleArtistAutocomplete" class="autocomplete hidden"></div>
               </label>
               <label class="field style-artist-select-field">
@@ -344,29 +366,35 @@
                 <section class="prompt-preset-control" aria-labelledby="promptPresetTitle">
                   <div class="prompt-preset-head">
                     <strong id="promptPresetTitle">수집 그림체 프롬프트</strong>
-                    <select id="promptPresetMode" aria-label="수집 프롬프트 적용 방식">
-                      <option value="auto">자동 추천</option>
-                      <option value="fixed">수동 고정</option>
-                    </select>
                   </div>
                   <div class="prompt-preset-row">
                     <select id="promptPresetSelect" aria-label="수집 프롬프트 세트"><option value="">수집 세트를 불러오는 중...</option></select>
                     <button id="applyPromptPreset" type="button">적용</button>
                   </div>
-                  <p id="promptPresetStatus" class="prompt-preset-status">자동 추천은 작가 구성이 바뀔 때 인물 태그를 뺀 포지티브와 네거티브를 갱신합니다.</p>
+                  <p id="promptPresetStatus" class="prompt-preset-status">아래 랜덤 대상에서 퀄리티 프롬·네거 프롬을 켜면 생성할 때마다 수집 세트에서 무작위로 바뀝니다.</p>
                   <div id="excludedPromptTags" class="excluded-prompt-tags hidden">
                     <span>인물·신체 태그 제외됨 · 누르면 복원</span>
                     <div id="excludedPromptTagList" class="excluded-prompt-tag-list"></div>
                   </div>
                 </section>
-                <label id="basePromptPanel" class="field prompt-editor" role="tabpanel" aria-labelledby="basePromptTab">
-                  <span>퀄리티 프롬프트 · 버튼을 누르면 제외 목록으로 이동</span>
-                  <textarea id="basePrompt" placeholder="masterpiece, best quality"></textarea>
-                  <div id="basePromptTokens" class="prompt-token-surface" data-prompt-field="base" aria-label="기본 프롬프트 토큰"></div>
-                </label>
+                <section id="basePromptPanel" class="prompt-positive-panel" role="tabpanel" aria-labelledby="basePromptTab">
+                  <label class="field prompt-editor">
+                    <span>퀄리티 프롬프트 · 버튼을 누르면 제외 목록으로 이동</span>
+                    <textarea id="basePrompt" autocomplete="off" placeholder="masterpiece, best quality"></textarea>
+                    <div id="basePromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
+                    <div id="basePromptTokens" class="prompt-token-surface" data-prompt-field="base" aria-label="기본 프롬프트 토큰"></div>
+                  </label>
+                  <label class="field fixed-prompt-editor">
+                    <span>고정 태그 · 퀄리티 프롬프트 다음에 항상 포함</span>
+                    <textarea id="fixedPrompt" autocomplete="off" placeholder="upper body, white sheet"></textarea>
+                    <div id="fixedPromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
+                    <span class="help-text">수집 세트 적용이나 매 장 랜덤 변경의 영향을 받지 않습니다.</span>
+                  </label>
+                </section>
                 <label id="negativePromptPanel" class="field prompt-editor negative hidden" role="tabpanel" aria-labelledby="negativePromptTab">
                   <span>네거티브 프롬프트</span>
-                  <textarea id="negativePrompt"></textarea>
+                  <textarea id="negativePrompt" autocomplete="off"></textarea>
+                  <div id="negativePromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
                   <div id="negativePromptTokens" class="prompt-token-surface" data-prompt-field="negative" aria-label="네거티브 프롬프트 토큰"></div>
                 </label>
               </div>
@@ -393,6 +421,7 @@
                   <label class="parameter-row"><span>Steps</span><input id="generationSteps" type="number" min="1" max="50" value="28"></label>
                   <div class="parameter-row range-parameter"><span>CFG Scale</span><input id="generationScaleRange" type="range" min="0" max="10" step="0.1" value="5"><input id="generationScale" type="number" min="0" max="10" step="0.1" value="5"></div>
                   <div class="parameter-row range-parameter"><span>CFG Rescale</span><input id="generationCfgRescaleRange" type="range" min="0" max="1" step="0.01" value="0"><input id="generationCfgRescale" type="number" min="0" max="1" step="0.01" value="0"></div>
+                  <label class="parameter-row"><span>Variety+</span><span class="compact-check"><input id="generationVarietyPlus" type="checkbox"> 사용</span></label>
                   <div class="parameter-row seed-parameter"><span>시드</span><input id="generationSeed" type="number" min="1" max="4294967295" placeholder="랜덤"><label class="compact-check"><input id="generationSeedFixed" type="checkbox"> 고정</label></div>
                 </div>
               </section>
@@ -425,13 +454,100 @@
       </section>
 
       <section id="style-manager-tab" class="view style-manager-view">
-        <aside class="style-manager-list-pane">
-          <div class="style-pane-head"><h2>그림체 목록</h2><button id="refreshStyleManager" type="button">새로고침</button></div>
+        <header class="style-manager-toolbar">
+          <div id="styleManagerModeTabs" class="style-manager-mode-tabs" role="tablist" aria-label="그림체 관리 종류">
+            <button class="active" type="button" data-style-manager-mode="generated" role="tab" aria-selected="true">제작 기록</button>
+            <button type="button" data-style-manager-mode="confirmed" role="tab" aria-selected="false">확정 그림체</button>
+            <button type="button" data-style-manager-mode="shared" role="tab" aria-selected="false">공유 그림체</button>
+          </div>
+          <label class="compact-check style-description-toggle"><input id="toggleStyleDescriptions" type="checkbox"> 설명 표시</label>
+        </header>
+        <aside id="styleManagerListPane" class="style-manager-list-pane">
+          <div class="style-pane-head style-manager-list-head">
+            <h2 id="styleManagerListTitle">제작 기록</h2>
+            <div class="style-manager-list-actions">
+              <button id="addConfirmedStyle" class="primary hidden" type="button">그림체 추가</button>
+              <button id="beginStyleSelection" type="button">여러 개 삭제</button>
+              <button id="deleteSelectedStyles" class="danger-button style-manager-delete-selected hidden" type="button" disabled>선택 삭제 (0)</button>
+              <button id="cancelStyleSelection" class="ghost hidden" type="button">취소</button>
+              <button id="refreshStyleManager" type="button">새로고침</button>
+            </div>
+          </div>
+          <section class="style-manager-filters" aria-label="그림체 목록 검색과 필터">
+            <label class="field"><span>목록 검색</span><input id="styleManagerSearch" type="search" placeholder="이름, 작가, 프롬프트, 모델"></label>
+            <label class="field"><span>구분</span><select id="styleManagerScopeFilter"></select></label>
+            <label id="styleManagerMetadataField" class="field hidden"><span>메타데이터</span><select id="styleManagerMetadataFilter"><option value="all">전체</option><option value="ok">추출 성공</option><option value="body_only">본문 추출</option><option value="no_metadata">없음</option><option value="error">오류</option></select></label>
+            <label id="styleManagerRecommendationField" class="field hidden"><span>최소 추천수</span><input id="styleManagerRecommendationMin" type="number" min="0" step="1" placeholder="전체"></label>
+            <label class="field"><span>정렬</span><select id="styleManagerSort"><option value="newest">최신순</option><option value="oldest">오래된순</option><option id="styleManagerRecommendSort" value="recommend">추천순</option></select></label>
+            <label class="field"><span>표시 개수</span><select id="styleManagerPageSize"><option value="12">12개</option><option value="24" selected>24개</option><option value="48">48개</option><option value="96">96개</option></select></label>
+            <label class="field"><span>그림 크기</span><select id="styleManagerCardSize"><option value="small">작게</option><option value="medium" selected>보통</option><option value="large">크게</option></select></label>
+          </section>
           <div id="styleManagerStatus" class="status"></div>
           <div id="styleManagerList" class="style-manager-list"></div>
+          <nav id="styleManagerPagination" class="style-manager-pagination" aria-label="그림체 관리 목록 페이지">
+            <button id="styleManagerPrevPage" type="button">이전</button>
+            <span id="styleManagerPageSummary">1 / 1 페이지</span>
+            <button id="styleManagerNextPage" type="button">다음</button>
+          </nav>
         </aside>
         <section id="styleManagerDetail" class="style-manager-detail">
           <div class="latest-result-placeholder">확인할 그림체를 선택하세요.</div>
+        </section>
+      </section>
+
+      <section id="comparison-tab" class="view comparison-view">
+        <header class="style-manager-toolbar"><div><h2 id="comparisonPageTitle">비교군 관리</h2><p>확정 그림체의 저장 설정으로 같은 조건을 비교합니다.</p></div><div class="style-manager-list-actions"><button id="backToComparisonList" class="ghost hidden" type="button">목록으로</button><button id="addComparison" class="primary" type="button">비교군 추가</button></div></header>
+        <div id="comparisonStatus" class="status"></div>
+        <section id="comparisonProgress" class="comparison-progress hidden" aria-live="polite">
+          <progress id="comparisonProgressBar" max="1" value="0"></progress>
+          <strong id="comparisonProgressText">생성 준비 중</strong>
+        </section>
+        <div id="comparisonGroups" class="comparison-groups"></div>
+        <section id="comparisonGallery" class="comparison-gallery-view hidden">
+          <section class="comparison-gallery-pane">
+            <div class="comparison-gallery-head">
+              <div><h3 id="comparisonGalleryTitle">비교군</h3><span id="comparisonGalleryCount">0개</span></div>
+              <div class="style-manager-list-actions"><button id="editComparisonSelection" type="button">선택 변경</button><button id="deleteOpenComparison" class="danger-button" type="button">비교군 삭제</button></div>
+            </div>
+            <div id="comparisonResultGallery" class="comparison-result-gallery"></div>
+          </section>
+          <aside id="comparisonResultDetail" class="comparison-result-detail"><div class="latest-result-placeholder">갤러리의 그림을 선택하세요.</div></aside>
+        </section>
+        <section id="comparisonEditor" class="comparison-editor hidden">
+          <aside class="comparison-picker-pane">
+            <div class="style-pane-head"><div><h3>확정 그림체 선택</h3><span id="comparisonSelectedSummary">0개 선택</span></div></div>
+            <label class="field"><span>목록 검색</span><input id="comparisonStyleSearch" type="search" placeholder="이름, 작가, 프롬프트, 모델"></label>
+            <div id="comparisonStylePicker" class="comparison-style-picker"></div>
+          </aside>
+          <aside id="comparisonDetailPanel" class="comparison-detail-pane">
+            <div class="comparison-column-head"><h3>선택 그림체 상세</h3><button id="toggleComparisonDetailColumn" class="ghost comparison-column-toggle" type="button" aria-expanded="true" title="상세정보 좌우 접기">◀</button></div>
+            <div id="comparisonDetailContent" class="comparison-column-content"><div id="comparisonStyleDetail" class="comparison-style-detail"><div class="latest-result-placeholder">갤러리의 그림을 클릭하면 상세정보를 표시합니다.</div></div></div>
+          </aside>
+          <aside id="comparisonSettingsPanel" class="comparison-settings-pane">
+            <div class="comparison-column-head"><h3>프롬프트·생성 설정</h3><button id="toggleComparisonSettingsColumn" class="ghost comparison-column-toggle" type="button" aria-expanded="true" title="설정 좌우 접기">▶</button></div>
+            <div id="comparisonSettingsContent" class="comparison-column-content">
+            <section class="comparison-settings-section"><h4>비교군 및 프롬프트</h4><div class="comparison-settings-body">
+              <label class="field"><span>비교군 이름</span><input id="comparisonName" value="새 비교군"></label>
+              <label class="field"><span>추가 고정 프롬프트</span><textarea id="comparisonFixedPrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+              <section class="comparison-character-prompts">
+                <div class="comparison-character-prompts-head">
+                  <span>캐릭터 프롬프트</span>
+                  <button id="addComparisonCharacterPrompt" class="secondary" type="button">+ 캐릭터 추가</button>
+                </div>
+                <div id="comparisonCharacterPromptList" class="comparison-character-prompt-list"></div>
+                <p id="comparisonCharacterPromptEmpty" class="field-hint">필요할 때만 캐릭터를 추가하세요. 캐릭터 프롬프트 없이도 생성할 수 있습니다.</p>
+              </section>
+            </div></section>
+            <section class="comparison-settings-section"><h4>생성 설정</h4><div class="comparison-settings-body">
+              <label class="field"><span>크기</span><select id="comparisonResolution"><option value="832x1216">832 × 1216</option><option value="1216x832">1216 × 832</option><option value="1024x1024">1024 × 1024</option><option value="custom">직접 입력</option></select></label>
+              <div id="comparisonCustomResolution" class="confirmed-style-parameter-grid"><label class="field"><span>너비</span><input id="comparisonWidth" type="number" min="64" step="64" value="832"></label><label class="field"><span>높이</span><input id="comparisonHeight" type="number" min="64" step="64" value="1216"></label></div>
+              <label class="field"><span>공통 시드</span><select id="comparisonSeedMode"><option value="none">미지정</option><option value="manual">직접 입력</option><option value="first">첫 번째 생성 그림 시드</option></select></label>
+              <label id="comparisonSeedField" class="field hidden"><span>시드</span><input id="comparisonSeed" type="number" min="1" max="4294967295"></label>
+            </div></section>
+            <section class="comparison-settings-section"><h4>저장 설정이 없을 때의 기본값</h4><div class="comparison-settings-body confirmed-style-parameter-grid"><label class="field"><span>샘플러</span><input id="comparisonDefaultSampler" value="k_euler_ancestral"></label><label class="field"><span>스케줄러</span><input id="comparisonDefaultSchedule" value="karras"></label><label class="field"><span>Steps</span><input id="comparisonDefaultSteps" type="number" value="28"></label><label class="field"><span>CFG Scale</span><input id="comparisonDefaultScale" type="number" step="0.01" value="5"></label><label class="field"><span>CFG Rescale</span><input id="comparisonDefaultRescale" type="number" step="0.01" value="0"></label><label class="field"><span>Variety+</span><select id="comparisonDefaultVariety"><option value="0">꺼짐</option><option value="1">켜짐</option></select></label><label class="field"><span>모델</span><select id="comparisonDefaultModel"><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option><option value="nai-diffusion-4-full">V4 Full</option><option value="nai-diffusion-3">V3</option></select></label></div></section>
+            <div id="comparisonModalStatus" class="status"></div><button id="createComparison" class="primary" type="button">선택한 그림체 생성</button>
+            </div>
+          </aside>
         </section>
       </section>
       <section id="arca-style-collector-tab" class="view arca-style-collector-view">
@@ -676,6 +792,30 @@
       </section>
     </div>
 
+    <div id="ratingTagRulesModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="ratingTagRulesTitle">
+      <div class="modal-backdrop" data-close-rating-tag-rules></div>
+      <section class="modal-dialog rating-tag-rules-dialog">
+        <div class="modal-head">
+          <div><h2 id="ratingTagRulesTitle">평가 작가 태그별 인원</h2><p>평가 관리에서 해당 태그로 평가한 작가를 지정한 인원만큼 선택합니다.</p></div>
+          <button id="closeRatingTagRules" class="ghost" type="button">닫기</button>
+        </div>
+        <div id="ratingTagRulesCountSummary" class="rating-tag-count-summary"></div>
+        <div id="ratingTagRulesList" class="rating-tag-rules-list"></div>
+        <button id="addRatingTagRule" type="button">+ 태그 조건 추가</button>
+        <div class="rating-tag-exclusion-head">
+          <strong>수집 태그로 작가 제외</strong>
+          <span class="help-text">아래 태그로 평가·수집한 작가는 태그 지정 자리와 남은 전체 평가 작가 자리에서 모두 제외합니다.</span>
+        </div>
+        <div id="ratingTagExclusionsList" class="rating-tag-rules-list rating-tag-exclusions-list"></div>
+        <button id="addRatingTagExclusion" type="button">+ 제외 태그 추가</button>
+        <div id="ratingTagRulesStatus" class="status" role="status"></div>
+        <div class="modal-actions">
+          <button id="cancelRatingTagRules" class="ghost" type="button">취소</button>
+          <button id="saveRatingTagRules" class="primary" type="button">적용</button>
+        </div>
+      </section>
+    </div>
+
     <div id="weightGraphModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="weightGraphTitle">
       <div class="modal-backdrop" data-close-weight-graph></div>
       <section class="modal-dialog weight-graph-dialog">
@@ -721,6 +861,80 @@
             </div>
           </div>
           <button id="manualPreviewNext" class="arrow" aria-label="다음 이미지">›</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="confirmedStyleModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirmedStyleModalTitle">
+      <div class="modal-backdrop" data-close-confirmed-style></div>
+      <section class="modal-dialog confirmed-style-dialog">
+        <div class="modal-head">
+          <div><h2 id="confirmedStyleModalTitle">확정 그림체 추가</h2><p id="confirmedStyleModalSubtitle">이미지와 정보를 확인한 뒤 저장하세요.</p></div>
+          <button id="closeConfirmedStyleModal" class="ghost" type="button">닫기</button>
+        </div>
+        <div class="confirmed-style-editor">
+          <section class="confirmed-style-image-column">
+            <div id="confirmedStyleDropZone" class="confirmed-style-drop-zone" tabindex="0">
+              <img id="confirmedStylePreview" class="hidden" alt="확정 그림체 미리보기">
+              <span id="confirmedStyleDropHint">이미지를 드래그하거나 붙여넣으세요.</span>
+            </div>
+            <input id="confirmedStyleFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp">
+            <button id="chooseConfirmedStyleImage" type="button">이미지 선택</button>
+            <div id="confirmedStyleMetadataStatus" class="status"></div>
+          </section>
+          <section class="confirmed-style-fields">
+            <div class="confirmed-style-basic-grid">
+              <label class="field"><span>그림체 이름</span><input id="confirmedStyleName" type="text" maxlength="16384"></label>
+              <label class="field"><span>설명</span><textarea id="confirmedStyleDescription"></textarea></label>
+            </div>
+            <label class="field"><span>작가 프롬프트</span><textarea id="confirmedStyleArtistPrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+            <label class="field"><span>퀄리티 프롬프트</span><textarea id="confirmedStyleQualityPrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+            <div id="confirmedStyleExcludedSection" class="excluded-prompt-tags hidden"><span>제외된 퀄리티 태그 · 누르면 복구</span><div id="confirmedStyleExcludedTags" class="excluded-prompt-tag-list"></div></div>
+            <label class="field"><span>고정 프롬프트</span><textarea id="confirmedStyleFixedPrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+            <label class="field"><span>네거티브 프롬프트</span><textarea id="confirmedStyleNegativePrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+            <div class="confirmed-style-parameter-grid">
+              <label class="field"><span>샘플러</span><input id="confirmedStyleSampler" type="text"></label>
+              <label class="field"><span>스케줄러</span><input id="confirmedStyleScheduler" type="text"></label>
+              <label class="field"><span>Steps</span><input id="confirmedStyleSteps" type="number" min="1"></label>
+              <label class="field"><span>CFG Scale</span><input id="confirmedStyleScale" type="number" min="0" step="0.01"></label>
+              <label class="field"><span>CFG Rescale</span><input id="confirmedStyleCfgRescale" type="number" min="0" step="0.01"></label>
+              <label class="field"><span>Variety+</span><select id="confirmedStyleVariety"><option value="unknown">알 수 없음</option><option value="1">켜짐</option><option value="0">꺼짐</option></select></label>
+              <label class="field"><span>모델</span><select id="confirmedStyleModel">
+                <option value="">알 수 없음 / 직접 확인</option>
+                <option value="NovelAI Diffusion V4.5 Full">NovelAI Diffusion V4.5 Full</option>
+                <option value="NovelAI Diffusion V4.5 Curated">NovelAI Diffusion V4.5 Curated</option>
+                <option value="NovelAI Diffusion V4 Full">NovelAI Diffusion V4 Full</option>
+                <option value="NovelAI Diffusion V3">NovelAI Diffusion V3</option>
+              </select></label>
+            </div>
+          </section>
+        </div>
+        <div id="confirmedStyleModalStatus" class="status"></div>
+        <div class="modal-actions">
+          <button id="cancelConfirmedStyle" class="ghost" type="button">취소</button>
+          <button id="saveConfirmedStyle" class="primary" type="button">확정 그림체 저장</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="appDialog" class="modal app-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle" aria-describedby="appDialogMessage">
+      <div class="modal-backdrop" data-app-dialog-cancel></div>
+      <section class="modal-dialog app-dialog-panel">
+        <div class="app-dialog-heading">
+          <span id="appDialogIcon" class="app-dialog-icon" aria-hidden="true">!</span>
+          <div>
+            <h2 id="appDialogTitle">확인</h2>
+            <p id="appDialogMessage"></p>
+          </div>
+        </div>
+        <ul id="appDialogDetails" class="app-dialog-details hidden"></ul>
+        <label id="appDialogInputField" class="field app-dialog-input hidden">
+          <span id="appDialogInputLabel">입력</span>
+          <input id="appDialogInput" type="text" autocomplete="off">
+        </label>
+        <div class="modal-actions app-dialog-actions">
+          <button id="appDialogCancel" class="ghost" type="button">취소</button>
+          <button id="appDialogConfirm" class="primary" type="button">확인</button>
         </div>
       </section>
     </div>

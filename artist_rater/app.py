@@ -30,6 +30,7 @@ from arca_style_collector import (
     get_image_restore_estimate,
     get_arca_browser_session_status,
     get_arca_style_detail,
+    get_arca_image_gallery_page,
     get_arca_style_page,
     get_arca_style_statistics,
     get_arca_tag_statistics,
@@ -50,7 +51,9 @@ from arca_style_collector import (
     start_url_collection_job,
     resume_collection_job,
     stop_collection_job,
+    split_artist_quality_prompt,
     update_arca_style,
+    extract_novelai_metadata,
 )
 from arca_image_archive import (
     ARCHIVE_BYTES,
@@ -77,12 +80,36 @@ from style_store import (
     delete_app_key,
     delete_style,
     get_style_detail,
+    list_generated_images,
     list_styles,
     load_app_key,
     release_generation_request,
     reserve_generation_request,
     save_app_key,
     save_generated_result,
+    delete_generated_image_batch,
+)
+from confirmed_style_store import (
+    MAX_IMAGE_BYTES as MAX_CONFIRMED_IMAGE_BYTES,
+    create_confirmed_style,
+    delete_confirmed_style,
+    get_confirmed_style,
+    init_confirmed_style_tables,
+    inspect_image,
+    list_confirmed_styles,
+    update_confirmed_style,
+)
+from comparison_store import (
+    create_group,
+    delete_group,
+    delete_result,
+    get_group,
+    init_comparison_tables,
+    list_groups,
+    remove_group_results,
+    save_result,
+    set_group_seed,
+    update_group_style_ids,
 )
 
 from style_logic import (
@@ -115,6 +142,8 @@ RESOURCE_DIR, DATA_DIR = resolve_runtime_paths(
 BASE_DIR = RESOURCE_DIR
 THUMBNAIL_DIR = DATA_DIR / "thumbnails"
 GENERATED_DIR = DATA_DIR / "generated"
+CONFIRMED_STYLE_IMAGE_DIR = DATA_DIR / "confirmed_style_images"
+COMPARISON_IMAGE_DIR = DATA_DIR / "comparison_images"
 ARCA_STYLE_IMAGE_DIR = DATA_DIR / "arca_style_images"
 ARCA_STYLE_SEED_PATH = RESOURCE_DIR / "arca_style_seed.sqlite"
 SETTINGS_JSON_PATH = DATA_DIR / "settings.json"
@@ -252,10 +281,23 @@ def init_db():
         image_columns = {row[1] for row in conn.execute("PRAGMA table_info(generated_images)")}
         if "noise_schedule" not in image_columns:
             conn.execute("ALTER TABLE generated_images ADD COLUMN noise_schedule TEXT NOT NULL DEFAULT 'native'")
+        generated_migrations = {
+            "quality_prompt": "TEXT NOT NULL DEFAULT ''",
+            "original_quality_prompt": "TEXT NOT NULL DEFAULT ''",
+            "excluded_quality_tags_json": "TEXT NOT NULL DEFAULT '[]'",
+            "fixed_prompt": "TEXT NOT NULL DEFAULT ''",
+            "variety_plus": "INTEGER",
+            "skip_cfg_above_sigma": "REAL",
+        }
+        for column, declaration in generated_migrations.items():
+            if column not in image_columns:
+                conn.execute(f"ALTER TABLE generated_images ADD COLUMN {column} {declaration}")
 
     from style_store import reconcile_generated_storage
 
     reconcile_generated_storage(DB_PATH, GENERATED_DIR)
+    init_confirmed_style_tables(DB_PATH)
+    init_comparison_tables(DB_PATH)
     init_arca_style_tables(DB_PATH)
     import_arca_style_seed(DB_PATH, ARCA_STYLE_SEED_PATH)
     revalidate_stored_metadata(DB_PATH)
@@ -431,6 +473,70 @@ def get_rated_artist_set():
     with db() as conn:
         rows = conn.execute("SELECT artist_tag FROM ratings").fetchall()
     return {row["artist_tag"] for row in rows}
+
+
+def normalize_rating_tag_filter(value):
+    if not isinstance(value, str):
+        raise ValueError("평가 작가 태그 필터는 문자열이어야 합니다.")
+    return re.sub(r"\s+", "_", value.strip()).casefold()
+
+
+def normalize_rating_tag_rules(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError("평가 작가 태그별 인원은 최대 20개의 배열이어야 합니다.")
+    normalized = []
+    seen = set()
+    for rule in value:
+        if not isinstance(rule, dict):
+            raise ValueError("평가 작가 태그별 인원 형식을 확인하세요.")
+        tag = normalize_rating_tag_filter(rule.get("tag", ""))
+        count = rule.get("count")
+        if not tag:
+            raise ValueError("평가 작가 태그를 입력하세요.")
+        if type(count) is not int or count < 1 or count > 50:
+            raise ValueError("평가 작가 태그별 인원은 1명부터 50명 사이의 정수여야 합니다.")
+        if tag in seen:
+            raise ValueError(f"같은 평가 작가 태그를 두 번 지정할 수 없습니다: {tag}")
+        seen.add(tag)
+        normalized.append({"tag": tag, "count": count})
+    return normalized
+
+
+def normalize_rating_exclude_tags(value):
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 20:
+        raise ValueError("평가 작가 제외 태그는 최대 20개의 배열이어야 합니다.")
+    normalized = []
+    seen = set()
+    for item in value:
+        tag = normalize_rating_tag_filter(item)
+        if not tag:
+            raise ValueError("제외할 평가 작가 태그를 입력하세요.")
+        if tag in seen:
+            raise ValueError(f"같은 제외 태그를 두 번 지정할 수 없습니다: {tag}")
+        seen.add(tag)
+        normalized.append(tag)
+    return normalized
+
+
+def rating_matches_tag_filter(row, tag_filter):
+    if not tag_filter:
+        return True
+    try:
+        query_tags = json.loads(row["query_tags_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        query_tags = []
+    if not isinstance(query_tags, list):
+        query_tags = []
+    if not query_tags:
+        query_tags = normalize_query_text(row["query_text"] or "")
+    return any(
+        re.sub(r"\s+", "_", str(tag).strip()).casefold() == tag_filter
+        for tag in query_tags
+    )
 
 
 def safe_filename(value):
@@ -878,6 +984,9 @@ def api_style_maker_artists():
             raise ValueError("공유 그림체 작가 인원은 0부터 50 사이의 정수여야 합니다.")
         if shared_artist_min > shared_artist_max:
             raise ValueError("공유 그림체 작가 최소 인원은 최대 인원보다 클 수 없습니다.")
+        rating_tag_rules = normalize_rating_tag_rules(payload.get("rating_tag_rules"))
+        rating_exclude_tags = normalize_rating_exclude_tags(payload.get("rating_exclude_tags"))
+        rating_tag_filter = normalize_rating_tag_filter(payload.get("rating_tag_filter", ""))
         if "ranges" in payload and not isinstance(payload["ranges"], list):
             raise ValueError("가중치 구간은 JSON 배열이어야 합니다.")
         ranges = payload.get("ranges", [])
@@ -893,6 +1002,25 @@ def api_style_maker_artists():
                 supplied,
                 require_weights=reroll == "artists",
             )
+        fixed_payload = payload.get("fixed_artists", [])
+        if not isinstance(fixed_payload, list):
+            raise ValueError("고정 작가 목록 형식을 확인하세요.")
+        fixed_artists = (
+            validate_supplied_style_artists(fixed_payload, require_weights=True)
+            if fixed_payload else []
+        )
+        fixed_slots = []
+        for item in fixed_payload:
+            slot = item.get("slot")
+            if slot is None:
+                continue
+            if type(slot) is not int or slot < 1:
+                raise ValueError("고정 작가 자리는 1 이상의 정수여야 합니다.")
+            fixed_slots.append(slot)
+        fixed_names = {
+            item["artist"].replace("_", " ").casefold()
+            for item in fixed_artists
+        }
 
         if reroll == "weights":
             artists = current_artists
@@ -902,19 +1030,65 @@ def api_style_maker_artists():
                 raise ValueError("선택할 평점을 하나 이상 지정하세요.")
             scores = [exact_score(score) for score in scores]
             with closing(db()) as conn:
-                rows = conn.execute("SELECT artist_tag, score FROM ratings").fetchall()
+                rows = conn.execute(
+                    "SELECT artist_tag, score, query_text, query_tags_json FROM ratings"
+                ).fetchall()
+            rated_rows = [
+                row for row in rows
+                if rating_tag_rules or rating_matches_tag_filter(row, rating_tag_filter)
+            ]
+            if rating_exclude_tags:
+                rated_rows = [
+                    row for row in rated_rows
+                    if not any(
+                        rating_matches_tag_filter(row, excluded_tag)
+                        for excluded_tag in rating_exclude_tags
+                    )
+                ]
+            excluded_rated_names = set(fixed_names)
+            if reroll == "artists":
+                excluded_rated_names.update(
+                    item["artist"].replace("_", " ").casefold()
+                    for item in current_artists
+                )
+            rated_rows = [
+                row for row in rated_rows
+                if row["artist_tag"].replace("_", " ").casefold()
+                not in excluded_rated_names
+            ]
             pool = [
                 {"artist": row["artist_tag"], "score": row["score"]}
-                for row in rows
+                for row in rated_rows
             ]
-            if reroll == "artists":
-                current_names = {item["artist"] for item in current_artists}
-                pool = [item for item in pool if item["artist"] not in current_names]
-            target_count = len(current_artists) if reroll == "artists" else payload.get("count", 12)
+            target_count = payload.get("count", len(current_artists) if reroll == "artists" else 12)
             target_count = int(target_count)
+            if target_count < 1:
+                raise ValueError("작가 수는 1명 이상이어야 합니다.")
+            if len(fixed_artists) > target_count:
+                raise ValueError("고정 작가 수는 전체 작가 수보다 많을 수 없습니다.")
+            if any(slot > target_count for slot in fixed_slots):
+                raise ValueError("고정 작가 자리는 전체 작가 수를 넘을 수 없습니다.")
+            random_target_count = target_count - len(fixed_artists)
+            tagged_target_count = sum(rule["count"] for rule in rating_tag_rules)
+            if tagged_target_count + shared_artist_min > random_target_count:
+                raise ValueError(
+                    "태그 지정 인원과 공유 작가 최소 인원의 합이 고정 작가를 제외한 남은 자리보다 많습니다."
+                )
+            occupied_slots = {slot - 1 for slot in fixed_slots}
+            open_slots = [
+                index for index in range(target_count)
+                if index not in occupied_slots
+            ][:random_target_count]
+            profile_positions = [
+                slot / max(1, target_count - 1)
+                for slot in open_slots
+            ]
             rng = random.Random(rng_seed)
             shared_pool = get_shared_style_artist_pool(DB_PATH) if shared_artist_max else []
-            current_names = {item["artist"].replace("_", " ").casefold() for item in (current_artists or [])}
+            current_names = {
+                item["artist"].replace("_", " ").casefold()
+                for item in (current_artists or [])
+            } | fixed_names
             shared_pool = [
                 item for item in shared_pool
                 if item["artist"].replace("_", " ").casefold() not in current_names
@@ -924,7 +1098,11 @@ def api_style_maker_artists():
                 normalized_name = item["artist"].replace("_", " ").casefold()
                 unique_shared_pool.setdefault(normalized_name, item)
             shared_pool = list(unique_shared_pool.values())
-            shared_limit = min(shared_artist_max, target_count, len(shared_pool))
+            shared_limit = min(
+                shared_artist_max,
+                random_target_count - tagged_target_count,
+                len(shared_pool),
+            )
             if shared_artist_min > shared_limit:
                 raise ValueError("공유 그림체에서 선택 가능한 작가가 최소 인원보다 적습니다.")
             shared_count = rng.randint(shared_artist_min, shared_limit) if shared_limit else 0
@@ -943,7 +1121,7 @@ def api_style_maker_artists():
                     if item["score"] in scores
                     and item["artist"].replace("_", " ").casefold() not in selected_names
                 ]
-                if len(rated_available) >= target_count - len(selected_shared):
+                if len(rated_available) >= random_target_count - len(selected_shared):
                     break
                 remaining_shared = [
                     item for item in shared_pool
@@ -961,21 +1139,83 @@ def api_style_maker_artists():
                 for item in selected_shared
             ]
             shared_names = {item["artist"].replace("_", " ").casefold() for item in shared_artists}
-            pool = [item for item in pool if item["artist"].replace("_", " ").casefold() not in shared_names]
-            rated_artists = select_artists(
-                pool,
-                target_count - len(shared_artists),
+            available_rows = [
+                row for row in rated_rows
+                if row["artist_tag"].replace("_", " ").casefold() not in shared_names
+                and row["score"] in scores
+            ]
+            tagged_artists = []
+            selected_rated_names = set()
+            rule_pools = []
+            for rule in rating_tag_rules:
+                candidates = [
+                    row for row in available_rows
+                    if rating_matches_tag_filter(row, rule["tag"])
+                ]
+                rule_pools.append((len(candidates), rule, candidates))
+            for _, rule, candidates in sorted(rule_pools, key=lambda item: item[0]):
+                candidate_pool = [
+                    {"artist": row["artist_tag"], "score": row["score"]}
+                    for row in candidates
+                    if row["artist_tag"].replace("_", " ").casefold()
+                    not in selected_rated_names
+                ]
+                if len(candidate_pool) < rule["count"]:
+                    raise ValueError(
+                        f"'{rule['tag']}' 태그에서 선택 가능한 평가 작가가 {rule['count']}명보다 적습니다."
+                    )
+                selected = select_artists(
+                    candidate_pool,
+                    rule["count"],
+                    scores,
+                    rng_seed=rng.randrange(0, 2**32),
+                )
+                tagged_artists.extend(selected)
+                selected_rated_names.update(
+                    item["artist"].replace("_", " ").casefold()
+                    for item in selected
+                )
+            unrestricted_count = (
+                random_target_count - len(shared_artists) - len(tagged_artists)
+            )
+            unrestricted_pool = [
+                {"artist": row["artist_tag"], "score": row["score"]}
+                for row in available_rows
+                if row["artist_tag"].replace("_", " ").casefold()
+                not in selected_rated_names
+            ]
+            unrestricted_artists = select_artists(
+                unrestricted_pool,
+                unrestricted_count,
                 scores,
-                rng_seed=rng_seed,
-            ) if target_count > len(shared_artists) else []
-            artists = rated_artists + shared_artists
+                rng_seed=rng.randrange(0, 2**32),
+            ) if unrestricted_count else []
+            artists = tagged_artists + unrestricted_artists + shared_artists
             rng.shuffle(artists)
 
         if reroll == "artists":
-            weighted = [
-                item | {"weight": current_artists[index]["weight"]}
-                for index, item in enumerate(artists)
+            current_random_artists = [
+                item for item in current_artists
+                if item["artist"].replace("_", " ").casefold() not in fixed_names
             ]
+            if len(current_random_artists) == len(artists):
+                weighted = [
+                    item | {"weight": current_random_artists[index]["weight"]}
+                    for index, item in enumerate(artists)
+                ]
+            else:
+                weighted = assign_weights(
+                    artists,
+                    payload.get("weight_mode", "balanced"),
+                    payload.get("min_weight", 0.1),
+                    payload.get("max_weight", 2.3),
+                    prefer_high_scores,
+                    ranges,
+                    rng_seed=rng_seed,
+                    profile=payload.get("weight_profile"),
+                    positions=profile_positions,
+                )
+            weighted.extend(fixed_artists)
         else:
             weighted = assign_weights(
                 artists,
@@ -986,7 +1226,10 @@ def api_style_maker_artists():
                 ranges,
                 rng_seed=rng_seed,
                 profile=payload.get("weight_profile"),
+                positions=profile_positions if reroll != "weights" else None,
             )
+            if reroll != "weights":
+                weighted.extend(fixed_artists)
             if reroll != "weights" and payload.get("weight_mode") != "profile":
                 weighted.sort(key=lambda item: item["weight"])
         artist_prompt = build_artist_prompt(weighted)
@@ -1153,6 +1396,10 @@ def _generation_payload_hash(data):
     canonical = {
         "artists": data["artists"],
         "base_prompt": data["base_prompt"],
+        "quality_prompt": data["quality_prompt"],
+        "original_quality_prompt": data["original_quality_prompt"],
+        "excluded_quality_tags": data["excluded_quality_tags"],
+        "fixed_prompt": data["fixed_prompt"],
         "negative_prompt": data["negative_prompt"],
         "character_prompts": data["character_prompts"],
         "width": data["width"],
@@ -1162,6 +1409,8 @@ def _generation_payload_hash(data):
         "steps": data["steps"],
         "scale": data["scale"],
         "cfg_rescale": data["cfg_rescale"],
+        "variety_plus": data["variety_plus"],
+        "skip_cfg_above_sigma": data["skip_cfg_above_sigma"],
         "seed": data["seed"] if data["seed_provided"] else None,
         "model": MODEL,
     }
@@ -1216,6 +1465,10 @@ def api_style_maker_generate():
             artists=data["artists"],
             png_bytes=png_bytes,
             base_prompt=data["base_prompt"],
+            quality_prompt=data["quality_prompt"],
+            original_quality_prompt=data["original_quality_prompt"],
+            excluded_quality_tags=data["excluded_quality_tags"],
+            fixed_prompt=data["fixed_prompt"],
             negative_prompt=data["negative_prompt"],
             character_prompts=data["character_prompts"],
             combined_prompt=combined_prompt,
@@ -1227,6 +1480,8 @@ def api_style_maker_generate():
             steps=data["steps"],
             scale=data["scale"],
             cfg_rescale=data["cfg_rescale"],
+            variety_plus=data["variety_plus"],
+            skip_cfg_above_sigma=data["skip_cfg_above_sigma"],
             model=MODEL,
         )
         result["seed"] = actual_seed
@@ -1254,6 +1509,31 @@ def _add_generated_urls(item):
 @app.route("/api/art-styles", methods=["GET"])
 def api_art_styles():
     return json_response([_add_generated_urls(item) for item in list_styles(DB_PATH)])
+
+
+@app.route("/api/art-styles/delete-batch", methods=["POST"])
+def api_delete_art_styles_batch():
+    payload = request.get_json(silent=True)
+    style_ids = payload.get("style_ids") if isinstance(payload, dict) else None
+    if (
+        not isinstance(style_ids, list)
+        or not style_ids
+        or len(style_ids) > 500
+        or any(type(style_id) is not int or style_id < 1 for style_id in style_ids)
+    ):
+        return json_response(
+            {"error": "style_ids must be a nonempty list of up to 500 positive integers."},
+            400,
+        )
+    unique_ids = list(dict.fromkeys(style_ids))
+    deleted_ids = []
+    missing_ids = []
+    for style_id in unique_ids:
+        if delete_style(DB_PATH, GENERATED_DIR, style_id) is None:
+            missing_ids.append(style_id)
+        else:
+            deleted_ids.append(style_id)
+    return json_response({"deleted_ids": deleted_ids, "missing_ids": missing_ids})
 
 
 @app.route("/api/art-styles/<int:style_id>", methods=["GET", "DELETE"])
@@ -1291,6 +1571,435 @@ def _add_arca_urls(item):
         for image in group.get("images", []):
             add_image_url(image)
     return item
+
+
+def _add_confirmed_url(item):
+    if item and item.get("image_path"):
+        item["image_url"] = f'/confirmed-style-images/{item["image_path"]}'
+    return item
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _confirmed_metadata_from_bytes(image_bytes, content_type=""):
+    image_info = inspect_image(image_bytes)
+    metadata = extract_novelai_metadata(image_bytes, content_type)
+    artist_prompt, quality_prompt = split_artist_quality_prompt(metadata.get("base_prompt") or "")
+    raw_metadata = _json_object(metadata.get("raw_metadata_json"))
+    return {
+        "metadata_status": metadata.get("metadata_status") or "no_metadata",
+        "artist_prompt": artist_prompt,
+        "quality_prompt": quality_prompt,
+        "original_quality_prompt": quality_prompt,
+        "excluded_quality_tags": [],
+        "fixed_prompt": "",
+        "negative_prompt": metadata.get("negative_prompt") or "",
+        "sampler": metadata.get("sampler") or "",
+        "noise_schedule": metadata.get("noise_schedule") or "",
+        "steps": metadata.get("steps"),
+        "scale": metadata.get("scale"),
+        "cfg_rescale": metadata.get("cfg_rescale"),
+        "variety_plus": metadata.get("variety_plus"),
+        "skip_cfg_above_sigma": metadata.get("skip_cfg_above_sigma"),
+        "model": metadata.get("model") or "",
+        "width": metadata.get("width") or image_info["width"],
+        "height": metadata.get("height") or image_info["height"],
+        "seed": metadata.get("seed") or None,
+        "raw_metadata": raw_metadata,
+    }
+
+
+def _safe_source_image(root, relative_path):
+    path = Path(str(relative_path or "").replace("\\", "/"))
+    resolved_root = Path(root).resolve()
+    target = (resolved_root / path).resolve()
+    if not relative_path or resolved_root not in target.parents or not target.is_file():
+        raise ValueError("원본 이미지가 로컬에 저장되어 있지 않습니다.")
+    return target.read_bytes()
+
+
+def _confirmed_source(source_type, source_id):
+    connection = db()
+    try:
+        if source_type == "generated":
+            row = connection.execute("SELECT * FROM generated_images WHERE id=?", (source_id,)).fetchone()
+            if row is None:
+                raise ValueError("제작 기록 이미지를 찾을 수 없습니다.")
+            item = dict(row)
+            image_bytes = _safe_source_image(GENERATED_DIR, item.get("image_path"))
+            try:
+                excluded = json.loads(item.get("excluded_quality_tags_json") or "[]")
+            except json.JSONDecodeError:
+                excluded = []
+            quality = item.get("quality_prompt") or item.get("base_prompt") or ""
+            payload = {
+                "name": f"제작 그림체 #{source_id}",
+                "description": "",
+                "artist_prompt": item.get("artist_prompt") or "",
+                "quality_prompt": quality,
+                "original_quality_prompt": item.get("original_quality_prompt") or quality,
+                "excluded_quality_tags": excluded,
+                "fixed_prompt": item.get("fixed_prompt") or "",
+                "negative_prompt": item.get("negative_prompt") or "",
+                "sampler": item.get("sampler") or "",
+                "noise_schedule": item.get("noise_schedule") or "",
+                "steps": item.get("steps"),
+                "scale": item.get("scale"),
+                "cfg_rescale": item.get("cfg_rescale"),
+                "variety_plus": bool(item["variety_plus"]) if item.get("variety_plus") is not None else None,
+                "skip_cfg_above_sigma": item.get("skip_cfg_above_sigma"),
+                "model": item.get("model") or "",
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "seed": item.get("seed"),
+                "raw_metadata": {},
+                "source_type": "generated",
+                "source_id": source_id,
+                "source_url": "",
+            }
+            return image_bytes, payload
+        if source_type == "shared":
+            row = connection.execute(
+                """
+                SELECT image.*,item.title,item.source_url
+                FROM arca_style_images image
+                JOIN arca_style_items item ON item.id=image.item_id
+                WHERE image.id=?
+                """,
+                (source_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("공유 그림체 이미지를 찾을 수 없습니다.")
+            item = dict(row)
+            image_bytes = _safe_source_image(ARCA_STYLE_IMAGE_DIR, item.get("image_path"))
+            image_metadata = extract_novelai_metadata(image_bytes, item.get("content_type") or "")
+            prompt = item.get("base_prompt") or item.get("prompt") or ""
+            artist_prompt, quality_prompt = split_artist_quality_prompt(prompt)
+            raw_metadata = _json_object(item.get("raw_metadata_json"))
+            skip_present = "skip_cfg_above_sigma" in raw_metadata
+            skip_cfg = raw_metadata.get("skip_cfg_above_sigma") if skip_present else None
+            payload = {
+                "name": item.get("title") or f"공유 그림체 #{source_id}",
+                "description": "",
+                "artist_prompt": artist_prompt,
+                "quality_prompt": quality_prompt,
+                "original_quality_prompt": quality_prompt,
+                "excluded_quality_tags": [],
+                "fixed_prompt": "",
+                "negative_prompt": item.get("negative_prompt") or "",
+                "sampler": item.get("sampler") or "",
+                "noise_schedule": item.get("noise_schedule") or "",
+                "steps": item.get("steps"),
+                "scale": item.get("scale"),
+                "cfg_rescale": item.get("cfg_rescale"),
+                "variety_plus": bool(skip_cfg) if skip_present else None,
+                "skip_cfg_above_sigma": skip_cfg,
+                "model": item.get("model") or image_metadata.get("model") or "",
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "seed": item.get("seed") or None,
+                "raw_metadata": raw_metadata,
+                "source_type": "shared",
+                "source_id": source_id,
+                "source_url": item.get("source_url") or "",
+            }
+            return image_bytes, payload
+    finally:
+        connection.close()
+    raise ValueError("확정 그림체 원본 종류를 확인해 주세요.")
+
+
+@app.route("/api/style-manager/generated", methods=["GET"])
+def api_style_manager_generated():
+    return json_response([_add_generated_urls(item) for item in list_generated_images(DB_PATH)])
+
+
+@app.route("/api/style-manager/generated/delete-batch", methods=["POST"])
+def api_delete_generated_images_batch():
+    payload = request.get_json(silent=True)
+    image_ids = payload.get("image_ids") if isinstance(payload, dict) else None
+    if not isinstance(image_ids, list) or not image_ids or len(image_ids) > 500 or any(type(value) is not int or value < 1 for value in image_ids):
+        return json_response({"error": "image_ids must contain up to 500 positive integers."}, 400)
+    deleted_ids = delete_generated_image_batch(DB_PATH, GENERATED_DIR, image_ids)
+    return json_response({"deleted_ids": deleted_ids})
+
+
+@app.route("/api/style-manager/shared", methods=["GET"])
+def api_style_manager_shared():
+    try:
+        result = get_arca_image_gallery_page(
+            DB_PATH,
+            request.args.get("offset", 0),
+            request.args.get("limit", 60),
+            ARCA_STYLE_IMAGE_DIR,
+            {
+                "q": request.args.get("q", ""),
+                "tab": request.args.get("tab", "all"),
+                "metadata": request.args.get("metadata", "all"),
+                "recommendation_min": request.args.get("recommendation_min", ""),
+                "sort": request.args.get("sort", "posted_desc"),
+            },
+        )
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
+    for item in result["items"]:
+        local_path = item.get("image_path") or ""
+        item["image_url"] = f"/arca-style-images/{local_path}" if local_path else item.get("remote_image_url") or ""
+        item["image_available"] = bool(item["image_url"])
+        if local_path and not item.get("model"):
+            try:
+                image_metadata = extract_novelai_metadata(
+                    _safe_source_image(ARCA_STYLE_IMAGE_DIR, local_path),
+                    item.get("content_type") or "",
+                )
+                item["model"] = image_metadata.get("model") or ""
+            except ValueError:
+                pass
+    return json_response(result)
+
+
+@app.route("/api/confirmed-styles/extract", methods=["POST"])
+def api_extract_confirmed_style():
+    uploaded = request.files.get("image")
+    if uploaded is None:
+        return json_response({"error": "이미지 파일을 선택해 주세요."}, 400)
+    image_bytes = uploaded.stream.read(MAX_CONFIRMED_IMAGE_BYTES + 1)
+    try:
+        result = _confirmed_metadata_from_bytes(image_bytes, uploaded.mimetype or "")
+    except ValueError as exc:
+        return json_response({"error": str(exc)}, 400)
+    return json_response(result)
+
+
+@app.route("/api/confirmed-styles", methods=["GET", "POST"])
+def api_confirmed_styles():
+    if request.method == "GET":
+        return json_response([_add_confirmed_url(item) for item in list_confirmed_styles(DB_PATH)])
+    try:
+        if request.mimetype and request.mimetype.startswith("multipart/form-data"):
+            uploaded = request.files.get("image")
+            if uploaded is None:
+                raise ValueError("이미지 파일을 선택해 주세요.")
+            image_bytes = uploaded.stream.read(MAX_CONFIRMED_IMAGE_BYTES + 1)
+            supplied = json.loads(request.form.get("data") or "{}")
+            if not isinstance(supplied, dict):
+                raise ValueError("그림체 입력값을 확인해 주세요.")
+            extracted = _confirmed_metadata_from_bytes(image_bytes, uploaded.mimetype or "")
+            payload = {**extracted, **supplied, "source_type": "manual", "source_id": None}
+        else:
+            supplied = request.get_json(silent=True)
+            if not isinstance(supplied, dict):
+                raise ValueError("그림체 입력값을 확인해 주세요.")
+            source_type = supplied.get("source_type")
+            source_id = supplied.get("source_id")
+            if source_type not in {"generated", "shared"} or type(source_id) is not int:
+                raise ValueError("확정할 원본 그림체를 확인해 주세요.")
+            image_bytes, defaults = _confirmed_source(source_type, source_id)
+            payload = {**defaults, **supplied, "source_type": source_type, "source_id": source_id}
+            if not str(supplied.get("model") or "").strip():
+                payload["model"] = defaults.get("model") or ""
+        created = create_confirmed_style(DB_PATH, CONFIRMED_STYLE_IMAGE_DIR, image_bytes, payload)
+        return json_response(_add_confirmed_url(created), 201)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return json_response({"error": str(exc)}, 400)
+    except (OSError, sqlite3.Error):
+        return json_response({"error": "확정 그림체를 저장하지 못했습니다."}, 500)
+
+
+@app.route("/api/confirmed-styles/delete-batch", methods=["POST"])
+def api_delete_confirmed_styles_batch():
+    payload = request.get_json(silent=True)
+    style_ids = payload.get("style_ids") if isinstance(payload, dict) else None
+    if not isinstance(style_ids, list) or not style_ids or len(style_ids) > 500 or any(type(value) is not int or value < 1 for value in style_ids):
+        return json_response({"error": "style_ids must contain up to 500 positive integers."}, 400)
+    deleted_ids = [style_id for style_id in dict.fromkeys(style_ids) if delete_confirmed_style(DB_PATH, CONFIRMED_STYLE_IMAGE_DIR, style_id)]
+    return json_response({"deleted_ids": deleted_ids})
+
+
+@app.route("/api/confirmed-styles/<int:style_id>", methods=["GET", "PATCH", "DELETE"])
+def api_confirmed_style_detail(style_id):
+    if request.method == "DELETE":
+        if not delete_confirmed_style(DB_PATH, CONFIRMED_STYLE_IMAGE_DIR, style_id):
+            return json_response({"error": "확정 그림체를 찾을 수 없습니다."}, 404)
+        return json_response({"deleted": True, "id": style_id})
+    if request.method == "PATCH":
+        try:
+            updated = update_confirmed_style(DB_PATH, style_id, request.get_json(silent=True))
+        except ValueError as exc:
+            return json_response({"error": str(exc)}, 400)
+        if updated is None:
+            return json_response({"error": "확정 그림체를 찾을 수 없습니다."}, 404)
+        return json_response(_add_confirmed_url(updated))
+    item = get_confirmed_style(DB_PATH, style_id)
+    if item is None:
+        return json_response({"error": "확정 그림체를 찾을 수 없습니다."}, 404)
+    return json_response(_add_confirmed_url(item))
+
+
+def _comparison_model(value, fallback):
+    text = str(value or "").strip()
+    aliases = {
+        "NovelAI Diffusion V4.5": "nai-diffusion-4-5-full",
+        "NovelAI Diffusion V4.5 Full": "nai-diffusion-4-5-full",
+        "NovelAI Diffusion V4.5 Curated": "nai-diffusion-4-5-curated",
+        "NovelAI Diffusion V4 Full": "nai-diffusion-4-full",
+        "NovelAI Diffusion V3": "nai-diffusion-3",
+    }
+    return aliases.get(text, text if text.startswith("nai-diffusion-") else fallback)
+
+
+def _comparison_generation_data(group, style):
+    defaults = group.get("defaults") or {}
+    def value(key, fallback): return style.get(key) if style.get(key) not in (None, "") else defaults.get(key, fallback)
+    base_prompt = ", ".join(part for part in [style.get("quality_prompt"), style.get("fixed_prompt"), group.get("fixed_prompt")] if part)
+    return {
+        "base_prompt": base_prompt, "quality_prompt": style.get("quality_prompt") or "",
+        "original_quality_prompt": style.get("original_quality_prompt") or style.get("quality_prompt") or "",
+        "fixed_prompt": group.get("fixed_prompt") or "", "excluded_quality_tags": [],
+        "negative_prompt": style.get("negative_prompt") or "", "character_prompts": group.get("character_prompts") or [],
+        "width": group["width"], "height": group["height"], "sampler": value("sampler", "k_euler_ancestral"),
+        "noise_schedule": value("noise_schedule", "karras"), "steps": value("steps", 28),
+        "scale": value("scale", 5.0), "cfg_rescale": value("cfg_rescale", 0.0),
+        "variety_plus": value("variety_plus", False),
+    }, _comparison_model(style.get("model"), _comparison_model(defaults.get("model"), MODEL))
+
+
+def _comparison_result_url(result):
+    item = dict(result)
+    item["image_url"] = f'/comparison-images/{item["image_path"]}'
+    return item
+
+
+def _generate_comparison_style(group, style_id):
+    style = get_confirmed_style(DB_PATH, style_id)
+    if not style:
+        raise ValueError("확정 그림체를 찾을 수 없습니다.")
+    try:
+        key = load_app_key(SETTINGS_JSON_PATH, DATA_DIR)
+    except SettingsError:
+        raise ValueError("설정 파일이 올바르지 않습니다.") from None
+    if not key:
+        raise ValueError("NovelAI App Key가 설정되어 있지 않습니다.")
+    data, model = _comparison_generation_data(group, style)
+    common_seed = group.get("seed")
+    if group["seed_mode"] == "none":
+        data["seed"] = style.get("seed") or random.SystemRandom().randint(1, 4294967295)
+    elif common_seed:
+        data["seed"] = common_seed
+    else:
+        data["seed"] = random.SystemRandom().randint(1, 4294967295)
+    try:
+        png, actual_seed = generate_novelai_png(
+            key, data, style.get("artist_prompt") or "", model=model
+        )
+    except NovelAIError as exc:
+        style_name = style.get("name") or f"확정 그림체 #{style_id}"
+        settings = f"{model}, {data['sampler']} / {data['noise_schedule']}, {data['steps']} steps, {data['width']}×{data['height']}"
+        raise NovelAIError(
+            exc.status_code,
+            f"{style_name} 생성 실패 ({settings}) · {exc.public_message}",
+        ) from None
+    if group["seed_mode"] == "first" and common_seed is None:
+        set_group_seed(DB_PATH, group["id"], actual_seed)
+    snapshot = {
+        **data,
+        "seed": actual_seed,
+        "model": model,
+        "artist_prompt": style.get("artist_prompt") or "",
+        "quality_prompt": style.get("quality_prompt") or "",
+        "style_fixed_prompt": style.get("fixed_prompt") or "",
+        "comparison_fixed_prompt": group.get("fixed_prompt") or "",
+        "style_name": style.get("name") or f"확정 그림체 #{style_id}",
+    }
+    save_result(
+        DB_PATH,
+        COMPARISON_IMAGE_DIR,
+        group["id"],
+        style_id,
+        snapshot["style_name"],
+        png,
+        snapshot,
+    )
+    refreshed = get_group(DB_PATH, group["id"])
+    result = next(
+        item for item in refreshed["results"] if item.get("confirmed_style_id") == style_id
+    )
+    return _comparison_result_url(result)
+
+
+@app.route("/api/comparisons", methods=["GET", "POST"])
+def api_comparisons():
+    if request.method == "GET":
+        groups = list_groups(DB_PATH)
+        for group in groups:
+            group["results"] = [_comparison_result_url(result) for result in group["results"]]
+        return json_response(groups)
+    payload = request.get_json(silent=True) or {}
+    style_ids = payload.get("style_ids")
+    editing_group = type(payload.get("group_id")) is int
+    if not isinstance(style_ids, list) or any(type(value) is not int or value < 1 for value in style_ids) or (not editing_group and not style_ids):
+        return json_response({"error": "확정 그림체 선택을 확인해 주세요."}, 400)
+    try:
+        group_id = payload.get("group_id")
+        if editing_group:
+            group = get_group(DB_PATH, group_id)
+            if group is None: raise ValueError("비교군을 찾을 수 없습니다.")
+            update_group_style_ids(DB_PATH, group_id, style_ids)
+            remove_group_results(DB_PATH, COMPARISON_IMAGE_DIR, group_id, style_ids)
+        else:
+            group_id = create_group(DB_PATH, payload)
+        group = get_group(DB_PATH, group_id)
+        existing_style_ids = {result.get("confirmed_style_id") for result in group.get("results", [])}
+        pending_style_ids = [style_id for style_id in dict.fromkeys(style_ids) if style_id not in existing_style_ids]
+        if payload.get("defer_generation") is True:
+            return json_response({
+                "id": group_id,
+                "pending_style_ids": pending_style_ids,
+                "generated_count": len(existing_style_ids),
+                "total_count": len(style_ids),
+            }, 200 if editing_group else 201)
+        for style_id in pending_style_ids:
+            group = get_group(DB_PATH, group_id)
+            _generate_comparison_style(group, style_id)
+        return json_response({"id": group_id}, 200 if editing_group else 201)
+    except (ValueError, NovelAIError) as exc:
+        return json_response({"error": getattr(exc, "public_message", str(exc))}, getattr(exc, "status_code", 400))
+
+
+@app.route("/api/comparisons/<int:group_id>/styles/<int:style_id>/generate", methods=["POST"])
+def api_generate_comparison_style(group_id, style_id):
+    group = get_group(DB_PATH, group_id)
+    if group is None:
+        return json_response({"error": "비교군을 찾을 수 없습니다."}, 404)
+    if style_id not in group.get("selected_style_ids", []):
+        return json_response({"error": "이 비교군에 선택되지 않은 확정 그림체입니다."}, 400)
+    try:
+        return json_response(_generate_comparison_style(group, style_id), 201)
+    except (ValueError, NovelAIError) as exc:
+        return json_response({"error": getattr(exc, "public_message", str(exc))}, getattr(exc, "status_code", 400))
+
+
+@app.route("/api/comparison-results/<int:result_id>", methods=["DELETE"])
+def api_delete_comparison_result(result_id):
+    if not delete_result(DB_PATH, COMPARISON_IMAGE_DIR, result_id): return json_response({"error": "결과를 찾을 수 없습니다."}, 404)
+    return json_response({"deleted": True})
+
+
+@app.route("/api/comparisons/<int:group_id>", methods=["DELETE"])
+def api_delete_comparison_group(group_id):
+    if not delete_group(DB_PATH, COMPARISON_IMAGE_DIR, group_id):
+        return json_response({"error": "비교군을 찾을 수 없습니다."}, 404)
+    return json_response({"deleted": True, "id": group_id})
 
 
 @app.route("/api/arca-styles/collect", methods=["POST"])
@@ -1619,6 +2328,26 @@ def generated(filename):
     return send_from_directory(root, path.as_posix())
 
 
+@app.route("/confirmed-style-images/<path:filename>")
+def confirmed_style_image(filename):
+    normalized = filename.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute() or ".." in path.parts or normalized != filename:
+        return json_response({"error": "Invalid confirmed image path."}, 400)
+    target = (CONFIRMED_STYLE_IMAGE_DIR / path).resolve()
+    root = CONFIRMED_STYLE_IMAGE_DIR.resolve()
+    if target.parent != root:
+        return json_response({"error": "Invalid confirmed image path."}, 400)
+    return send_from_directory(root, path.as_posix())
+
+
+@app.route("/comparison-images/<path:filename>")
+def comparison_image(filename):
+    path = Path(filename)
+    if path.is_absolute() or ".." in path.parts: return json_response({"error": "Invalid comparison image path."}, 400)
+    return send_from_directory(COMPARISON_IMAGE_DIR, path.as_posix())
+
+
 @app.route("/api/ratings/<int:rating_id>", methods=["PATCH"])
 def api_update_rating(rating_id):
     payload = request.get_json(silent=True) or {}
@@ -1634,6 +2363,12 @@ def api_update_rating(rating_id):
         if key in payload:
             allowed.append(f"{key} = ?")
             params.append(payload[key])
+    if "query_text" in payload:
+        if not isinstance(payload["query_text"], str):
+            return json_response({"ok": False, "error": "쿼리 프롬프트는 문자열이어야 합니다."}, 400)
+        query_text = payload["query_text"].strip()
+        allowed.extend(("query_text = ?", "query_tags_json = ?"))
+        params.extend((query_text, json.dumps(normalize_query_text(query_text), ensure_ascii=False)))
     if not allowed:
         return json_response({"ok": False, "error": "수정할 값이 없습니다."}, 400)
     allowed.append("updated_at = ?")

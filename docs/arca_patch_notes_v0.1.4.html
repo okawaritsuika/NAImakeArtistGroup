@@ -1,0 +1,55 @@
+<div style="max-width:920px;margin:0 auto;padding:22px;color:#e8edf5;background:#171b22;border:1px solid #343c49;border-radius:14px;line-height:1.7;word-break:keep-all;">
+  <h1 style="margin:0 0 8px;font-size:28px;color:#7de0d6;">NovelAI 그림체 도구 v0.1.4 패치노트</h1>
+  <p style="margin:0 0 18px;color:#aeb8c7;">그림체를 확정해 보관하고, 같은 캐릭터를 여러 그림체로 비교하는 작업을 한곳에서 할 수 있게 만든 업데이트입니다.</p>
+
+  <div style="margin:16px 0;padding:14px 16px;background:#202732;border:1px solid #3c4858;border-radius:10px;">
+    <strong style="color:#ffffff;">기존 사용자 업데이트</strong>
+    <p style="margin:6px 0 0;">v0.1.1 이상은 리모콘에서 <strong style="color:#7de0d6;">업데이트 확인 → 업데이트 받기</strong>를 누르면 됩니다. v0.1.0은 프로그램을 완전히 종료한 뒤 새 EXE로 수동 교체해 주세요.</p>
+  </div>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">1. 그림체 관리 3분류</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;"><strong>제작 기록</strong>, <strong>확정 그림체</strong>, <strong>공유 그림체</strong>를 각각 따로 볼 수 있습니다.</li>
+    <li style="margin:7px 0;">같은 작가 조합으로 여러 번 만든 이미지도 제작 기록에서 결과별 카드로 남습니다.</li>
+    <li style="margin:7px 0;">제작 기록이나 공유 그림체를 확정하기 전에 작가·퀄리티·고정·네거티브 프롬프트와 생성 설정을 검토하고 수정할 수 있습니다.</li>
+    <li style="margin:7px 0;">이미지를 드래그하거나 붙여 넣어 확정 그림체를 직접 추가할 수 있습니다. 이미지에서 읽지 못한 생성 정보는 직접 입력하면 됩니다.</li>
+    <li style="margin:7px 0;">검색·필터·페이지당 표시 수·그림 크기 조절을 지원하며, 공유 그림체는 이미지가 있는 항목만 표시합니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">2. 비교군 관리</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">확정 그림체를 여러 개 골라 같은 캐릭터와 고정 프롬프트로 자동 생성해 결과를 비교할 수 있습니다.</li>
+    <li style="margin:7px 0;">그림체 갤러리, 선택한 그림체의 상세 정보, 생성 설정을 한 화면에서 보고 선택합니다.</li>
+    <li style="margin:7px 0;">각 그림체에 저장된 모델·샘플러·스케줄러·Steps·CFG·Rescale·Variety+를 그대로 사용합니다.</li>
+    <li style="margin:7px 0;">캐릭터 프롬프트는 여러 개 추가하거나 삭제할 수 있고, 공통 시드는 미지정·직접 입력·첫 그림 시드 재사용 중에서 선택할 수 있습니다.</li>
+    <li style="margin:7px 0;">생성 중에는 <strong>완료 수 / 전체 수</strong>가 그림 한 장마다 실시간으로 갱신됩니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">3. 폴더형 비교 갤러리</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">비교군 목록을 폴더처럼 모아 표시하고, 폴더를 누르면 그 안의 결과 갤러리가 열립니다.</li>
+    <li style="margin:7px 0;">결과 그림을 선택하면 큰 이미지와 사용한 프롬프트·생성 정보를 오른쪽에서 확인할 수 있습니다.</li>
+    <li style="margin:7px 0;">잘못되거나 빠진 그림은 개별 삭제 후 <strong>재습득</strong>할 수 있고, 이미 있는 그림도 같은 버튼으로 다시 생성할 수 있습니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">4. 숫자로 끝나는 태그 수정</h2>
+  <div style="margin:10px 0;padding:14px 16px;background:#202732;border-left:4px solid #7de0d6;border-radius:8px;">
+    <p style="margin:0;"><strong style="color:#ffffff;">수정 전:</strong> 1.5::artist:matrix16::</p>
+    <p style="margin:5px 0 0;"><strong style="color:#ffffff;">수정 후:</strong> 1.5::artist:matrix16 ::</p>
+  </div>
+  <p style="margin:8px 0;">숫자로 끝나는 태그는 닫는 <strong>::</strong> 앞에 공백이 필요합니다. 공유 그림체 가져오기, 확정 그림체 저장·불러오기, 그림체 제작, 실제 NovelAI 생성 요청까지 모두 자동 보정합니다.</p>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">5. 생성 오류 수정</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">비교군도 그림체 제작과 같은 NovelAI V4/V4.5 요청 형식을 사용하도록 통일했습니다.</li>
+    <li style="margin:7px 0;">V4.5 Full과 저장된 샘플러·스케줄러·Steps 등의 설정을 정확히 전달합니다.</li>
+    <li style="margin:7px 0;">NovelAI 서버 오류가 발생하면 확인에 사용할 수 있는 요청 ID를 함께 표시합니다.</li>
+  </ul>
+
+  <hr style="margin:26px 0;border:0;border-top:1px solid #3c4655;">
+  <p style="margin:0;text-align:center;">
+    <a href="https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.4" style="display:inline-block;padding:10px 18px;color:#101719;background:#7de0d6;border-radius:8px;text-decoration:none;font-weight:700;">v0.1.4 다운로드 및 상세 내용</a>
+  </p>
+  <p style="margin:12px 0 0;text-align:center;color:#9aa6b5;font-size:13px;">기존 로컬 데이터는 유지되며, 개인 평가·NovelAI App Key·생성 이미지·로그인 정보는 배포 파일에 포함되지 않습니다.</p>
+  <p style="margin:5px 0 0;text-align:center;color:#7f8b99;font-size:12px;word-break:break-all;">EXE SHA-256: __V014_SHA256__</p>
+</div>

@@ -1180,6 +1180,20 @@ class ArcaCollectorTest(unittest.TestCase):
             "1girl, blue hair", "1boy, black hair",
         ])
 
+    def test_extracts_numeric_ending_tags_with_safe_closing_space(self):
+        payload = {
+            "v4_prompt": {"caption": {
+                "base_caption": "1.5::artist:matrix16::, 2::year 2025::",
+                "char_captions": [{"char_caption": "1.2::character 2::"}],
+            }},
+            "v4_negative_prompt": {"caption": {"base_caption": "-2::bad 3::"}},
+            "seed": 7,
+        }
+        meta = extract_novelai_metadata(png_with_text("Comment", json.dumps(payload)), "image/png")
+        self.assertEqual(meta["base_prompt"], "1.5::artist:matrix16 ::, 2::year 2025 ::")
+        self.assertEqual(meta["negative_prompt"], "-2::bad 3 ::")
+        self.assertEqual(meta["character_prompts"][0]["prompt"], "1.2::character 2 ::")
+
     def test_prompt_presets_keep_non_character_tags_and_full_negative(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             for index, (prompt, negative, recommendations) in enumerate((
@@ -1218,6 +1232,26 @@ class ArcaCollectorTest(unittest.TestCase):
             {item["artist"] for item in get_shared_style_artist_pool(self.db_path)},
             {"alpha", "beta"},
         )
+
+    def test_prompt_presets_keep_quality_only_and_negative_only_candidates(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            for index, (prompt, negative) in enumerate((
+                ("artist:alpha, masterpiece, best quality", ""),
+                ("artist:alpha", "lowres, bad hands"),
+            ), 1):
+                item_id = conn.execute(
+                    "INSERT INTO arca_style_items(source_url,title,board_tab,metadata_status,prompt,negative_prompt,collected_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (f"https://arca.live/b/aiart/partial-{index}", "그림체 공유", "NAI", "ok", prompt, negative, "now", "now"),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO arca_style_images(item_id,image_url,metadata_status,prompt,base_prompt,negative_prompt,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (item_id, f"https://img/partial-{index}.png", "ok", prompt, prompt, negative, "now"),
+                )
+
+        presets = get_style_maker_prompt_presets(self.db_path, ["alpha"], limit=1)["presets"]
+
+        self.assertTrue(any(item["base_prompt"] == "masterpiece, best quality" for item in presets))
+        self.assertTrue(any(item["negative_prompt"] == "lowres, bad hands" for item in presets))
 
     def test_namu_cdn_candidates_request_original_image_bytes(self):
         candidates = extract_image_candidates(

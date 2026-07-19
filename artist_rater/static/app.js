@@ -46,8 +46,9 @@ function showStatus(target, message, type = "") {
 }
 
 async function apiFetch(url, options = {}) {
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers: { ...(isFormData ? {} : { "Content-Type": "application/json" }), ...(options.headers || {}) },
     ...options,
   });
   const data = await response.json().catch(() => ({}));
@@ -306,6 +307,68 @@ async function addManualRating() {
   }
 }
 
+let appDialogResolve = null;
+
+function closeAppDialog(value) {
+  const modal = $("appDialog");
+  if (!modal || !appDialogResolve) return;
+  modal.classList.add("hidden");
+  const resolve = appDialogResolve;
+  appDialogResolve = null;
+  resolve(value);
+}
+
+function openAppDialog(options = {}) {
+  const modal = $("appDialog");
+  if (!modal) return Promise.resolve(options.input ? null : false);
+  if (appDialogResolve) closeAppDialog(options.input ? null : false);
+  const isInput = options.input === true;
+  const title = $("appDialogTitle");
+  const message = $("appDialogMessage");
+  const icon = $("appDialogIcon");
+  const details = $("appDialogDetails");
+  const inputField = $("appDialogInputField");
+  const inputLabel = $("appDialogInputLabel");
+  const input = $("appDialogInput");
+  const cancel = $("appDialogCancel");
+  const confirm = $("appDialogConfirm");
+  modal.dataset.tone = options.tone || "warning";
+  if (title) title.textContent = options.title || "확인";
+  if (message) message.textContent = options.message || "계속 진행할까요?";
+  if (icon) icon.textContent = options.icon || (modal.dataset.tone === "danger" ? "×" : modal.dataset.tone === "info" ? "i" : "!");
+  if (details) {
+    details.replaceChildren();
+    (Array.isArray(options.details) ? options.details : []).forEach((item) => {
+      const row = document.createElement("li");
+      row.textContent = String(item);
+      details.append(row);
+    });
+    details.classList.toggle("hidden", !details.children.length);
+  }
+  inputField?.classList.toggle("hidden", !isInput);
+  if (inputLabel) inputLabel.textContent = options.inputLabel || "입력";
+  if (input) input.value = isInput ? String(options.defaultValue || "") : "";
+  if (cancel) cancel.textContent = options.cancelLabel || "취소";
+  if (confirm) confirm.textContent = options.confirmLabel || "확인";
+  modal.classList.remove("hidden");
+  requestAnimationFrame(() => (isInput ? input : confirm)?.focus());
+  if (isInput && input) input.select();
+  return new Promise((resolve) => { appDialogResolve = resolve; });
+}
+
+function appConfirm(options) {
+  const normalized = typeof options === "string" ? { message: options } : options;
+  return openAppDialog(normalized).then(Boolean);
+}
+
+function appPrompt(options) {
+  const normalized = typeof options === "string" ? { title: options } : options;
+  return openAppDialog({ ...normalized, input: true });
+}
+
+globalThis.appDialog = { confirm: appConfirm, prompt: appPrompt };
+
+
 function manualPreviewRatingFields(artist, queryTags, preview) {
   const sameArtist = String(preview?.artist || "") === String(artist || "");
   const sameTags = JSON.stringify(preview?.queryTags || []) === JSON.stringify(queryTags || []);
@@ -428,7 +491,17 @@ async function loadCandidatePool(force = false) {
 async function showNextArtist() {
   if (state.loadingSamples) return;
   if (!state.candidatePool.length) {
-    const loaded = await loadCandidatePool();
+    const shouldCollect = await globalThis.appDialog.confirm({
+      title: "후보를 모두 확인했습니다",
+      message: "새 후보 작가를 다시 수집할까요?",
+      confirmLabel: "새 후보 수집",
+      tone: "info",
+    });
+    if (!shouldCollect) {
+      showStatus($("status"), "후보 수집을 멈췄습니다. 새 후보 검색을 누르면 다시 수집할 수 있습니다.");
+      return;
+    }
+    const loaded = await loadCandidatePool(true);
     if (!loaded) return;
   }
 
@@ -656,11 +729,19 @@ function renderRatingCard(item) {
   const memoInput = document.createElement("textarea");
   memoInput.dataset.edit = "memo";
   memoInput.value = String(item.memo || "");
+  const queryInput = document.createElement("textarea");
+  queryInput.dataset.edit = "query-text";
+  queryInput.setAttribute("aria-label", "쿼리 프롬프트");
+  queryInput.placeholder = "비우면 전체 작가 수집으로 변경됩니다.";
+  queryInput.value = String(item.query_text || (item.query_tags || []).join(", "));
   const apply = document.createElement("button");
   apply.type = "button";
   apply.dataset.action = "apply";
   apply.textContent = "적용";
-  editor.append(scoreSelect, memoInput, apply);
+  const queryLabel = document.createElement("span");
+  queryLabel.className = "inline-edit-label";
+  queryLabel.textContent = "쿼리 프롬프트";
+  editor.append(scoreSelect, memoInput, queryLabel, queryInput, apply);
   body.append(heading, score, memoPreview, meta, actions, editor);
   card.append(body);
 
@@ -672,6 +753,7 @@ function renderRatingCard(item) {
     patchRating(item.id, {
       score: Number(card.querySelector('[data-edit="score"]').value),
       memo: card.querySelector('[data-edit="memo"]').value,
+      query_text: card.querySelector('[data-edit="query-text"]').value,
     });
   });
   return card;
@@ -710,7 +792,12 @@ async function patchRating(id, payload) {
 }
 
 async function deleteRating(id) {
-  if (!confirm("삭제할까요?")) return;
+  if (!await globalThis.appDialog.confirm({
+    title: "평가 기록 삭제",
+    message: "선택한 작가의 평가 기록을 삭제할까요?",
+    confirmLabel: "삭제",
+    tone: "danger",
+  })) return;
   try {
     await apiFetch(`/api/ratings/${id}`, { method: "DELETE" });
     await loadRatings();
@@ -720,6 +807,23 @@ async function deleteRating(id) {
 }
 
 if (typeof document !== "undefined" && !(typeof module !== "undefined" && module.exports)) {
+bindClick("appDialogCancel", () => closeAppDialog(null));
+bindClick("appDialogConfirm", () => {
+  const inputVisible = !$("appDialogInputField")?.classList.contains("hidden");
+  closeAppDialog(inputVisible ? valueOf("appDialogInput") : true);
+});
+document.querySelectorAll("[data-app-dialog-cancel]").forEach((element) => {
+  element.addEventListener("click", () => closeAppDialog(null));
+});
+$("appDialogInput")?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    closeAppDialog(valueOf("appDialogInput"));
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("appDialog")?.classList.contains("hidden")) closeAppDialog(null);
+});
 document.querySelectorAll(".tab").forEach((button) => {
   button.addEventListener("click", () => {
     document.querySelectorAll(".tab, .view").forEach((item) => item.classList.remove("active"));
@@ -755,7 +859,10 @@ if (queryText) {
   });
   queryText.addEventListener("keydown", handleAutocompleteKeydown);
 }
-bindClick("candidateButton", () => loadCandidatePool(true)) || bindClick("pickButton", async () => {
+bindClick("candidateButton", async () => {
+  const loaded = await loadCandidatePool(true);
+  if (loaded) await showNextArtist();
+}) || bindClick("pickButton", async () => {
   const loaded = await loadCandidatePool(true);
   if (loaded) await showNextArtist();
 });

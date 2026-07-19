@@ -17,14 +17,20 @@ const {
   hasProfileDragMoved,
   normalizeStoredPrompts,
   promptStoragePayload,
+  combinePromptSections,
+  currentPromptTagFragment,
+  replaceCurrentPromptTagFragment,
+  formatPromptAutocompleteTag,
   parsePromptTokens,
   appendUniquePromptToken,
   removePromptToken,
   parseStyleArtistNames,
+  parseStyleArtistEntries,
   insertStyleArtistsAtPosition,
   updateStyleArtistAtIndex,
   moveStyleArtistToPosition,
   fixedStyleArtistEntries,
+  limitArtistsToTotalCount,
   fixedArtistOverlayCoordinates,
   graphInsertionPositionFromRatio,
   moveSelectedArtistsToPosition,
@@ -34,7 +40,157 @@ const {
   addPromptGroupItem,
   cleanPromptGroups,
   buildEffectivePromptText,
+  toggleSelectedStyleId,
+  managerCombinedPromptText,
+  confirmedGeneratedSourceValues,
+  filterStyleManagerItems,
+  paginateStyleManagerItems,
+  normalizeStyleManagerPageSize,
+  normalizeRatingTagRules,
+  validateRatingTagRules,
+  ratingTagRuleCount,
+  normalizeRatingExcludeTags,
+  validateRatingExcludeTags,
+  opusFreeGenerationIssues,
+  normalizeComparisonCharacterPrompts,
+  normalizeNumericPromptClosers,
 } = require("../static/style_maker.js");
+
+test("numeric prompt closers keep weight openers and space numeric tag endings", () => {
+  assert.equal(
+    normalizeNumericPromptClosers("1.5::artist:matrix16::, 2::year 2025::, -3::clone::"),
+    "1.5::artist:matrix16 ::, 2::year 2025 ::, -3::clone::",
+  );
+});
+
+test("comparison character prompts allow none and normalize separate rows", () => {
+  assert.deepEqual(normalizeComparisonCharacterPrompts(null), []);
+  assert.deepEqual(
+    normalizeComparisonCharacterPrompts([" sakuragi mano, cowboy shot ", "", "asuka langley"]),
+    ["sakuragi mano, cowboy shot", "asuka langley"],
+  );
+});
+
+test("rating tag rules normalize multiple tags and count reserved artists", () => {
+  const rules = normalizeRatingTagRules([
+    { tag: "dakimakura (medium)", count: 2 },
+    { tag: "white_sheet", count: 1 },
+  ]);
+  assert.deepEqual(rules, [
+    { tag: "dakimakura_(medium)", count: 2 },
+    { tag: "white_sheet", count: 1 },
+  ]);
+  assert.equal(ratingTagRuleCount(rules), 3);
+  assert.throws(
+    () => validateRatingTagRules([...rules, { tag: "WHITE_SHEET", count: 1 }]),
+    /같은 태그/,
+  );
+});
+
+test("rating exclusion tags normalize spaces and reject duplicates", () => {
+  assert.deepEqual(
+    normalizeRatingExcludeTags(["monochrome", "white sheet"]),
+    ["monochrome", "white_sheet"],
+  );
+  assert.throws(
+    () => validateRatingExcludeTags(["white sheet", "WHITE_SHEET"]),
+    /같은 태그/,
+  );
+});
+
+test("Opus free generation warning checks steps and total pixels", () => {
+  assert.deepEqual(opusFreeGenerationIssues({ width: 832, height: 1216, steps: 28 }), []);
+  assert.equal(opusFreeGenerationIssues({ width: 1024, height: 1024, steps: 28 }).length, 0);
+  assert.match(
+    opusFreeGenerationIssues({ width: 1024, height: 1024, steps: 29 })[0],
+    /28스텝/,
+  );
+  assert.match(
+    opusFreeGenerationIssues({ width: 1280, height: 1024, steps: 28 })[0],
+    /1,048,576픽셀/,
+  );
+});
+
+test("style manager selection toggles ids without mutating the previous set", () => {
+  const original = new Set([2]);
+  const added = toggleSelectedStyleId(original, 5);
+  const removed = toggleSelectedStyleId(added, 2);
+  assert.deepEqual([...original], [2]);
+  assert.deepEqual([...added], [2, 5]);
+  assert.deepEqual([...removed], [5]);
+});
+
+test("style manager combines the weighted artist prompt before quality tags", () => {
+  const image = {
+    artist_prompt: "1.25::artist:sample artist::",
+    artists: [{ artist: "sample_artist", weight: 1.25 }],
+    base_prompt: "masterpiece, best quality",
+    character_prompts: ["1girl", "blue eyes"],
+    negative_prompt: "lowres",
+  };
+  assert.equal(
+    managerCombinedPromptText(image),
+    "1.25::artist:sample artist::, masterpiece, best quality",
+  );
+});
+
+test("generated style confirmation keeps its image and generation settings", () => {
+  const source = confirmedGeneratedSourceValues({
+    id: 12,
+    image_url: "/generated/4/sample.png",
+    artists: [{ artist: "sample_artist", weight: 1.25 }],
+    quality_prompt: "very aesthetic",
+    negative_prompt: "lowres",
+    sampler: "k_euler_ancestral",
+    noise_schedule: "karras",
+    steps: 28,
+    scale: 5,
+    cfg_rescale: 0.2,
+    variety_plus: true,
+    model: "nai-diffusion-4-5-full",
+  });
+
+  assert.equal(source.image_url, "/generated/4/sample.png");
+  assert.equal(source.sampler, "k_euler_ancestral");
+  assert.equal(source.noise_schedule, "karras");
+  assert.equal(source.steps, 28);
+  assert.equal(source.scale, 5);
+  assert.equal(source.cfg_rescale, 0.2);
+  assert.equal(source.variety_plus, true);
+  assert.equal(source.model, "nai-diffusion-4-5-full");
+  assert.equal(source.artist_prompt, "1.25::artist:sample artist::");
+});
+
+test("style manager filters each gallery mode and sorts visible cards", () => {
+  const generated = [
+    { id: 1, created_at: "2026-01-01", confirmed: false, artists: [{ artist: "alpha" }] },
+    { id: 2, created_at: "2026-01-02", confirmed: true, artists: [{ artist: "beta" }] },
+  ];
+  assert.deepEqual(
+    filterStyleManagerItems(generated, "generated", { query: "beta", scope: "confirmed", sort: "newest" }).map((item) => item.id),
+    [2],
+  );
+  const confirmed = [
+    { id: 3, updated_at: "2026-01-03", source_type: "manual", name: "직접 보관" },
+    { id: 4, updated_at: "2026-01-04", source_type: "shared", name: "공유 보관" },
+  ];
+  assert.deepEqual(
+    filterStyleManagerItems(confirmed, "confirmed", { scope: "shared", sort: "oldest" }).map((item) => item.id),
+    [4],
+  );
+});
+
+test("style manager pagination slices generated and confirmed records", () => {
+  assert.deepEqual(
+    paginateStyleManagerItems([{ id: 1 }, { id: 2 }, { id: 3 }], 2, 2).map((item) => item.id),
+    [3],
+  );
+});
+
+test("style manager accepts only supported page sizes", () => {
+  assert.equal(normalizeStyleManagerPageSize("48"), 48);
+  assert.equal(normalizeStyleManagerPageSize("13"), 24);
+});
 
 test("continuous random targets migrate old settings and keep four independent toggles", () => {
   assert.deepEqual(normalizeRandomTargets(null, "weights"), ["weights"]);
@@ -75,6 +231,7 @@ test("prompt storage keeps one normalized snapshot", () => {
     promptStoragePayload(" base ", " negative ", [" char one ", "", " char two "]),
     {
       base_prompt: " base ",
+      fixed_prompt: "",
       negative_prompt: " negative ",
       character_prompts: [" char one ", "", " char two "],
       character_prompt_ids: ["character-1", "character-2", "character-3"],
@@ -86,6 +243,7 @@ test("prompt storage keeps one normalized snapshot", () => {
     normalizeStoredPrompts({ base_prompt: "base", negative_prompt: "neg", character_prompts: ["a", 3, "b"] }),
     {
       base_prompt: "base",
+      fixed_prompt: "",
       negative_prompt: "neg",
       character_prompts: ["a", "b"],
       character_prompt_ids: ["character-1", "character-2"],
@@ -95,12 +253,54 @@ test("prompt storage keeps one normalized snapshot", () => {
   );
   assert.deepEqual(normalizeStoredPrompts(null), {
     base_prompt: "",
+    fixed_prompt: "",
     negative_prompt: "",
     character_prompts: [""],
     character_prompt_ids: ["character-1"],
     prompt_groups: [],
     generation_settings: {},
   });
+});
+
+test("fixed prompt tags persist separately and follow quality tags", () => {
+  const stored = promptStoragePayload(
+    "masterpiece",
+    "lowres",
+    ["1girl"],
+    ["hero"],
+    [],
+    {},
+    "upper body, white sheet",
+  );
+
+  assert.equal(stored.fixed_prompt, "upper body, white sheet");
+  assert.equal(normalizeStoredPrompts(stored).fixed_prompt, "upper body, white sheet");
+  assert.equal(
+    combinePromptSections(stored.base_prompt, stored.fixed_prompt),
+    "masterpiece, upper body, white sheet",
+  );
+  assert.equal(combinePromptSections("", "white sheet"), "white sheet");
+});
+
+test("fixed prompt autocomplete searches and replaces only the tag at the caret", () => {
+  assert.equal(currentPromptTagFragment("upper_body, white sh", 20), "white_sh");
+  assert.equal(currentPromptTagFragment("upper_body, wh sheet, solo", 14), "wh");
+  assert.deepEqual(
+    replaceCurrentPromptTagFragment("upper_body, wh sheet, solo", "white_sheet", 14),
+    { value: "upper_body, white_sheet, solo", cursor: 23 },
+  );
+  assert.deepEqual(
+    replaceCurrentPromptTagFragment("upper_body,\n  wh", "white_sheet", 16),
+    { value: "upper_body,\n  white_sheet", cursor: 25 },
+  );
+});
+
+test("prompt autocomplete prefixes artist tags only in prompt fields", () => {
+  assert.equal(formatPromptAutocompleteTag({ name: "some_artist", category: 1 }), "artist:some artist");
+  assert.equal(formatPromptAutocompleteTag({ name: "artist_123", category: 1 }), "artist:artist 123 ");
+  assert.equal(formatPromptAutocompleteTag({ name: "white_sheet", category: 0 }), "white sheet");
+  assert.equal(formatPromptAutocompleteTag({ name: "some_character", category: 4 }), "some character");
+  assert.equal(formatPromptAutocompleteTag({ name: "some_artist", category: 1 }, false), "some artist");
 });
 
 test("prompt storage preserves generation settings from the website", () => {
@@ -173,6 +373,27 @@ test("manual style artist entry accepts multiple names without duplicates", () =
     parseStyleArtistNames("alpha, beta\nalpha  \n  gamma"),
     ["alpha", "beta", "gamma"],
   );
+});
+
+test("manual style artist entry accepts weighted NovelAI artist prompt lists", () => {
+  const entries = parseStyleArtistEntries(
+    "0.1::artist:kittew::, 0.4::artist:patzzi::, 0.78::artist:kawacy::, 1.13::artist:chomikuplus::, 1.6::artist:miito (meeeeton333)::, 1.94::artist:weiyan (nbnbmwnl)::, 2.3::artist:sadamoto yoshiyuki::",
+  );
+  assert.deepEqual(entries, [
+    { artist: "kittew", weight: 0.1 },
+    { artist: "patzzi", weight: 0.4 },
+    { artist: "kawacy", weight: 0.78 },
+    { artist: "chomikuplus", weight: 1.13 },
+    { artist: "miito (meeeeton333)", weight: 1.6 },
+    { artist: "weiyan (nbnbmwnl)", weight: 1.94 },
+    { artist: "sadamoto yoshiyuki", weight: 2.3 },
+  ]);
+  assert.deepEqual(
+    insertStyleArtistsAtPosition([], entries, { position: 1, weight: 1 })
+      .map(({ artist, weight, slot }) => ({ artist, weight, slot })),
+    entries.map((entry, index) => ({ ...entry, slot: index + 1 })),
+  );
+  assert.equal(chooseArtistsForPrompt(insertStyleArtistsAtPosition([], entries, { position: 1 })).length, 7);
 });
 
 test("manual style artists insert at a one-based prompt position", () => {
@@ -301,6 +522,19 @@ test("selected fixed artists move together into an insertion slot", () => {
   assert.deepEqual(current.map((item) => item.artist), ["a", "b", "c", "d", "e"]);
 });
 
+test("a fixed artist can move across the configured prompt slots", () => {
+  const current = [{ artist: "fixed", weight: 1.0, fixed: true, slot: 1 }];
+
+  assert.deepEqual(
+    moveSelectedArtistsToPosition(current, [0], 12, 12),
+    [{ artist: "fixed", weight: 1.0, fixed: true, slot: 12 }],
+  );
+  assert.deepEqual(
+    moveStyleArtistToPosition(current, 0, 8, 12),
+    [{ artist: "fixed", weight: 1.0, fixed: true, slot: 8 }],
+  );
+});
+
 test("graph insertion position maps pointer ratio to visible between-item slots", () => {
   assert.equal(graphInsertionPositionFromRatio(-0.2, 5), 1);
   assert.equal(graphInsertionPositionFromRatio(0, 5), 1);
@@ -412,6 +646,7 @@ test("reroll payload uses one explicit mode without unused boolean flags", () =>
     { artist: "second", score: 4, weight: 1.0 },
   ]);
   assert.equal(payload.reroll, "weights");
+  assert.deepEqual(payload.fixed_artists, []);
   assert.equal("reroll_artists" in payload, false);
   assert.equal("reroll_weights" in payload, false);
 });
@@ -442,6 +677,30 @@ test("reroll result ordering depends on the explicit action", () => {
     applyStyleRerollResult(current, fresh, "all", true),
     fresh,
   );
+});
+
+test("fixed artists are included in the configured total artist count", () => {
+  const artists = [
+    { artist: "random-a", weight: 0.4 },
+    { artist: "fixed-a", weight: 1.2, fixed: true },
+    { artist: "random-b", weight: 0.8 },
+    { artist: "fixed-b", weight: 1.6, fixed: true },
+    { artist: "random-c", weight: 2.0 },
+  ];
+  assert.deepEqual(
+    limitArtistsToTotalCount(artists, 3).map((item) => item.artist),
+    ["random-a", "fixed-a", "fixed-b"],
+  );
+  assert.throws(() => limitArtistsToTotalCount(artists, 1), /고정 작가 2명.*전체 작가 수 1명/);
+
+  const payload = buildStyleRequestPayload({ count: 3 }, artists, "all");
+  assert.deepEqual(payload.fixed_artists, [
+    { artist: "fixed-a", score: undefined, weight: 1.2 },
+    { artist: "fixed-b", score: undefined, weight: 1.6 },
+  ]);
+
+  artists[1].slot = 2;
+  assert.equal(buildStyleRequestPayload({ count: 3 }, artists, "all").fixed_artists[0].slot, 2);
 });
 
 test("reroll all keeps manually fixed artists even when incoming result omits them", () => {

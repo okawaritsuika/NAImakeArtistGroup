@@ -14,10 +14,24 @@ class FrontendContractTest(unittest.TestCase):
         self.assertIn("state.sampleIndex = 0;", source)
         self.assertNotIn("Math.floor(Math.random() * data.samples.length)", source)
 
-    def test_candidate_pool_only_refills_automatically_when_empty(self):
+    def test_candidate_pool_shows_first_artist_and_asks_before_refilling(self):
         source = APP_JS.read_text(encoding="utf-8")
         self.assertIn("async function loadCandidatePool(force = false)", source)
         self.assertIn("if (state.candidatePool.length && !force) return true;", source)
+        self.assertIn('title: "후보를 모두 확인했습니다"', source)
+        self.assertIn('bindClick("candidateButton", async () => {', source)
+        self.assertIn("if (loaded) await showNextArtist();", source)
+
+    def test_candidate_picker_has_no_exclusion_prompt(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertNotIn('id="excludeQueryText"', html)
+        self.assertNotIn('exclude_query_text:', source)
+
+    def test_rating_editor_can_update_or_clear_the_query_prompt(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn('queryInput.dataset.edit = "query-text"', source)
+        self.assertIn('query_text: card.querySelector(\'[data-edit="query-text"]\').value', source)
 
     def test_manual_artist_preview_uses_modal_and_sample_api(self):
         source = APP_JS.read_text(encoding="utf-8")
@@ -26,6 +40,15 @@ class FrontendContractTest(unittest.TestCase):
         self.assertIn('id="manualPreviewModal"', html)
         self.assertIn('async function openManualPreview()', source)
         self.assertIn('apiFetch("/api/artist_samples"', source)
+
+    def test_native_dialogs_are_replaced_with_the_shared_designed_modal(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn('id="appDialog"', html)
+        self.assertIn('id="appDialogConfirm"', html)
+        self.assertIn("function openAppDialog(options = {})", source)
+        self.assertNotIn("window.confirm(", source)
+        self.assertNotIn('if (!confirm("', source)
 
     def test_rating_card_behavior_with_node(self):
         result = subprocess.run(

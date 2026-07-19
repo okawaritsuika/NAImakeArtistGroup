@@ -2,9 +2,26 @@ import hashlib
 import json
 import math
 import random
+import re
 
 
 SCORE_SELECTION_WEIGHT = {1: 0.08, 2: 0.2, 3: 0.55, 4: 1.0, 5: 1.6}
+_WEIGHTED_PROMPT_GROUP = re.compile(r"([+-]?\d+(?:\.\d+)?)::([\s\S]*?)::")
+_UNWEIGHTED_ARTIST_CLOSER = re.compile(r"(artist\s*:[^,\n]*?\d)\s*::", re.I)
+
+
+def normalize_numeric_prompt_closers(prompt):
+    """Keep numeric weight openers intact and space numeric tag endings before ``::``."""
+    text = str(prompt or "")
+
+    def normalize_group(match):
+        body = match.group(2).rstrip()
+        if body[-1:].isdigit():
+            body += " "
+        return f"{match.group(1)}::{body}::"
+
+    text = _WEIGHTED_PROMPT_GROUP.sub(normalize_group, text)
+    return _UNWEIGHTED_ARTIST_CLOSER.sub(lambda match: f"{match.group(1)} ::", text)
 
 
 def _integer_value(value, error_message):
@@ -205,6 +222,7 @@ def assign_weights(
     ranges,
     rng_seed=None,
     profile=None,
+    positions=None,
 ):
     try:
         minimum = float(minimum)
@@ -231,15 +249,27 @@ def assign_weights(
         items.append(normalized)
     if mode == "profile":
         points = validate_weight_profile(profile, minimum, maximum)
-        spread = (maximum - minimum) * 0.04
         last_index = max(1, len(items) - 1)
+        if positions is not None:
+            if (
+                not isinstance(positions, list)
+                or len(positions) != len(items)
+                or any(
+                    not isinstance(position, (int, float))
+                    or isinstance(position, bool)
+                    or not math.isfinite(position)
+                    or not 0 <= position <= 1
+                    for position in positions
+                )
+            ):
+                raise ValueError("가중치 그래프 자리 정보를 확인하세요.")
         result = []
         for index, item in enumerate(items):
-            target = interpolate_weight_profile(points, index / last_index)
-            jittered = min(maximum, max(minimum, target + rng.uniform(-spread, spread)))
+            position = positions[index] if positions is not None else index / last_index
+            target = interpolate_weight_profile(points, position)
             result.append(
                 {key: value for key, value in item.items() if key != "_index"}
-                | {"weight": round(jittered, 2)}
+                | {"weight": round(target, 2)}
             )
         return result
     if mode == "random" or (mode == "custom" and not ranges):
@@ -357,7 +387,7 @@ def build_artist_prompt(artists):
         if artist[-1:].isdigit():
             artist += " "
         prompts.append(f'{format_weight(item["weight"])}::artist:{artist}::')
-    return ", ".join(prompts)
+    return normalize_numeric_prompt_closers(", ".join(prompts))
 
 
 def style_hash(artists):

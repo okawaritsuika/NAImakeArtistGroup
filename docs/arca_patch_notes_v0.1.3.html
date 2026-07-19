@@ -1,0 +1,51 @@
+<div style="max-width:920px;margin:0 auto;padding:22px;color:#e8edf5;background:#171b22;border:1px solid #343c49;border-radius:14px;line-height:1.7;word-break:keep-all;">
+  <h1 style="margin:0 0 8px;font-size:28px;color:#7de0d6;">NovelAI 그림체 도구 v0.1.3 패치노트</h1>
+  <p style="margin:0 0 18px;color:#aeb8c7;">그림체 제작과 관리 화면을 크게 손보고, 작가 선택 규칙과 생성 안전 안내를 보강한 업데이트입니다.</p>
+
+  <div style="margin:16px 0;padding:14px 16px;background:#202732;border:1px solid #3c4858;border-radius:10px;">
+    <strong style="color:#ffffff;">기존 사용자 업데이트</strong>
+    <p style="margin:6px 0 0;">v0.1.1 이상은 리모콘에서 <strong style="color:#7de0d6;">업데이트 확인 → 업데이트 받기</strong>를 누르면 됩니다. v0.1.0은 프로그램을 완전히 종료한 뒤 EXE를 수동으로 교체해 주세요.</p>
+  </div>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">1. 그림체 제작</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">고정 작가도 전체 작가 수에 포함됩니다. 전체 7명 중 고정 작가가 5명이면 나머지 2명만 새로 선택합니다.</li>
+    <li style="margin:7px 0;">추가할 작가에 <strong>가중치::artist:작가명::</strong> 형식을 여러 개 한꺼번에 붙여 넣을 수 있습니다.</li>
+    <li style="margin:7px 0;">사용자 그래프 가중치를 실제 프롬프트 자리 순서에 맞춰 정확히 적용합니다.</li>
+    <li style="margin:7px 0;">평가 작가 태그별 인원 모달에서 여러 수집 태그마다 몇 명을 넣을지 정할 수 있습니다.</li>
+    <li style="margin:7px 0;">특정 수집 태그로 평가한 작가를 태그 지정 자리와 전체 랜덤 자리에서 제외할 수 있습니다.</li>
+    <li style="margin:7px 0;">평가 태그 입력에도 Danbooru 태그 자동완성을 지원합니다.</li>
+    <li style="margin:7px 0;">프롬프트 순서는 <strong>작가 → 퀄리티 → 고정 태그</strong>로 통일했습니다.</li>
+    <li style="margin:7px 0;">퀄리티와 네거티브 프롬프트 랜덤 변경은 아래의 매 장 랜덤 버튼만 기준으로 동작합니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">2. 작가 뽑기와 평가 관리</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">후보 수집이 끝나면 첫 작가의 그림이 바로 표시됩니다.</li>
+    <li style="margin:7px 0;">후보를 전부 확인하면 자동 재수집하지 않고 새 후보를 받을지 먼저 묻습니다.</li>
+    <li style="margin:7px 0;">평가 수정 화면에서 저장된 쿼리 프롬프트를 수정하거나 완전히 삭제할 수 있습니다.</li>
+    <li style="margin:7px 0;">수정한 쿼리는 그림체 제작의 태그별 인원과 제외 조건에도 반영됩니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">3. 그림체 관리</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">목록과 그림을 크게 만들고 선택한 그림의 정보를 오른쪽에 표시하도록 재구성했습니다.</li>
+    <li style="margin:7px 0;">작가·퀄리티와 캐릭터는 항상 표시하고, 네거티브 프롬프트는 토글로 확인합니다.</li>
+    <li style="margin:7px 0;">작가 목록을 NovelAI 가중치 프롬프트 그대로 표시합니다.</li>
+    <li style="margin:7px 0;">여러 그림체를 선택한 뒤 오른쪽 미리보기로 다시 확인하고 한꺼번에 삭제할 수 있습니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">4. Anlas 주의와 모달 디자인</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">28스텝 또는 최대 1,048,576픽셀을 넘으면 Opus 사용자도 Anlas가 차감될 수 있다는 경고를 생성 전에 표시합니다.</li>
+    <li style="margin:7px 0;">1장 생성과 연속 생성 모두 검사하며, 연속 생성은 예정 장수도 함께 알려 줍니다.</li>
+    <li style="margin:7px 0;">삭제·재수집·이름 변경 등에 나오던 브라우저 기본 창을 프로그램 디자인 모달로 교체했습니다.</li>
+  </ul>
+
+  <hr style="margin:26px 0;border:0;border-top:1px solid #3c4655;">
+  <p style="margin:0;text-align:center;">
+    <a href="https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.3" style="display:inline-block;padding:10px 18px;color:#101719;background:#7de0d6;border-radius:8px;text-decoration:none;font-weight:700;">v0.1.3 다운로드 및 상세 내용</a>
+  </p>
+  <p style="margin:12px 0 0;text-align:center;color:#9aa6b5;font-size:13px;">개인 평가, NovelAI App Key, 생성 이미지와 로그인 정보는 배포 파일에 포함되지 않습니다.</p>
+  <p style="margin:5px 0 0;text-align:center;color:#7f8b99;font-size:12px;word-break:break-all;">EXE SHA-256: f5baa52146b0957da39d6190c96c8cf13a4d486ce25a1fa733b1150c486be9d8</p>
+</div>

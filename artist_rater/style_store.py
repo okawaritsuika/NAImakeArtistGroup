@@ -172,6 +172,8 @@ def _stored_result(row):
         "steps": row["steps"],
         "scale": row["scale"],
         "cfg_rescale": row["cfg_rescale"],
+        "variety_plus": bool(row["variety_plus"]) if row["variety_plus"] is not None else None,
+        "skip_cfg_above_sigma": row["skip_cfg_above_sigma"],
         "model": row["model"],
     }
 
@@ -185,7 +187,8 @@ def _find_request(conn, request_id):
                generated_images.height, generated_images.sampler,
                generated_images.noise_schedule,
                generated_images.steps, generated_images.scale,
-               generated_images.cfg_rescale, generated_images.model,
+               generated_images.cfg_rescale, generated_images.variety_plus,
+               generated_images.skip_cfg_above_sigma, generated_images.model,
                art_styles.style_hash
         FROM generated_images
         JOIN art_styles ON art_styles.id = generated_images.style_id
@@ -236,7 +239,8 @@ def reserve_generation_request(db_path, request_id, payload_hash):
                        generated_images.height, generated_images.sampler,
                        generated_images.noise_schedule,
                        generated_images.steps, generated_images.scale,
-                       generated_images.cfg_rescale, generated_images.model,
+                       generated_images.cfg_rescale, generated_images.variety_plus,
+                       generated_images.skip_cfg_above_sigma, generated_images.model,
                        art_styles.style_hash
                 FROM generated_images
                 JOIN art_styles ON art_styles.id = generated_images.style_id
@@ -323,6 +327,10 @@ def save_generated_result(
     artists,
     png_bytes,
     base_prompt="",
+    quality_prompt="",
+    original_quality_prompt="",
+    excluded_quality_tags=None,
+    fixed_prompt="",
     negative_prompt="",
     character_prompts=None,
     combined_prompt="",
@@ -334,6 +342,8 @@ def save_generated_result(
     steps=0,
     scale=0.0,
     cfg_rescale=0.0,
+    variety_plus=False,
+    skip_cfg_above_sigma=None,
     model="",
 ):
     request_id = str(request_id or "")
@@ -349,6 +359,9 @@ def save_generated_result(
     artists_json = json.dumps(normalized_artists, ensure_ascii=False, separators=(",", ":"))
     character_prompts_json = json.dumps(
         character_prompts or [], ensure_ascii=False, separators=(",", ":")
+    )
+    excluded_quality_tags_json = json.dumps(
+        excluded_quality_tags or [], ensure_ascii=False, separators=(",", ":")
     )
     identity_hash = style_hash(normalized_artists)
     artist_prompt = build_artist_prompt(normalized_artists)
@@ -402,17 +415,22 @@ def save_generated_result(
             cursor = conn.execute(
                 """
                 INSERT INTO generated_images (
-                    request_id, style_id, image_path, base_prompt, negative_prompt,
+                    request_id, style_id, image_path, base_prompt, quality_prompt,
+                    original_quality_prompt, excluded_quality_tags_json, fixed_prompt, negative_prompt,
                     character_prompts_json, combined_prompt, artist_prompt,
                     artists_json, seed, width, height, sampler, noise_schedule, steps, scale,
-                    cfg_rescale, model, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cfg_rescale, variety_plus, skip_cfg_above_sigma, model, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     request_id,
                     style_id,
                     relative_path,
                     base_prompt,
+                    quality_prompt,
+                    original_quality_prompt,
+                    excluded_quality_tags_json,
+                    fixed_prompt,
                     negative_prompt,
                     character_prompts_json,
                     combined_prompt,
@@ -426,6 +444,8 @@ def save_generated_result(
                     int(steps),
                     float(scale),
                     float(cfg_rescale),
+                    1 if variety_plus else 0,
+                    skip_cfg_above_sigma,
                     model,
                     timestamp,
                 ),
@@ -473,6 +493,8 @@ def save_generated_result(
             "steps": int(steps),
             "scale": float(scale),
             "cfg_rescale": float(cfg_rescale),
+            "variety_plus": bool(variety_plus),
+            "skip_cfg_above_sigma": skip_cfg_above_sigma,
             "model": model,
         }
     except Exception:
@@ -565,6 +587,63 @@ def list_styles(db_path):
         _parse_json_field(item, "artists_json", "artists")
         styles.append(item)
     return styles
+
+
+def list_generated_images(db_path):
+    conn = connect_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT generated_images.*,
+                   EXISTS(
+                       SELECT 1 FROM confirmed_styles
+                       WHERE source_type='generated' AND source_id=generated_images.id
+                   ) AS confirmed
+            FROM generated_images
+            ORDER BY generated_images.created_at DESC, generated_images.id DESC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    images = []
+    for row in rows:
+        item = dict(row)
+        _parse_json_field(item, "artists_json", "artists")
+        _parse_json_field(item, "character_prompts_json", "character_prompts")
+        _parse_json_field(item, "excluded_quality_tags_json", "excluded_quality_tags")
+        item["confirmed"] = bool(item.get("confirmed"))
+        if item.get("variety_plus") is not None:
+            item["variety_plus"] = bool(item["variety_plus"])
+        images.append(item)
+    return images
+
+
+def delete_generated_image_batch(db_path, generated_dir, image_ids):
+    unique_ids = list(dict.fromkeys(int(image_id) for image_id in image_ids))
+    if not unique_ids:
+        return []
+    placeholders = ",".join("?" for _ in unique_ids)
+    conn = connect_db(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT id,style_id,image_path FROM generated_images WHERE id IN ({placeholders})",
+            unique_ids,
+        ).fetchall()
+        with conn:
+            _delete_generated_images(
+                conn,
+                [row["id"] for row in rows],
+                [row["style_id"] for row in rows],
+                datetime.now(timezone.utc).isoformat(),
+            )
+    finally:
+        conn.close()
+    root = Path(generated_dir).resolve()
+    for row in rows:
+        target = (root / row["image_path"]).resolve()
+        if root in target.parents:
+            target.unlink(missing_ok=True)
+    return [row["id"] for row in rows]
 
 
 def get_style_detail(db_path, style_id):
