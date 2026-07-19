@@ -1219,6 +1219,16 @@ textarea {
   min-width: 0;
 }
 
+.prompt-positive-panel {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.fixed-prompt-editor textarea {
+  min-height: 70px;
+}
+
 .prompt-editor textarea {
   min-height: 90px;
 }

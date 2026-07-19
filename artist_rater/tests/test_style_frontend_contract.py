@@ -293,6 +293,30 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.script)
 
+    def test_fixed_prompt_tags_follow_quality_and_are_kept_out_of_random_presets(self):
+        self.assertIn('id="fixedPrompt"', self.html)
+        self.assertIn('id="fixedPromptAutocomplete"', self.html)
+        self.assertLess(self.html.index('id="basePrompt"'), self.html.index('id="fixedPrompt"'))
+        self.assertIn('function updatePromptTagAutocomplete(input)', self.script)
+        self.assertIn('function handlePromptTagAutocompleteKeydown(event)', self.script)
+        self.assertIn('apiFetch(`/api/tags/autocomplete?q=${encodeURIComponent(query)}`)', self.script)
+        self.assertIn('styleElement("fixedPrompt")?.value', self.script)
+        self.assertIn('combinePromptSections(', self.script)
+
+    def test_all_prompt_textareas_use_danbooru_tag_autocomplete(self):
+        for marker in (
+            'id="basePromptAutocomplete"',
+            'id="fixedPromptAutocomplete"',
+            'id="negativePromptAutocomplete"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        self.assertIn('["basePrompt", "fixedPrompt", "negativePrompt"].forEach((id) => bindPromptTagAutocomplete', self.script)
+        self.assertIn('autocomplete.className = "autocomplete prompt-tag-autocomplete hidden"', self.script)
+        self.assertIn("bindPromptTagAutocomplete(input);", self.script)
+        self.assertIn('Number(item?.category) === 1 ? `artist:${name}` : name', self.script)
+        self.assertIn('fragment.replace(/^artist:/i, "")', self.script)
+
     def test_editor_script_exposes_state_and_required_operations(self):
         source = JS_PATH.read_text(encoding="utf-8")
         for marker in (

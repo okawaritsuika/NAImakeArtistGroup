@@ -17,6 +17,10 @@ const {
   hasProfileDragMoved,
   normalizeStoredPrompts,
   promptStoragePayload,
+  combinePromptSections,
+  currentPromptTagFragment,
+  replaceCurrentPromptTagFragment,
+  formatPromptAutocompleteTag,
   parsePromptTokens,
   appendUniquePromptToken,
   removePromptToken,
@@ -75,6 +79,7 @@ test("prompt storage keeps one normalized snapshot", () => {
     promptStoragePayload(" base ", " negative ", [" char one ", "", " char two "]),
     {
       base_prompt: " base ",
+      fixed_prompt: "",
       negative_prompt: " negative ",
       character_prompts: [" char one ", "", " char two "],
       character_prompt_ids: ["character-1", "character-2", "character-3"],
@@ -86,6 +91,7 @@ test("prompt storage keeps one normalized snapshot", () => {
     normalizeStoredPrompts({ base_prompt: "base", negative_prompt: "neg", character_prompts: ["a", 3, "b"] }),
     {
       base_prompt: "base",
+      fixed_prompt: "",
       negative_prompt: "neg",
       character_prompts: ["a", "b"],
       character_prompt_ids: ["character-1", "character-2"],
@@ -95,12 +101,52 @@ test("prompt storage keeps one normalized snapshot", () => {
   );
   assert.deepEqual(normalizeStoredPrompts(null), {
     base_prompt: "",
+    fixed_prompt: "",
     negative_prompt: "",
     character_prompts: [""],
     character_prompt_ids: ["character-1"],
     prompt_groups: [],
     generation_settings: {},
   });
+});
+
+test("fixed prompt tags persist separately and follow quality tags", () => {
+  const stored = promptStoragePayload(
+    "masterpiece",
+    "lowres",
+    ["1girl"],
+    ["hero"],
+    [],
+    {},
+    "upper body, white sheet",
+  );
+
+  assert.equal(stored.fixed_prompt, "upper body, white sheet");
+  assert.equal(normalizeStoredPrompts(stored).fixed_prompt, "upper body, white sheet");
+  assert.equal(
+    combinePromptSections(stored.base_prompt, stored.fixed_prompt),
+    "masterpiece, upper body, white sheet",
+  );
+  assert.equal(combinePromptSections("", "white sheet"), "white sheet");
+});
+
+test("fixed prompt autocomplete searches and replaces only the tag at the caret", () => {
+  assert.equal(currentPromptTagFragment("upper_body, white sh", 20), "white_sh");
+  assert.equal(currentPromptTagFragment("upper_body, wh sheet, solo", 14), "wh");
+  assert.deepEqual(
+    replaceCurrentPromptTagFragment("upper_body, wh sheet, solo", "white_sheet", 14),
+    { value: "upper_body, white_sheet, solo", cursor: 23 },
+  );
+  assert.deepEqual(
+    replaceCurrentPromptTagFragment("upper_body,\n  wh", "white_sheet", 16),
+    { value: "upper_body,\n  white_sheet", cursor: 25 },
+  );
+});
+
+test("prompt autocomplete prefixes artist tags only in prompt fields", () => {
+  assert.equal(formatPromptAutocompleteTag({ name: "some_artist", category: 1 }), "artist:some_artist");
+  assert.equal(formatPromptAutocompleteTag({ name: "white_sheet", category: 0 }), "white_sheet");
+  assert.equal(formatPromptAutocompleteTag({ name: "some_character", category: 4 }), "some_character");
 });
 
 test("prompt storage preserves generation settings from the website", () => {

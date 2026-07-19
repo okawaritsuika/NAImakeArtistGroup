@@ -374,14 +374,24 @@
                     <div id="excludedPromptTagList" class="excluded-prompt-tag-list"></div>
                   </div>
                 </section>
-                <label id="basePromptPanel" class="field prompt-editor" role="tabpanel" aria-labelledby="basePromptTab">
-                  <span>퀄리티 프롬프트 · 버튼을 누르면 제외 목록으로 이동</span>
-                  <textarea id="basePrompt" placeholder="masterpiece, best quality"></textarea>
-                  <div id="basePromptTokens" class="prompt-token-surface" data-prompt-field="base" aria-label="기본 프롬프트 토큰"></div>
-                </label>
+                <section id="basePromptPanel" class="prompt-positive-panel" role="tabpanel" aria-labelledby="basePromptTab">
+                  <label class="field prompt-editor">
+                    <span>퀄리티 프롬프트 · 버튼을 누르면 제외 목록으로 이동</span>
+                    <textarea id="basePrompt" autocomplete="off" placeholder="masterpiece, best quality"></textarea>
+                    <div id="basePromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
+                    <div id="basePromptTokens" class="prompt-token-surface" data-prompt-field="base" aria-label="기본 프롬프트 토큰"></div>
+                  </label>
+                  <label class="field fixed-prompt-editor">
+                    <span>고정 태그 · 퀄리티 프롬프트 다음에 항상 포함</span>
+                    <textarea id="fixedPrompt" autocomplete="off" placeholder="upper body, white sheet"></textarea>
+                    <div id="fixedPromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
+                    <span class="help-text">자동 추천이나 매 장 랜덤 변경의 영향을 받지 않습니다.</span>
+                  </label>
+                </section>
                 <label id="negativePromptPanel" class="field prompt-editor negative hidden" role="tabpanel" aria-labelledby="negativePromptTab">
                   <span>네거티브 프롬프트</span>
-                  <textarea id="negativePrompt"></textarea>
+                  <textarea id="negativePrompt" autocomplete="off"></textarea>
+                  <div id="negativePromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
                   <div id="negativePromptTokens" class="prompt-token-surface" data-prompt-field="negative" aria-label="네거티브 프롬프트 토큰"></div>
                 </label>
               </div>

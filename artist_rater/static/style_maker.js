@@ -6,6 +6,12 @@ const styleState = {
   styleArtistAutocompleteItems: [],
   styleArtistAutocompleteIndex: -1,
   styleArtistAutocompleteTimer: null,
+  promptTagAutocompleteItems: [],
+  promptTagAutocompleteIndex: -1,
+  promptTagAutocompleteTimer: null,
+  promptTagAutocompleteInput: null,
+  promptTagAutocompleteBox: null,
+  promptTagAutocompleteRequestToken: 0,
   selectedFixedArtistNames: new Set(),
   initialized: false,
   draggingIndex: null,
@@ -413,13 +419,14 @@ function normalizePromptGroup(group, index = 0) {
   };
 }
 
-function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, characterPromptIds = [], promptGroups = [], generationSettings = {}) {
+function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, characterPromptIds = [], promptGroups = [], generationSettings = {}, fixedPrompt = "") {
   const prompts = Array.isArray(characterPrompts)
     ? characterPrompts.map((value) => (typeof value === "string" ? value : ""))
     : [""];
   const ids = prompts.map((_, index) => String(characterPromptIds[index] || `character-${index + 1}`));
   return {
     base_prompt: typeof basePrompt === "string" ? basePrompt : "",
+    fixed_prompt: typeof fixedPrompt === "string" ? fixedPrompt : "",
     negative_prompt: typeof negativePrompt === "string" ? negativePrompt : "",
     character_prompts: prompts,
     character_prompt_ids: ids,
@@ -440,7 +447,55 @@ function normalizeStoredPrompts(value) {
     Array.isArray(value.character_prompt_ids) ? value.character_prompt_ids : [],
     Array.isArray(value.prompt_groups) ? value.prompt_groups : [],
     value.generation_settings && typeof value.generation_settings === "object" ? value.generation_settings : {},
+    typeof value.fixed_prompt === "string" ? value.fixed_prompt : "",
   );
+}
+
+function combinePromptSections(...sections) {
+  return sections
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean)
+    .join(", ");
+}
+
+function promptTagFragmentBounds(value, cursorPosition = String(value || "").length) {
+  const text = String(value || "");
+  const cursor = Math.max(0, Math.min(text.length, Number(cursorPosition) || 0));
+  const before = text.slice(0, cursor);
+  const separatorIndex = Math.max(before.lastIndexOf(","), before.lastIndexOf("\n"));
+  const segmentStart = separatorIndex + 1;
+  const nextComma = text.indexOf(",", cursor);
+  const nextNewline = text.indexOf("\n", cursor);
+  const endings = [nextComma, nextNewline].filter((index) => index >= 0);
+  const segmentEnd = endings.length ? Math.min(...endings) : text.length;
+  const leadingWhitespace = text.slice(segmentStart, cursor).match(/^\s*/)?.[0].length || 0;
+  const trailingWhitespace = text.slice(cursor, segmentEnd).match(/\s*$/)?.[0].length || 0;
+  return {
+    start: segmentStart + leadingWhitespace,
+    end: segmentEnd - trailingWhitespace,
+    cursor,
+  };
+}
+
+function currentPromptTagFragment(value, cursorPosition) {
+  const text = String(value || "");
+  const bounds = promptTagFragmentBounds(text, cursorPosition);
+  return text.slice(bounds.start, bounds.cursor).trim().replace(/\s+/g, "_");
+}
+
+function replaceCurrentPromptTagFragment(value, replacement, cursorPosition) {
+  const text = String(value || "");
+  const bounds = promptTagFragmentBounds(text, cursorPosition);
+  const inserted = String(replacement || "");
+  return {
+    value: `${text.slice(0, bounds.start)}${inserted}${text.slice(bounds.end)}`,
+    cursor: bounds.start + inserted.length,
+  };
+}
+
+function formatPromptAutocompleteTag(item) {
+  const name = String(item?.name || "");
+  return Number(item?.category) === 1 ? `artist:${name}` : name;
 }
 
 function readGenerationSettings() {
@@ -539,6 +594,7 @@ function savePromptDraft() {
   const characterIds = rows.map((row, index) => row.dataset.characterId || `character-${index + 1}`);
   const draft = {
     base_prompt: styleElement("basePrompt")?.value || "",
+    fixed_prompt: styleElement("fixedPrompt")?.value || "",
     negative_prompt: styleElement("negativePrompt")?.value || "",
     character_prompts: characters,
     character_prompt_ids: characterIds,
@@ -551,6 +607,7 @@ function savePromptDraft() {
     characterIds,
     styleState.promptGroups,
     readGenerationSettings(),
+    draft.fixed_prompt,
   );
   try { localStorage.setItem(PROMPT_STORAGE_KEY, JSON.stringify(payload)); } catch (_) { /* Storage can be disabled. */ }
 }
@@ -802,6 +859,7 @@ function persistAndRenderPromptControls() {
 
 function selectPromptTab(tabName) {
   const selected = tabName === "negative" ? "negative" : "base";
+  hidePromptTagAutocomplete();
   document.querySelectorAll("[data-prompt-tab]").forEach((button) => {
     const active = button.dataset.promptTab === selected;
     button.classList.toggle("active", active);
@@ -814,6 +872,7 @@ function selectPromptTab(tabName) {
 
 function setPromptViewMode(mode) {
   const textMode = mode === "text";
+  if (!textMode) hidePromptTagAutocomplete();
   document.querySelector(".prompt-workspace")?.classList.toggle("prompt-text-mode", textMode);
   const button = styleElement("togglePromptView");
   if (button) {
@@ -1772,6 +1831,103 @@ function handleStyleArtistAutocompleteKeydown(event) {
   }
 }
 
+function hidePromptTagAutocomplete() {
+  styleState.promptTagAutocompleteBox?.classList.add("hidden");
+  styleState.promptTagAutocompleteItems = [];
+  styleState.promptTagAutocompleteIndex = -1;
+  styleState.promptTagAutocompleteInput = null;
+  styleState.promptTagAutocompleteBox = null;
+}
+
+function setPromptTagAutocompleteIndex(index) {
+  const box = styleState.promptTagAutocompleteBox;
+  if (!box || !styleState.promptTagAutocompleteItems.length) return;
+  styleState.promptTagAutocompleteIndex = (index + styleState.promptTagAutocompleteItems.length) % styleState.promptTagAutocompleteItems.length;
+  box.querySelectorAll("button").forEach((button, buttonIndex) => {
+    button.classList.toggle("active", buttonIndex === styleState.promptTagAutocompleteIndex);
+  });
+}
+
+function applyPromptTagAutocomplete(index = styleState.promptTagAutocompleteIndex) {
+  const input = styleState.promptTagAutocompleteInput;
+  const item = styleState.promptTagAutocompleteItems[index];
+  if (!input || !item) return;
+  const result = replaceCurrentPromptTagFragment(input.value, formatPromptAutocompleteTag(item), input.selectionStart);
+  input.value = result.value;
+  input.setSelectionRange(result.cursor, result.cursor);
+  hidePromptTagAutocomplete();
+  input.focus();
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  clearTimeout(styleState.promptTagAutocompleteTimer);
+  styleState.promptTagAutocompleteTimer = null;
+}
+
+async function updatePromptTagAutocomplete(input) {
+  const box = input?.closest(".field")?.querySelector(".prompt-tag-autocomplete");
+  if (!input || !box) return;
+  const fragment = currentPromptTagFragment(input.value, input.selectionStart);
+  const query = fragment.replace(/^artist:/i, "");
+  if (query.length < 2) {
+    hidePromptTagAutocomplete();
+    return;
+  }
+  if (styleState.promptTagAutocompleteBox && styleState.promptTagAutocompleteBox !== box) {
+    styleState.promptTagAutocompleteBox.classList.add("hidden");
+  }
+  const requestToken = ++styleState.promptTagAutocompleteRequestToken;
+  styleState.promptTagAutocompleteInput = input;
+  styleState.promptTagAutocompleteBox = box;
+  try {
+    const items = await apiFetch(`/api/tags/autocomplete?q=${encodeURIComponent(query)}`);
+    if (requestToken !== styleState.promptTagAutocompleteRequestToken || styleState.promptTagAutocompleteInput !== input) return;
+    styleState.promptTagAutocompleteItems = Array.isArray(items) ? items : [];
+    styleState.promptTagAutocompleteIndex = -1;
+    box.replaceChildren();
+    styleState.promptTagAutocompleteItems.forEach((item, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      const name = document.createElement("span");
+      name.textContent = item.name;
+      const detail = document.createElement("span");
+      detail.textContent = `${item.category_name || "other"} · ${item.post_count || 0}`;
+      button.append(name, detail);
+      button.addEventListener("mouseenter", () => setPromptTagAutocompleteIndex(index));
+      button.addEventListener("click", () => applyPromptTagAutocomplete(index));
+      box.append(button);
+    });
+    box.classList.toggle("hidden", !styleState.promptTagAutocompleteItems.length);
+  } catch {
+    if (requestToken === styleState.promptTagAutocompleteRequestToken) hidePromptTagAutocomplete();
+  }
+}
+
+function handlePromptTagAutocompleteKeydown(event) {
+  const box = styleState.promptTagAutocompleteBox;
+  if (styleState.promptTagAutocompleteInput !== event.currentTarget || !box || box.classList.contains("hidden") || !styleState.promptTagAutocompleteItems.length) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setPromptTagAutocompleteIndex(styleState.promptTagAutocompleteIndex + 1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setPromptTagAutocompleteIndex(styleState.promptTagAutocompleteIndex <= 0 ? styleState.promptTagAutocompleteItems.length - 1 : styleState.promptTagAutocompleteIndex - 1);
+  } else if (event.key === "Enter" && styleState.promptTagAutocompleteIndex >= 0) {
+    event.preventDefault();
+    applyPromptTagAutocomplete();
+  } else if (event.key === "Escape") {
+    hidePromptTagAutocomplete();
+  }
+}
+
+function bindPromptTagAutocomplete(input) {
+  if (!input || input.dataset.tagAutocompleteBound === "true") return;
+  input.dataset.tagAutocompleteBound = "true";
+  input.addEventListener("input", () => {
+    clearTimeout(styleState.promptTagAutocompleteTimer);
+    styleState.promptTagAutocompleteTimer = setTimeout(() => updatePromptTagAutocomplete(input), 220);
+  });
+  input.addEventListener("keydown", handlePromptTagAutocompleteKeydown);
+}
+
 function filteredRatedArtists() {
   const query = (styleElement("styleArtistSearch")?.value || "").trim().toLowerCase();
   return styleState.ratedArtists.filter((item) => !query || item.artist.toLowerCase().includes(query));
@@ -1877,12 +2033,16 @@ function addCharacterPrompt(value = "", characterId = createRequestId()) {
   const input = document.createElement("textarea");
   input.placeholder = "캐릭터 프롬프트";
   input.value = value;
+  input.autocomplete = "off";
+  const autocomplete = document.createElement("div");
+  autocomplete.className = "autocomplete prompt-tag-autocomplete hidden";
   const tokens = document.createElement("div");
   tokens.className = "prompt-token-surface";
   tokens.dataset.promptField = "character";
   tokens.setAttribute("aria-label", "캐릭터 프롬프트 토큰");
   input.addEventListener("input", persistAndRenderPromptControls);
-  editor.append(input, tokens);
+  bindPromptTagAutocomplete(input);
+  editor.append(input, autocomplete, tokens);
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "icon-button danger-button";
@@ -1890,6 +2050,7 @@ function addCharacterPrompt(value = "", characterId = createRequestId()) {
   remove.setAttribute("aria-label", "캐릭터 프롬프트 삭제");
   remove.textContent = "×";
   remove.addEventListener("click", () => {
+    if (styleState.promptTagAutocompleteInput === input) hidePromptTagAutocomplete();
     row.remove();
     if (!styleElement("characterPromptList")?.children.length) addCharacterPrompt();
     persistAndRenderPromptControls();
@@ -1940,7 +2101,10 @@ function buildGenerationRequest(requestId = createRequestId()) {
     request_id: requestId,
     artists: chooseArtistsForPrompt(styleState.artists)
       .map(({ artist, score, weight }) => ({ artist, score, weight })),
-    base_prompt: buildEffectivePromptText(styleElement("basePrompt")?.value, "base", "", styleState.promptGroups),
+    base_prompt: combinePromptSections(
+      buildEffectivePromptText(styleElement("basePrompt")?.value, "base", "", styleState.promptGroups),
+      styleElement("fixedPrompt")?.value,
+    ),
     negative_prompt: buildEffectivePromptText(styleElement("negativePrompt")?.value, "negative", "", styleState.promptGroups),
     character_prompts: readCharacterPrompts(),
     width,
@@ -2409,6 +2573,8 @@ function initializeStyleMaker() {
     fixPromptPresetAfterManualEdit();
     persistAndRenderPromptControls();
   }));
+  styleElement("fixedPrompt")?.addEventListener("input", savePromptDraft);
+  ["basePrompt", "fixedPrompt", "negativePrompt"].forEach((id) => bindPromptTagAutocomplete(styleElement(id)));
   styleElement("promptPresetMode")?.addEventListener("change", (event) => {
     styleState.promptPresetMode = event.target.value === "fixed" ? "fixed" : "auto";
     savePromptPresetSettings();
@@ -2495,6 +2661,7 @@ function initializeStyleMaker() {
   styleState.promptGroups = storedPrompts.prompt_groups;
   applyGenerationSettings(storedPrompts.generation_settings);
   styleElement("basePrompt").value = storedPrompts.base_prompt;
+  styleElement("fixedPrompt").value = storedPrompts.fixed_prompt;
   styleElement("negativePrompt").value = storedPrompts.negative_prompt;
   storedPrompts.character_prompts.forEach((value, index) => addCharacterPrompt(value, storedPrompts.character_prompt_ids[index]));
   styleState.promptGroups = cleanPromptGroups(styleState.promptGroups, storedPrompts);
@@ -2566,6 +2733,10 @@ if (typeof module !== "undefined" && module.exports) {
     hasProfileDragMoved,
     normalizeStoredPrompts,
     promptStoragePayload,
+    combinePromptSections,
+    currentPromptTagFragment,
+    replaceCurrentPromptTagFragment,
+    formatPromptAutocompleteTag,
     parsePromptTokens,
     appendUniquePromptToken,
     removePromptToken,
