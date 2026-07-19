@@ -38,6 +38,9 @@ class FakeResponse:
 
 
 class LauncherControllerTest(unittest.TestCase):
+    def test_packaged_version_matches_next_release(self):
+        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.1")
+
     def test_launcher_theme_uses_light_apple_style_tokens(self):
         self.assertEqual(launcher.LAUNCHER_THEME["window_bg"], "#f5f5f7")
         self.assertEqual(launcher.LAUNCHER_THEME["card_bg"], "#ffffff")

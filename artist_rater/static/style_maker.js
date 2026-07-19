@@ -263,13 +263,18 @@ function normalizeFixedArtistSlot(item, fallbackSlot) {
   return Number.isInteger(slot) && slot >= 1 ? slot : fallbackSlot;
 }
 
-function moveStyleArtistToPosition(currentArtists, sourceIndex, oneBasedPosition) {
+function moveStyleArtistToPosition(currentArtists, sourceIndex, oneBasedPosition, maxPosition = null) {
   const artists = Array.isArray(currentArtists) ? currentArtists : [];
   if (!artists[sourceIndex]) return artists.map((item) => ({ ...item }));
-  const target = Math.min(artists.length - 1, Math.max(0, Math.trunc(Number(oneBasedPosition)) - 1));
+  const requested = Math.trunc(Number(oneBasedPosition));
+  const slotLimit = Number.isInteger(maxPosition) && maxPosition >= 1
+    ? maxPosition
+    : artists.length + 1;
+  const slot = Math.min(slotLimit, Math.max(1, Number.isInteger(requested) ? requested : 1));
+  const target = Math.min(artists.length - 1, slot - 1);
   return reorderArtists(artists, sourceIndex, target).map((item, index) => (
     item.fixed === true && item.artist === artists[sourceIndex].artist
-      ? { ...item, slot: Math.trunc(Number(oneBasedPosition)) }
+      ? { ...item, slot }
       : { ...item }
   ));
 }
@@ -280,15 +285,20 @@ function graphInsertionPositionFromRatio(ratio, artistCount) {
   return Math.min(count, Math.max(1, Math.round(normalized * (count - 1)) + 1));
 }
 
-function moveSelectedArtistsToPosition(currentArtists, sourceIndexes, oneBasedInsertionPosition) {
+function moveSelectedArtistsToPosition(currentArtists, sourceIndexes, oneBasedInsertionPosition, maxPosition = null) {
   const artists = Array.isArray(currentArtists) ? currentArtists : [];
   const selected = Array.from(new Set(sourceIndexes.map(Number)))
     .filter((index) => Number.isInteger(index) && artists[index])
     .sort((a, b) => a - b);
   if (!selected.length) return artists.map((item) => ({ ...item }));
   const selectedSet = new Set(selected);
-  const insertBefore = Math.min(artists.length + 1, Math.max(1, Math.trunc(Number(oneBasedInsertionPosition))));
-  const slot = Math.min(artists.length + 1, Math.max(1, Math.trunc(Number(oneBasedInsertionPosition))));
+  const requested = Math.trunc(Number(oneBasedInsertionPosition));
+  const normalizedPosition = Number.isInteger(requested) ? requested : 1;
+  const insertBefore = Math.min(artists.length + 1, Math.max(1, normalizedPosition));
+  const slotLimit = Number.isInteger(maxPosition) && maxPosition >= 1
+    ? maxPosition
+    : artists.length + 1;
+  const slot = Math.min(slotLimit, Math.max(1, normalizedPosition));
   const moved = selected.map((index) => (
     artists[index]?.fixed === true ? { ...artists[index], slot } : { ...artists[index] }
   ));
@@ -1232,7 +1242,6 @@ function removeStyleArtist(index) {
   const removed = styleState.artists[index];
   if (removed) styleState.selectedFixedArtistNames.delete(removed.artist);
   styleState.artists.splice(index, 1);
-  syncStyleArtistCountInputs();
   renderWeightGraph();
   renderRatedArtistSelect();
 }
@@ -1246,12 +1255,6 @@ function swapStyleArtists(a, b) {
 function sortStyleArtists(direction) {
   styleState.artists = sortArtistsByWeight(styleState.artists, direction);
   renderWeightGraph();
-}
-
-function syncStyleArtistCountInputs() {
-  if (styleElement("styleArtistCount")) {
-    styleElement("styleArtistCount").value = String(Math.max(1, styleState.artists.length));
-  }
 }
 
 function renderStyleArtistListTarget(list) {
@@ -1271,12 +1274,12 @@ function renderStyleArtistListTarget(list) {
     const position = document.createElement("input");
     position.type = "number";
     position.min = "1";
-    position.max = String(styleState.artists.length + 1);
+    position.max = String(styleSlotCount());
     position.value = String(normalizeFixedArtistSlot(item, index + 1));
     position.title = "순서";
     position.setAttribute("aria-label", `${item.artist} 순서`);
     position.addEventListener("change", () => {
-      styleState.artists = moveStyleArtistToPosition(styleState.artists, index, position.value);
+      styleState.artists = moveStyleArtistToPosition(styleState.artists, index, position.value, styleSlotCount());
       renderWeightGraph();
     });
 
@@ -1429,7 +1432,7 @@ function moveFixedArtistByGraphDrop(graph, event) {
   }
   if (!sourceIndexes.length) sourceIndexes = [Number(event.dataTransfer.getData("application/x-fixed-style-artist"))];
   const targetPosition = graphInsertionPositionForEvent(graph, event);
-  styleState.artists = moveSelectedArtistsToPosition(styleState.artists, sourceIndexes, targetPosition);
+  styleState.artists = moveSelectedArtistsToPosition(styleState.artists, sourceIndexes, targetPosition, styleSlotCount());
   renderWeightGraph();
 }
 
@@ -1511,12 +1514,12 @@ function renderWeightGraphFixedArtistOverlays(graph) {
     const position = document.createElement("input");
     position.type = "number";
     position.min = "1";
-    position.max = String(styleState.artists.length + 1);
+    position.max = String(slotCount);
     position.value = String(slot);
     position.title = "순서";
     position.setAttribute("aria-label", `${item.artist} 순서`);
     position.addEventListener("change", () => {
-      styleState.artists = moveSelectedArtistsToPosition(styleState.artists, [index], position.value);
+      styleState.artists = moveSelectedArtistsToPosition(styleState.artists, [index], position.value, slotCount);
       renderWeightGraph();
     });
 
@@ -1798,7 +1801,6 @@ function addStyleArtist() {
   const weight = clampStyleWeight(styleElement("styleArtistWeight")?.value || 1);
   styleState.artists = insertStyleArtistsAtPosition(styleState.artists, names, { position, weight });
   const added = fixedStyleArtistEntries(styleState.artists).length - beforeFixedCount;
-  syncStyleArtistCountInputs();
   if (input && added > 0) input.value = "";
   hideStyleArtistAutocomplete();
   renderWeightGraph();
@@ -2480,6 +2482,7 @@ function initializeStyleMaker() {
     "sharedStyleArtistMax",
   ].forEach((id) => styleElement(id)?.addEventListener("change", savePromptDraft));
   ["styleMinWeight", "styleMaxWeight"].forEach((id) => styleElement(id)?.addEventListener("change", renderWeightGraph));
+  styleElement("styleArtistCount")?.addEventListener("change", renderWeightGraph);
   styleElement("openWeightGraph")?.addEventListener("click", openWeightGraphModal);
   styleElement("closeWeightGraph")?.addEventListener("click", closeWeightGraphModal);
   document.querySelectorAll("[data-close-weight-graph]").forEach((item) => item.addEventListener("click", closeWeightGraphModal));

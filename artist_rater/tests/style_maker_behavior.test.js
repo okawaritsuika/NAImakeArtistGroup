@@ -301,6 +301,19 @@ test("selected fixed artists move together into an insertion slot", () => {
   assert.deepEqual(current.map((item) => item.artist), ["a", "b", "c", "d", "e"]);
 });
 
+test("a fixed artist can move across the configured prompt slots", () => {
+  const current = [{ artist: "fixed", weight: 1.0, fixed: true, slot: 1 }];
+
+  assert.deepEqual(
+    moveSelectedArtistsToPosition(current, [0], 12, 12),
+    [{ artist: "fixed", weight: 1.0, fixed: true, slot: 12 }],
+  );
+  assert.deepEqual(
+    moveStyleArtistToPosition(current, 0, 8, 12),
+    [{ artist: "fixed", weight: 1.0, fixed: true, slot: 8 }],
+  );
+});
+
 test("graph insertion position maps pointer ratio to visible between-item slots", () => {
   assert.equal(graphInsertionPositionFromRatio(-0.2, 5), 1);
   assert.equal(graphInsertionPositionFromRatio(0, 5), 1);

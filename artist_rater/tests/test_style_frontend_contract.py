@@ -143,6 +143,19 @@ class StyleFrontendContractTest(unittest.TestCase):
             self.html.index('id="artistPromptPreview"'),
         )
 
+    def test_style_settings_have_collapsible_groups_and_one_outer_scroll(self):
+        self.assertNotIn('id="toggleStyleSettingsBody"', self.html)
+        for label in ("작가 구성", "허용 평점", "가중치 설정", "가중치 표"):
+            with self.subTest(label=label):
+                self.assertIn(f"<summary>{label}</summary>", self.html)
+        self.assertGreaterEqual(self.html.count('class="style-settings-section" open'), 3)
+        self.assertIn(".style-settings-body", self.css)
+        self.assertIn("overflow-y: auto", self.css)
+        self.assertIn("scrollbar-gutter: stable", self.css)
+        artist_list_start = self.css.index(".style-artist-list {")
+        artist_list_end = self.css.index("}", artist_list_start)
+        self.assertIn("overflow: visible", self.css[artist_list_start:artist_list_end])
+
     def test_weight_graph_edits_fixed_artists_as_overlays_not_bottom_table(self):
         overlay_start = self.script.index("function renderWeightGraphFixedArtistOverlays")
         overlay_end = self.script.index("function renderWeightGraph()", overlay_start)

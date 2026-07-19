@@ -535,6 +535,39 @@ textarea {
   overflow: auto;
 }
 
+.style-settings-body {
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.style-settings-section {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #11161d;
+}
+
+.style-settings-section > summary {
+  padding: 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+}
+
+.style-settings-section[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.style-settings-section > .style-settings-section-body {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
 .style-fieldset {
   display: grid;
   gap: 8px;
@@ -983,10 +1016,6 @@ textarea {
 }
 
 .style-artist-list-section {
-  display: grid;
-  gap: 8px;
-  padding: 10px 0 0;
-  border-top: 1px solid var(--line);
   min-height: 0;
 }
 
@@ -1002,9 +1031,7 @@ textarea {
 .style-artist-list {
   display: grid;
   gap: 6px;
-  max-height: 220px;
-  overflow: auto;
-  padding-right: 2px;
+  overflow: visible;
 }
 
 .style-artist-row {
