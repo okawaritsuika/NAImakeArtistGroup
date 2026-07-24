@@ -7,6 +7,7 @@ const styleState = {
   styleArtistAutocompleteIndex: -1,
   styleArtistAutocompleteTimer: null,
   styleArtistAutocompleteRequestToken: 0,
+  styleArtistAutocompleteContext: "main",
   promptTagAutocompleteItems: [],
   promptTagAutocompleteIndex: -1,
   promptTagAutocompleteTimer: null,
@@ -39,9 +40,21 @@ const styleState = {
   managerPageCount: 1,
   managerDescriptions: false,
   managerFilterTimer: null,
+  managerImageLoadToken: 0,
   confirmedModalSource: null,
   confirmedModalFile: null,
   confirmedModalObjectUrl: "",
+  confirmedModalPreviewData: null,
+  confirmedImportGroups: [],
+  confirmedImportGroupIndex: 0,
+  confirmedImportImageIndex: 0,
+  confirmedImportBusy: false,
+  confirmedDuplicatePanelOpen: false,
+  confirmedDuplicateStyleIndex: 0,
+  confirmedDuplicateImageIndex: 0,
+  confirmedFolderFiles: [],
+  confirmedFolderPreviewUrls: [],
+  confirmedFolderPending: false,
   confirmedModalExcludedTags: [],
   confirmedModalOriginalQualityPrompt: "",
   confirmedModalEditId: null,
@@ -53,6 +66,7 @@ const styleState = {
   promptPresets: [],
   selectedPromptPresetKey: "",
   promptPresetRequestToken: 0,
+  promptPresetModalIndex: 0,
   lastPromptPresetArtistSignature: "",
   excludedPromptTags: [],
   suppressAutomaticPromptPreset: false,
@@ -60,6 +74,7 @@ const styleState = {
     { position: 0, weight: 0.1 },
     { position: 1, weight: 2.3 },
   ],
+  weightTableSortMode: "default",
 };
 
 const PROMPT_STORAGE_KEY = "naiArtistRater.prompts.v1";
@@ -76,8 +91,6 @@ const STYLE_REQUEST_CONTROL_IDS = [
   "rerollStyleArtists",
   "rerollStyleWeights",
   "rerollStyleAll",
-  "sortStyleAsc",
-  "sortStyleDesc",
   "styleArtistCount",
   "sharedStyleArtistMin",
   "sharedStyleArtistMax",
@@ -149,11 +162,12 @@ function buildStyleRequestPayload(options, artists, reroll) {
   const payload = { ...options, reroll };
   payload.fixed_artists = artists
     .filter((item) => item.fixed === true)
-    .map(({ artist, score, weight, slot }) => ({
+    .map(({ artist, score, weight, slot, random_weight }) => ({
       artist,
       score,
       weight,
       ...(Number.isInteger(Number(slot)) ? { slot: Number(slot) } : {}),
+      ...(random_weight === true ? { random_weight: true } : {}),
     }));
   if (reroll !== "all") {
     payload.artists = artists.map(({ artist, score, weight }) => ({ artist, score, weight }));
@@ -163,7 +177,9 @@ function buildStyleRequestPayload(options, artists, reroll) {
 
 function applyStyleRerollResult(currentArtists, incomingArtists, reroll, preserveOrder = false) {
   const fixedByArtist = new Map((currentArtists || [])
-    .map((item) => [item.artist, item.fixed === true ? { fixed: true, slot: item.slot } : { fixed: false }]));
+    .map((item) => [item.artist, item.fixed === true
+      ? { fixed: true, slot: item.slot, random_weight: item.random_weight === true }
+      : { fixed: false }]));
   const incomingNames = new Set((incomingArtists || []).map((item) => item.artist));
   const fixedAdditions = (currentArtists || [])
     .filter((item) => item.fixed === true && !incomingNames.has(item.artist))
@@ -171,7 +187,12 @@ function applyStyleRerollResult(currentArtists, incomingArtists, reroll, preserv
   const merged = (incomingArtists || []).map((item) => {
     const fixed = fixedByArtist.get(item.artist);
     if (!fixed?.fixed) return { ...item };
-    return fixed.slot ? { ...item, fixed: true, slot: fixed.slot } : { ...item, fixed: true };
+    return {
+      ...item,
+      fixed: true,
+      ...(Number.isInteger(Number(fixed.slot)) ? { slot: Number(fixed.slot) } : {}),
+      ...(fixed.random_weight ? { random_weight: true } : {}),
+    };
   }).concat(fixedAdditions);
   if (reroll !== "all" || preserveOrder) return merged;
   return sortArtistsByWeight(merged, "asc");
@@ -245,19 +266,28 @@ function parseStyleArtistNames(text) {
 function parseStyleArtistEntries(text) {
   const names = [];
   const seen = new Set();
-  String(text || "")
-    .split(/[,\n;]+/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .forEach((value) => {
-      const match = value.match(/^(?:(\d+(?:\.\d+)?)::)?(?:artist:)?(.+?)(?:::)?$/i);
-      const artist = (match?.[2] || "").trim();
-      if (!artist) return;
-      if (seen.has(artist)) return;
-      const weight = match?.[1] === undefined ? undefined : Number(match[1]);
-      names.push(Number.isFinite(weight) && weight > 0 ? { artist, weight } : { artist });
-      seen.add(artist);
-    });
+  const source = String(text || "");
+  const weightedBlocks = [...source.matchAll(/(\d+(?:\.\d+)?)\s*::\s*artist:\s*(.*?)::/gis)];
+  const values = weightedBlocks.length
+    ? weightedBlocks.flatMap((match) => String(match[2] || "")
+      .split(/[,\n;]+/)
+      .map((artist) => ({ artist: artist.trim(), weight: Number(match[1]) })))
+    : source
+      .split(/[,\n;]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .map((value) => {
+        const match = value.match(/^(?:(\d+(?:\.\d+)?)\s*::\s*)?(?:artist:\s*)?(.+?)(?:::)?$/i);
+        return {
+          artist: (match?.[2] || "").trim(),
+          weight: match?.[1] === undefined ? undefined : Number(match[1]),
+        };
+      });
+  values.forEach(({ artist, weight }) => {
+    if (!artist || seen.has(artist)) return;
+    names.push(Number.isFinite(weight) && weight > 0 ? { artist, weight } : { artist });
+    seen.add(artist);
+  });
   return names;
 }
 
@@ -267,8 +297,9 @@ function insertStyleArtistsAtPosition(currentArtists, artistNames, options = {})
   const normalizedWeight = Number.isFinite(weight) && weight > 0 ? Number(weight.toFixed(2)) : 1;
   const requestedPosition = Number(options.position);
   const slot = Number.isInteger(requestedPosition)
-    ? Math.max(1, requestedPosition)
+    ? Math.max(0, requestedPosition)
     : current.length + 1;
+  const randomWeight = options.randomWeight === true;
   const remaining = current.map((item) => ({ ...item }));
   const additions = [];
   const requestedArtists = (Array.isArray(artistNames) ? artistNames : [artistNames]).flatMap((item) => (
@@ -276,12 +307,11 @@ function insertStyleArtistsAtPosition(currentArtists, artistNames, options = {})
       ? [{ artist: String(item.artist || "").trim(), weight: item.weight }]
       : parseStyleArtistEntries(item)
   ));
-  const sequentialSlots = requestedArtists.length > 1
-    && requestedArtists.every((entry) => Number.isFinite(Number(entry.weight)) && Number(entry.weight) > 0);
+  const sequentialSlots = requestedArtists.length > 1;
   requestedArtists.forEach((entry, entryIndex) => {
     const artist = entry.artist;
     if (!artist) return;
-    const artistSlot = sequentialSlots ? slot + entryIndex : slot;
+    const artistSlot = slot === 0 ? 0 : (sequentialSlots ? slot + entryIndex : slot);
     const entryWeight = Number(entry.weight);
     const artistWeight = Number.isFinite(entryWeight) && entryWeight > 0
       ? Number(entryWeight.toFixed(2))
@@ -293,10 +323,16 @@ function insertStyleArtistsAtPosition(currentArtists, artistNames, options = {})
         remaining.splice(existingIndex, 0, existing);
         return;
       }
-      additions.push({ ...existing, weight: artistWeight, fixed: true, slot: artistSlot });
+      additions.push({
+        ...existing, weight: artistWeight, fixed: true, slot: artistSlot,
+        ...(randomWeight ? { random_weight: true } : {}),
+      });
       return;
     }
-    additions.push({ artist, weight: artistWeight, fixed: true, slot: artistSlot });
+    additions.push({
+      artist, weight: artistWeight, fixed: true, slot: artistSlot,
+      ...(randomWeight ? { random_weight: true } : {}),
+    });
   });
   const insertAt = Number.isInteger(requestedPosition)
     ? Math.min(remaining.length, Math.max(0, requestedPosition - 1))
@@ -320,19 +356,27 @@ function updateStyleArtistAtIndex(currentArtists, index, changes = {}) {
       const weight = Number(changes.weight);
       if (Number.isFinite(weight) && weight > 0) next.weight = Number(weight.toFixed(2));
     }
+    if (Object.prototype.hasOwnProperty.call(changes, "random_weight")) {
+      next.random_weight = changes.random_weight === true;
+    }
     return next;
   });
 }
 
 function normalizeFixedArtistSlot(item, fallbackSlot) {
   const slot = Number(item?.slot);
-  return Number.isInteger(slot) && slot >= 1 ? slot : fallbackSlot;
+  return Number.isInteger(slot) && slot >= 0 ? slot : fallbackSlot;
 }
 
 function moveStyleArtistToPosition(currentArtists, sourceIndex, oneBasedPosition, maxPosition = null) {
   const artists = Array.isArray(currentArtists) ? currentArtists : [];
   if (!artists[sourceIndex]) return artists.map((item) => ({ ...item }));
   const requested = Math.trunc(Number(oneBasedPosition));
+  if (requested === 0) {
+    return artists.map((item, index) => (
+      index === sourceIndex && item.fixed === true ? { ...item, slot: 0 } : { ...item }
+    ));
+  }
   const slotLimit = Number.isInteger(maxPosition) && maxPosition >= 1
     ? maxPosition
     : artists.length + 1;
@@ -360,6 +404,11 @@ function moveSelectedArtistsToPosition(currentArtists, sourceIndexes, oneBasedIn
   const selectedSet = new Set(selected);
   const requested = Math.trunc(Number(oneBasedInsertionPosition));
   const normalizedPosition = Number.isInteger(requested) ? requested : 1;
+  if (normalizedPosition === 0) {
+    return artists.map((item, index) => (
+      selectedSet.has(index) && item.fixed === true ? { ...item, slot: 0 } : { ...item }
+    ));
+  }
   const insertBefore = Math.min(artists.length + 1, Math.max(1, normalizedPosition));
   const slotLimit = Number.isInteger(maxPosition) && maxPosition >= 1
     ? maxPosition
@@ -415,23 +464,38 @@ function fixedArtistSlotEntries(artists) {
   return fixed.map((entry) => ({ ...entry, stackSize: sizes.get(entry.slot) || 1 }));
 }
 
-function chooseArtistsForPrompt(artists, randomFn = Math.random) {
+function chooseArtistsForPrompt(artists, randomFn = Math.random, options = {}) {
   const source = Array.isArray(artists) ? artists : [];
   const fixedBySlot = new Map();
   fixedArtistSlotEntries(source).forEach((entry) => {
+    if (entry.slot === 0) return;
     if (!fixedBySlot.has(entry.slot)) fixedBySlot.set(entry.slot, []);
     fixedBySlot.get(entry.slot).push(entry.artist);
   });
   const usedSlots = new Set();
-  return source.flatMap((item, index) => {
+  const selected = source.flatMap((item, index) => {
     if (item.fixed !== true) return [{ ...item }];
     const slot = normalizeFixedArtistSlot(item, index + 1);
+    if (slot === 0) return [{ ...item }];
     if (usedSlots.has(slot)) return [];
     usedSlots.add(slot);
     const group = fixedBySlot.get(slot) || [item];
     const chosenIndex = Math.min(group.length - 1, Math.max(0, Math.floor(randomFn() * group.length)));
     return [{ ...group[chosenIndex] }];
   });
+  const randomOrder = selected.filter((item) => item.fixed === true && normalizeFixedArtistSlot(item, 1) === 0);
+  const ordered = selected.filter((item) => !(item.fixed === true && normalizeFixedArtistSlot(item, 1) === 0));
+  randomOrder.forEach((item) => {
+    const target = Math.min(ordered.length, Math.max(0, Math.floor(randomFn() * (ordered.length + 1))));
+    ordered.splice(target, 0, item);
+  });
+  const minimum = Number.isFinite(Number(options.minWeight)) ? Number(options.minWeight) : styleNumber("styleMinWeight", 0.1);
+  const maximum = Number.isFinite(Number(options.maxWeight)) ? Number(options.maxWeight) : styleNumber("styleMaxWeight", 2.3);
+  const minCents = Math.max(1, Math.ceil(Math.min(minimum, maximum) * 100));
+  const maxCents = Math.max(minCents, Math.floor(Math.max(minimum, maximum) * 100));
+  return ordered.map((item) => item.random_weight === true
+    ? { ...item, weight: (minCents + Math.floor(randomFn() * (maxCents - minCents + 1))) / 100 }
+    : { ...item });
 }
 
 function hasProfileDragMoved(startX, startY, currentX, currentY) {
@@ -847,27 +911,21 @@ function excludeBasePromptToken(token) {
 }
 
 function renderPromptPresetOptions() {
-  const select = styleElement("promptPresetSelect");
-  if (!select) return;
-  select.replaceChildren();
+  const button = styleElement("openPromptPresetModal");
+  const text = styleElement("promptPresetButtonText");
   if (!styleState.promptPresets.length) {
-    select.add(new Option("사용 가능한 수집 세트가 없습니다.", ""));
-    select.disabled = true;
-    const applyButton = styleElement("applyPromptPreset");
-    if (applyButton) applyButton.disabled = true;
+    if (text) text.textContent = "사용 가능한 수집 세트가 없습니다.";
+    if (button) button.disabled = true;
     return;
   }
-  styleState.promptPresets.forEach((preset, index) => {
-    const match = preset.match_count ? ` · 작가 ${preset.match_count}명 일치` : "";
-    const sample = ` · 표본 ${preset.sample_count || 1}`;
-    select.add(new Option(`${index + 1}. ${preset.base_prompt || preset.quality_prompt}${match}${sample}`, preset.key));
-  });
   const selectedExists = styleState.promptPresets.some((preset) => preset.key === styleState.selectedPromptPresetKey);
   if (!selectedExists) styleState.selectedPromptPresetKey = styleState.promptPresets[0].key;
-  select.value = styleState.selectedPromptPresetKey;
-  select.disabled = false;
-  const applyButton = styleElement("applyPromptPreset");
-  if (applyButton) applyButton.disabled = false;
+  const selected = styleState.promptPresets.find((preset) => preset.key === styleState.selectedPromptPresetKey);
+  if (text) {
+    const modified = selected?.modified ? " · 수정됨" : "";
+    text.textContent = `수집 프롬프트 갤러리 열기 · ${styleState.promptPresets.length}개${modified}`;
+  }
+  if (button) button.disabled = false;
 }
 
 function applyPromptPreset(preset) {
@@ -878,8 +936,7 @@ function applyPromptPreset(preset) {
     ? preset.excluded_tags.map((item) => ({ tag: String(item?.tag || ""), prompt: String(item?.prompt || "") })).filter((item) => item.prompt)
     : [];
   styleState.selectedPromptPresetKey = preset.key || "";
-  const select = styleElement("promptPresetSelect");
-  if (select) select.value = styleState.selectedPromptPresetKey;
+  renderPromptPresetOptions();
   persistAndRenderPromptControls();
   renderExcludedPromptTags();
   savePromptPresetSettings();
@@ -887,6 +944,139 @@ function applyPromptPreset(preset) {
   const excluded = styleState.excludedPromptTags.length ? ` · 인물 태그 ${styleState.excludedPromptTags.length}개 제외` : "";
   setPromptPresetStatus(`수집 포지티브와 네거티브 전체를 적용했습니다. (${match}${excluded})`, "ok");
   return true;
+}
+
+function promptPresetFullText(preset, qualityPrompt = null) {
+  const quality = qualityPrompt === null
+    ? String(preset?.base_prompt || preset?.quality_prompt || "").trim()
+    : String(qualityPrompt || "").trim();
+  const excluded = Array.isArray(preset?.excluded_tags)
+    ? preset.excluded_tags.map((item) => String(item?.prompt || "").trim()).filter(Boolean)
+    : [];
+  return combinePromptSections(quality, ...excluded);
+}
+
+function currentPromptPresetModalItem() {
+  return styleState.promptPresets[styleState.promptPresetModalIndex] || null;
+}
+
+function updatePromptPresetFullPreview() {
+  const preview = styleElement("promptPresetFullPreview");
+  if (!preview) return;
+  preview.textContent = promptPresetFullText(
+    currentPromptPresetModalItem(),
+    styleElement("promptPresetQualityEditor")?.value || "",
+  ) || "프롬프트 없음";
+}
+
+function renderPromptPresetDetail() {
+  const preset = currentPromptPresetModalItem();
+  const editor = styleElement("promptPresetQualityEditor");
+  if (editor) editor.value = preset?.base_prompt || preset?.quality_prompt || "";
+  const title = styleElement("promptPresetDetailTitle");
+  if (title) title.textContent = preset?.representative_image?.title || `수집 프롬프트 ${styleState.promptPresetModalIndex + 1}`;
+  const meta = styleElement("promptPresetDetailMeta");
+  if (meta) meta.textContent = preset
+    ? `${styleState.promptPresetModalIndex + 1}/${styleState.promptPresets.length} · 표본 ${preset.sample_count || 1}${preset.modified ? " · 수정본" : ""}`
+    : "";
+  const excludedList = styleElement("promptPresetExcludedList");
+  if (excludedList) {
+    const excluded = Array.isArray(preset?.excluded_tags) ? preset.excluded_tags : [];
+    excludedList.replaceChildren(...excluded.map((item) => {
+      const tag = document.createElement("span");
+      tag.textContent = item.prompt || item.tag || "";
+      return tag;
+    }));
+    if (!excluded.length) excludedList.textContent = "제외된 태그 없음";
+  }
+  const applyButton = styleElement("saveAndApplyPromptPreset");
+  if (applyButton) applyButton.disabled = !preset;
+  const status = styleElement("promptPresetModalStatus");
+  if (status) status.textContent = "";
+  updatePromptPresetFullPreview();
+}
+
+function renderPromptPresetModal() {
+  const gallery = styleElement("promptPresetGallery");
+  if (!gallery) return;
+  gallery.replaceChildren();
+  styleState.promptPresets.forEach((preset, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "prompt-preset-card";
+    button.classList.toggle("active", index === styleState.promptPresetModalIndex);
+    const representative = preset.representative_image || {};
+    const imageUrl = representative.thumbnail_url || representative.image_url || "";
+    if (imageUrl) {
+      const image = document.createElement("img");
+      image.src = imageUrl;
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.alt = representative.title || `수집 프롬프트 ${index + 1}`;
+      button.append(image);
+    } else {
+      const empty = document.createElement("span");
+      empty.className = "prompt-preset-card-empty";
+      empty.textContent = "이미지 없음";
+      button.append(empty);
+    }
+    const label = document.createElement("span");
+    label.textContent = `${index + 1}${preset.modified ? " · 수정됨" : ""}`;
+    const count = document.createElement("small");
+    count.textContent = `표본 ${preset.sample_count || 1}${preset.match_count ? ` · 작가 ${preset.match_count}명 일치` : ""}`;
+    button.append(label, count);
+    button.addEventListener("click", () => {
+      styleState.promptPresetModalIndex = index;
+      [...gallery.children].forEach((card, cardIndex) => card.classList.toggle("active", cardIndex === index));
+      renderPromptPresetDetail();
+    });
+    button.addEventListener("dblclick", () => {
+      applyPromptPreset(preset);
+      closePromptPresetModal();
+    });
+    gallery.append(button);
+  });
+  renderPromptPresetDetail();
+}
+
+function openPromptPresetModal() {
+  if (!styleState.promptPresets.length) return;
+  const selectedIndex = styleState.promptPresets.findIndex((preset) => preset.key === styleState.selectedPromptPresetKey);
+  styleState.promptPresetModalIndex = selectedIndex >= 0 ? selectedIndex : 0;
+  renderPromptPresetModal();
+  styleElement("promptPresetModal")?.classList.remove("hidden");
+}
+
+function closePromptPresetModal() {
+  styleElement("promptPresetModal")?.classList.add("hidden");
+}
+
+async function saveAndApplyPromptPreset() {
+  const preset = currentPromptPresetModalItem();
+  const qualityPrompt = styleElement("promptPresetQualityEditor")?.value.trim() || "";
+  const status = styleElement("promptPresetModalStatus");
+  if (!preset || !qualityPrompt) {
+    if (status) status.textContent = "적용할 퀄리티 프롬프트를 입력해 주세요.";
+    return false;
+  }
+  try {
+    if (qualityPrompt !== String(preset.base_prompt || preset.quality_prompt || "").trim()) {
+      if (status) status.textContent = "수정한 프롬프트를 저장하는 중입니다...";
+      await apiFetch(`/api/style-maker/prompt-presets/${preset.key}`, {
+        method: "PATCH",
+        body: JSON.stringify({ quality_prompt: qualityPrompt }),
+      });
+      preset.base_prompt = qualityPrompt;
+      preset.quality_prompt = qualityPrompt;
+      preset.modified = true;
+    }
+    applyPromptPreset(preset);
+    closePromptPresetModal();
+    return true;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    return false;
+  }
 }
 
 async function loadPromptPresets({ force = false } = {}) {
@@ -1672,14 +1862,42 @@ function swapStyleArtists(a, b) {
   renderWeightGraph();
 }
 
-function sortStyleArtists(direction) {
-  styleState.artists = sortArtistsByWeight(styleState.artists, direction);
-  renderWeightGraph();
+function sortFixedArtistEntriesForTable(entries, mode) {
+  if (!["asc", "desc"].includes(mode)) return [...entries];
+  const factor = mode === "asc" ? 1 : -1;
+  return [...entries].sort((left, right) => (
+    factor * (Number(left.artist.weight) - Number(right.artist.weight))
+    || left.index - right.index
+  ));
+}
+
+function updateWeightTableSortHeaders() {
+  const labels = {
+    default: { icon: "↑↓", label: "가중치 정렬: 원래 순서" },
+    asc: { icon: "↑", label: "가중치 정렬: 오름차순" },
+    desc: { icon: "↓", label: "가중치 정렬: 내림차순" },
+  };
+  const current = labels[styleState.weightTableSortMode] || labels.default;
+  document.querySelectorAll("[data-weight-table-sort]").forEach((button) => {
+    const icon = button.querySelector("[data-weight-sort-icon]");
+    if (icon) icon.textContent = current.icon;
+    button.setAttribute("aria-label", current.label);
+    button.dataset.sortMode = styleState.weightTableSortMode;
+  });
+}
+
+function cycleWeightTableSort() {
+  const next = { default: "asc", asc: "desc", desc: "default" };
+  styleState.weightTableSortMode = next[styleState.weightTableSortMode] || "default";
+  renderStyleArtistList();
 }
 
 function renderStyleArtistListTarget(list) {
   list.replaceChildren();
-  const entries = fixedStyleArtistEntries(styleState.artists);
+  const entries = sortFixedArtistEntriesForTable(
+    fixedStyleArtistEntries(styleState.artists),
+    styleState.weightTableSortMode,
+  );
   if (!entries.length) {
     const empty = document.createElement("p");
     empty.className = "style-artist-list-empty";
@@ -1693,7 +1911,7 @@ function renderStyleArtistListTarget(list) {
 
     const position = document.createElement("input");
     position.type = "number";
-    position.min = "1";
+    position.min = "0";
     position.max = String(styleSlotCount());
     position.value = String(normalizeFixedArtistSlot(item, index + 1));
     position.title = "순서";
@@ -1728,6 +1946,20 @@ function renderStyleArtistListTarget(list) {
       renderWeightGraph();
     });
 
+    const randomWeight = document.createElement("label");
+    randomWeight.className = "style-artist-random-weight";
+    const randomWeightInput = document.createElement("input");
+    randomWeightInput.type = "checkbox";
+    randomWeightInput.checked = item.random_weight === true;
+    randomWeightInput.setAttribute("aria-label", `${item.artist} 가중치 랜덤`);
+    randomWeightInput.addEventListener("change", () => {
+      styleState.artists = updateStyleArtistAtIndex(styleState.artists, index, { random_weight: randomWeightInput.checked });
+      renderWeightGraph();
+    });
+    const randomWeightText = document.createElement("span");
+    randomWeightText.textContent = "랜덤";
+    randomWeight.append(randomWeightInput, randomWeightText);
+
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "icon-button danger-button";
@@ -1736,26 +1968,41 @@ function renderStyleArtistListTarget(list) {
     remove.textContent = "×";
     remove.addEventListener("click", () => removeStyleArtist(index));
 
-    row.append(position, name, weight, remove);
+    row.append(position, name, weight, randomWeight, remove);
     list.append(row);
   });
 }
 
 function renderStyleArtistList() {
-  const list = styleElement("styleArtistList");
-  if (list) renderStyleArtistListTarget(list);
+  ["styleArtistList", "weightTableArtistList"].forEach((id) => {
+    const list = styleElement(id);
+    if (list) renderStyleArtistListTarget(list);
+  });
+  updateWeightTableSortHeaders();
+}
+
+function openWeightTableModal() {
+  styleElement("weightTableModal")?.classList.remove("hidden");
+  renderStyleArtistList();
+  renderRatedArtistSelect();
+}
+
+function closeWeightTableModal() {
+  hideStyleArtistAutocomplete();
+  styleElement("weightTableModal")?.classList.add("hidden");
 }
 
 function fixedArtistOverlayCoordinates(indexOrSlot, weight, total, min, max) {
   const slotInfo = typeof indexOrSlot === "object" && indexOrSlot !== null ? indexOrSlot : null;
   const slotCount = Math.max(1, Math.trunc(Number(total)));
-  const slot = slotInfo ? Math.min(slotCount, normalizeFixedArtistSlot(slotInfo, 1)) : null;
+  const normalizedSlot = slotInfo ? normalizeFixedArtistSlot(slotInfo, 1) : null;
+  const slot = normalizedSlot > 0 ? Math.min(slotCount, normalizedSlot) : null;
   const plotLeft = 58;
   const plotRight = 24;
   const plotWidth = 900 - plotLeft - plotRight;
   const ratioX = slot
     ? (plotLeft + (((slot - 1) / Math.max(1, slotCount - 1)) * plotWidth)) / 900
-    : (slotCount <= 1 ? 0.5 : indexOrSlot / (slotCount - 1));
+    : (slotInfo ? 0.5 : (slotCount <= 1 ? 0.5 : indexOrSlot / (slotCount - 1)));
   const ratioY = max > min ? (clampStyleWeight(weight) - min) / (max - min) : 0.5;
   const left = slot
     ? Math.min(100, Math.max(0, Number((ratioX * 100).toFixed(2))))
@@ -1915,7 +2162,7 @@ function renderWeightGraphFixedArtistOverlays(graph) {
 
     const grip = document.createElement("span");
     grip.className = "weight-fixed-artist-grip";
-    grip.textContent = `#${slot}`;
+    grip.textContent = slot === 0 ? "랜덤" : `#${slot}`;
     grip.title = "드래그해서 순서 변경";
 
     const name = document.createElement("input");
@@ -1933,7 +2180,7 @@ function renderWeightGraphFixedArtistOverlays(graph) {
 
     const position = document.createElement("input");
     position.type = "number";
-    position.min = "1";
+    position.min = "0";
     position.max = String(slotCount);
     position.value = String(slot);
     position.title = "순서";
@@ -2117,16 +2364,30 @@ function replaceCurrentStyleArtistFragment(value, artist) {
   return `${prefix}${artist}`;
 }
 
+function styleArtistControlIds(context = "main") {
+  return context === "modal"
+    ? {
+      search: "weightTableArtistSearch", autocomplete: "weightTableArtistAutocomplete",
+      select: "weightTableArtistSelect", position: "weightTableArtistPosition",
+      weight: "weightTableArtistWeight", randomWeight: "weightTableArtistRandomWeight",
+    }
+    : {
+      search: "styleArtistSearch", autocomplete: "styleArtistAutocomplete",
+      select: "styleArtistSelect", position: "styleArtistPosition",
+      weight: "styleArtistWeight", randomWeight: "styleArtistRandomWeight",
+    };
+}
+
 function hideStyleArtistAutocomplete() {
-  const box = styleElement("styleArtistAutocomplete");
-  box?.classList.add("hidden");
+  styleElement("styleArtistAutocomplete")?.classList.add("hidden");
+  styleElement("weightTableArtistAutocomplete")?.classList.add("hidden");
   styleState.styleArtistAutocompleteRequestToken += 1;
   styleState.styleArtistAutocompleteItems = [];
   styleState.styleArtistAutocompleteIndex = -1;
 }
 
 function setStyleArtistAutocompleteIndex(index) {
-  const box = styleElement("styleArtistAutocomplete");
+  const box = styleElement(styleArtistControlIds(styleState.styleArtistAutocompleteContext).autocomplete);
   if (!box || !styleState.styleArtistAutocompleteItems.length) return;
   styleState.styleArtistAutocompleteIndex = (index + styleState.styleArtistAutocompleteItems.length) % styleState.styleArtistAutocompleteItems.length;
   box.querySelectorAll("button").forEach((button, buttonIndex) => {
@@ -2135,7 +2396,8 @@ function setStyleArtistAutocompleteIndex(index) {
 }
 
 function applyStyleArtistAutocomplete(index = styleState.styleArtistAutocompleteIndex) {
-  const input = styleElement("styleArtistSearch");
+  const ids = styleArtistControlIds(styleState.styleArtistAutocompleteContext);
+  const input = styleElement(ids.search);
   const item = styleState.styleArtistAutocompleteItems[index];
   if (!input || !item) return;
   input.value = replaceCurrentStyleArtistFragment(input.value, item.name);
@@ -2144,9 +2406,11 @@ function applyStyleArtistAutocomplete(index = styleState.styleArtistAutocomplete
   renderRatedArtistSelect();
 }
 
-async function updateStyleArtistAutocomplete() {
-  const input = styleElement("styleArtistSearch");
-  const box = styleElement("styleArtistAutocomplete");
+async function updateStyleArtistAutocomplete(context = "main") {
+  styleState.styleArtistAutocompleteContext = context;
+  const ids = styleArtistControlIds(context);
+  const input = styleElement(ids.search);
+  const box = styleElement(ids.autocomplete);
   if (!input || !box) return;
   const query = currentStyleArtistFragment(input.value);
   if (query.length < 2) {
@@ -2178,8 +2442,9 @@ async function updateStyleArtistAutocomplete() {
   }
 }
 
-function handleStyleArtistAutocompleteKeydown(event) {
-  const box = styleElement("styleArtistAutocomplete");
+function handleStyleArtistAutocompleteKeydown(event, context = "main") {
+  styleState.styleArtistAutocompleteContext = context;
+  const box = styleElement(styleArtistControlIds(context).autocomplete);
   if (!box || box.classList.contains("hidden") || !styleState.styleArtistAutocompleteItems.length) return;
   if (event.key === "ArrowDown") {
     event.preventDefault();
@@ -2297,16 +2562,17 @@ function bindPromptTagAutocomplete(input) {
   input.addEventListener("keydown", handlePromptTagAutocompleteKeydown);
 }
 
-function filteredRatedArtists() {
-  const query = (styleElement("styleArtistSearch")?.value || "").trim().toLowerCase();
+function filteredRatedArtists(searchId = "styleArtistSearch") {
+  const query = (styleElement(searchId)?.value || "").trim().toLowerCase();
   return styleState.ratedArtists.filter((item) => !query || item.artist.toLowerCase().includes(query));
 }
 
-function renderRatedArtistSelect() {
-  const select = styleElement("styleArtistSelect");
+function renderRatedArtistSelectTarget(context) {
+  const ids = styleArtistControlIds(context);
+  const select = styleElement(ids.select);
   if (!select) return;
   const selectedArtists = new Set(styleState.artists.map((item) => item.artist));
-  const options = filteredRatedArtists().filter((item) => !selectedArtists.has(item.artist));
+  const options = filteredRatedArtists(ids.search).filter((item) => !selectedArtists.has(item.artist));
   select.replaceChildren();
   if (!options.length) {
     select.add(new Option("추가할 작가가 없습니다", ""));
@@ -2315,16 +2581,24 @@ function renderRatedArtistSelect() {
   options.forEach((item) => select.add(new Option(`${item.artist} (평점 ${item.score})`, item.artist)));
 }
 
-function addStyleArtist() {
-  const input = styleElement("styleArtistSearch");
-  const selectedArtist = styleElement("styleArtistSelect")?.value || "";
+function renderRatedArtistSelect() {
+  renderRatedArtistSelectTarget("main");
+  renderRatedArtistSelectTarget("modal");
+}
+
+function addStyleArtist(context = "main") {
+  const ids = styleArtistControlIds(context);
+  const input = styleElement(ids.search);
+  const selectedArtist = styleElement(ids.select)?.value || "";
   const entries = parseStyleArtistEntries(input?.value || selectedArtist);
   if (!entries.length && selectedArtist) entries.push({ artist: selectedArtist });
   if (!entries.length) return;
   const beforeFixedCount = fixedStyleArtistEntries(styleState.artists).length;
-  const position = Math.trunc(Number(styleElement("styleArtistPosition")?.value || styleState.artists.length + 1));
-  const weight = clampStyleWeight(styleElement("styleArtistWeight")?.value || 1);
-  const inserted = insertStyleArtistsAtPosition(styleState.artists, entries, { position, weight });
+  const positionText = styleElement(ids.position)?.value;
+  const position = positionText === "0" ? 0 : Math.trunc(Number(positionText || styleState.artists.length + 1));
+  const weight = clampStyleWeight(styleElement(ids.weight)?.value || 1);
+  const randomWeight = Boolean(styleElement(ids.randomWeight)?.checked);
+  const inserted = insertStyleArtistsAtPosition(styleState.artists, entries, { position, weight, randomWeight });
   try {
     styleState.artists = limitArtistsToTotalCount(
       inserted,
@@ -2854,6 +3128,43 @@ function updateStyleManagerListStatus(total) {
   renderStyleManagerPagination(total);
 }
 
+function setStyleManagerLoadProgress({ label = "", completed = 0, total = 0, indeterminate = false, failures = 0 } = {}) {
+  const container = styleElement("styleManagerLoadProgress");
+  const bar = styleElement("styleManagerLoadProgressBar");
+  const text = styleElement("styleManagerLoadProgressText");
+  container?.classList.toggle("hidden", !label);
+  if (bar) {
+    bar.max = Math.max(1, total);
+    if (indeterminate) bar.removeAttribute("value");
+    else bar.value = Math.max(0, Math.min(completed, total));
+  }
+  if (text) text.textContent = label
+    ? `${label}${total ? ` · ${completed}/${total}${failures ? ` · 표시 실패 ${failures}장` : ""}` : ""}`
+    : "";
+}
+
+function createStyleManagerImageProgress(total) {
+  const token = ++styleState.managerImageLoadToken;
+  let completed = 0;
+  let failures = 0;
+  if (!total) {
+    setStyleManagerLoadProgress();
+    return () => {};
+  }
+  setStyleManagerLoadProgress({ label: "이미지 가져오는 중", completed, total });
+  return (failed = false) => {
+    if (token !== styleState.managerImageLoadToken) return;
+    completed += 1;
+    if (failed) failures += 1;
+    setStyleManagerLoadProgress({
+      label: completed < total ? "이미지 가져오는 중" : "현재 페이지 이미지 준비 완료",
+      completed,
+      total,
+      failures,
+    });
+  };
+}
+
 function paginateStyleManagerItems(items, page, pageSize) {
   const size = Math.max(1, Math.trunc(Number(pageSize) || 1));
   const currentPage = Math.max(1, Math.trunc(Number(page) || 1));
@@ -2875,6 +3186,9 @@ function renderStyleManagerList(styles) {
   const pageStyles = styleState.managerMode === "shared"
     ? visibleStyles
     : paginateStyleManagerItems(visibleStyles, styleState.managerPage, styleState.managerPageSize);
+  const settleImage = createStyleManagerImageProgress(
+    pageStyles.filter((style) => style.thumbnail_url || style.image_url || style.representative_image_url).length,
+  );
   pageStyles.forEach((style) => {
     const button = document.createElement("button");
     button.type = "button";
@@ -2891,9 +3205,12 @@ function renderStyleManagerList(styles) {
     const imageUrl = style.image_url || style.representative_image_url;
     if (imageUrl) {
       const image = document.createElement("img");
-      image.src = imageUrl;
+      image.addEventListener("load", () => settleImage(false), { once: true });
+      image.addEventListener("error", () => settleImage(true), { once: true });
+      image.src = style.thumbnail_url || imageUrl;
       image.alt = "그림체 대표 이미지";
-      image.loading = "lazy";
+      image.loading = "eager";
+      image.decoding = "async";
       button.append(image);
     }
     const body = document.createElement("span");
@@ -3047,6 +3364,9 @@ async function loadStyleManager() {
   const status = styleElement("styleManagerStatus");
   const requestedMode = styleState.managerMode;
   const requestToken = ++styleState.managerRequestToken;
+  const title = { generated: "제작 기록", confirmed: "확정 그림체", shared: "공유 그림체" }[requestedMode];
+  styleState.managerImageLoadToken += 1;
+  setStyleManagerLoadProgress({ label: `${title} 목록 정보를 가져오는 중`, indeterminate: true });
   try {
     let styles;
     let sharedResult = null;
@@ -3072,6 +3392,7 @@ async function loadStyleManager() {
     styleState.managerDirty = false;
   } catch (error) {
     if (requestToken !== styleState.managerRequestToken || requestedMode !== styleState.managerMode) return;
+    setStyleManagerLoadProgress();
     if (status) status.textContent = error.message;
   }
 }
@@ -3308,7 +3629,10 @@ function renderStyleManagerDetail(item) {
   styleElement("style-manager-tab")?.classList.add("has-detail");
   target.replaceChildren();
   styleState.managerDetail = item;
-  styleState.managerImages = [normalizedManagerModalImage(item)];
+  const confirmedImages = styleState.managerMode === "confirmed" && Array.isArray(item.images) && item.images.length
+    ? item.images.map((image) => normalizedManagerModalImage({ ...item, ...image, image_url: image.image_url }))
+    : [normalizedManagerModalImage(item)];
+  styleState.managerImages = confirmedImages;
   styleState.managerImageIndex = 0;
   styleState.managerNegativeExpanded = false;
   const head = document.createElement("div");
@@ -3364,10 +3688,32 @@ function renderStyleManagerDetail(item) {
   imageStage.className = "manager-image-stage";
   const image = document.createElement("img");
   image.className = "manager-selected-image";
-  image.src = item.image_url || "";
+  image.src = styleState.managerImages[0]?.image_url || item.image_url || "";
   image.alt = "선택한 그림체 이미지";
-  image.addEventListener("click", () => openGeneratedImage(styleState.managerImages, 0));
-  imageStage.append(image);
+  image.addEventListener("click", () => openGeneratedImage(styleState.managerImages, styleState.managerImageIndex));
+  if (styleState.managerImages.length > 1) {
+    const previous = document.createElement("button");
+    previous.type = "button";
+    previous.className = "manager-group-image-nav";
+    previous.textContent = "↑ 같은 그림체 이전 이미지";
+    const next = document.createElement("button");
+    next.type = "button";
+    next.className = "manager-group-image-nav";
+    next.textContent = "↓ 같은 그림체 다음 이미지";
+    const counter = document.createElement("span");
+    counter.className = "manager-group-image-counter";
+    const showImage = (index) => {
+      styleState.managerImageIndex = (index + styleState.managerImages.length) % styleState.managerImages.length;
+      image.src = styleState.managerImages[styleState.managerImageIndex].image_url || "";
+      counter.textContent = `${styleState.managerImageIndex + 1} / ${styleState.managerImages.length}`;
+    };
+    previous.addEventListener("click", () => showImage(styleState.managerImageIndex - 1));
+    next.addEventListener("click", () => showImage(styleState.managerImageIndex + 1));
+    imageStage.append(previous, image, next, counter);
+    showImage(0);
+  } else {
+    imageStage.append(image);
+  }
   const inspector = document.createElement("section");
   inspector.className = "manager-image-inspector";
   const prompts = managerPromptParts(item);
@@ -3400,7 +3746,9 @@ function renderStyleManagerDetail(item) {
 async function deleteSingleManagerItem(item) {
   if (!await globalThis.appDialog.confirm({
     title: "항목 삭제",
-    message: styleState.managerMode === "confirmed" ? "이 확정 그림체를 삭제할까요? 원본은 유지됩니다." : "이 생성 결과를 삭제할까요?",
+    message: styleState.managerMode === "confirmed"
+      ? `이 확정 그림체와 같은 묶음의 이미지 ${item.image_count || 1}장을 모두 삭제할까요? 원본은 유지됩니다.`
+      : "이 생성 결과를 삭제할까요?",
     confirmLabel: "삭제",
     tone: "danger",
   })) return;
@@ -3425,10 +3773,22 @@ function confirmedFormValue(id, value) {
   if (element) element.value = value === null || value === undefined ? "" : String(value);
 }
 
+function normalizeConfirmedModelName(value) {
+  const model = String(value || "").trim();
+  const lowered = model.toLowerCase();
+  if (lowered.startsWith("novelai diffusion v4.5 curated") || lowered === "nai-diffusion-4-5-curated") {
+    return "NovelAI Diffusion V4.5 Curated";
+  }
+  if (lowered.startsWith("novelai diffusion v4.5") || lowered === "nai-diffusion-4-5-full") {
+    return "NovelAI Diffusion V4.5 Full";
+  }
+  return model;
+}
+
 function setConfirmedModelValue(value) {
   const element = styleElement("confirmedStyleModel");
   if (!element) return;
-  const model = value === null || value === undefined ? "" : String(value);
+  const model = normalizeConfirmedModelName(value);
   if (model && ![...element.options].some((option) => option.value === model)) {
     const option = document.createElement("option");
     option.value = model;
@@ -3469,6 +3829,307 @@ function setConfirmedPreview(url, showHint = false) {
   hint?.classList.toggle("hidden", Boolean(url) && !showHint);
 }
 
+function confirmedArtistPromptSignature(prompt) {
+  return normalizeNumericPromptClosers(String(prompt || ""))
+    .replace(/(\d+(?:\.\d+)?)\s*::\s*artist:/gi, (_, weight) => `${Number(weight)}::artist:`)
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function groupConfirmedImportItems(items) {
+  const groups = [];
+  (Array.isArray(items) ? items : []).forEach((item, index) => {
+    const signature = confirmedArtistPromptSignature(item?.metadata?.artist_prompt);
+    const group = signature && groups.find((entry) => entry.signature === signature);
+    if (group) {
+      group.items.push(item);
+    } else {
+      groups.push({
+        signature: signature || `unidentified:${index}`,
+        items: [item],
+        data: { ...(item?.metadata || {}) },
+      });
+    }
+  });
+  return groups;
+}
+
+function attachConfirmedStyleSuspects(groups, confirmedStyles) {
+  const stylesBySignature = new Map();
+  (Array.isArray(confirmedStyles) ? confirmedStyles : []).forEach((style) => {
+    const signature = confirmedArtistPromptSignature(style?.artist_prompt);
+    if (!signature) return;
+    if (!stylesBySignature.has(signature)) stylesBySignature.set(signature, []);
+    stylesBySignature.get(signature).push(style);
+  });
+  (Array.isArray(groups) ? groups : []).forEach((group) => {
+    group.suspectedStyles = stylesBySignature.get(group.signature) || [];
+  });
+  return groups;
+}
+
+function confirmedCurrentImportGroup() {
+  return styleState.confirmedImportGroups[styleState.confirmedImportGroupIndex] || null;
+}
+
+function confirmedPreviewViewerItem(data, imageUrl, image = {}) {
+  return {
+    ...data,
+    image_url: imageUrl || "",
+    base_prompt: combinePromptSections(data?.artist_prompt, data?.quality_prompt || data?.base_prompt),
+    character_prompts: Array.isArray(data?.character_prompts)
+      ? data.character_prompts.map((entry) => typeof entry === "string" ? entry : entry?.prompt || "").filter(Boolean)
+      : [],
+    width: image.width || data?.width,
+    height: image.height || data?.height,
+  };
+}
+
+function openConfirmedStylePreview() {
+  const group = confirmedCurrentImportGroup();
+  if (group?.items?.length) {
+    const items = group.items.map((item) => confirmedPreviewViewerItem(
+      item.metadata || group.data || {},
+      item.objectUrl,
+      item.metadata || {},
+    ));
+    openGeneratedImage(items, Math.min(styleState.confirmedImportImageIndex, items.length - 1));
+    return;
+  }
+  const source = styleState.confirmedModalPreviewData;
+  if (!source?.image_url) return;
+  const images = Array.isArray(source.images) && source.images.length
+    ? source.images.map((image) => confirmedPreviewViewerItem(source, image.image_url, image))
+    : [confirmedPreviewViewerItem(source, source.image_url, source)];
+  openGeneratedImage(images, 0);
+}
+
+function revokeConfirmedImportGroups(groups = styleState.confirmedImportGroups) {
+  groups.forEach((group) => group.items.forEach((item) => {
+    if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
+  }));
+}
+
+function captureConfirmedImportGroupData() {
+  const group = confirmedCurrentImportGroup();
+  if (!group) return;
+  const data = readConfirmedStyleForm();
+  group.data = data;
+  const item = group.items[styleState.confirmedImportImageIndex];
+  if (item) item.metadata = { ...(item.metadata || {}), ...data };
+}
+
+function renderConfirmedDuplicateCandidates(group) {
+  const warning = styleElement("confirmedStyleDuplicateWarning");
+  const panel = styleElement("confirmedStyleDuplicateCandidates");
+  const modal = styleElement("confirmedStyleDuplicateModal");
+  if (!warning || !panel || !modal) return;
+  const suspects = group?.suspectedStyles || [];
+  warning.classList.toggle("hidden", !suspects.length);
+  warning.textContent = suspects.length
+    ? `이미 추가된 그림체 의심 ${suspects.length}개 · 클릭해서 확인`
+    : "";
+  if (!suspects.length) styleState.confirmedDuplicatePanelOpen = false;
+  modal.classList.toggle("hidden", !styleState.confirmedDuplicatePanelOpen || !suspects.length);
+  panel.replaceChildren();
+  if (!styleState.confirmedDuplicatePanelOpen) return;
+  styleState.confirmedDuplicateStyleIndex = Math.max(0, Math.min(styleState.confirmedDuplicateStyleIndex, suspects.length - 1));
+  suspects.forEach((style, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "confirmed-style-duplicate-card";
+    button.classList.toggle("active", index === styleState.confirmedDuplicateStyleIndex);
+    button.title = `${style.name || `확정 그림체 #${style.id}`} 자세히 보기`;
+    const image = document.createElement("img");
+    image.src = style.image_url || style.images?.[0]?.image_url || "";
+    image.alt = style.name || `의심 그림체 ${style.id}`;
+    const name = document.createElement("span");
+    name.textContent = style.name || `확정 그림체 #${style.id}`;
+    const count = document.createElement("small");
+    count.textContent = `${Number(style.image_count) || style.images?.length || 1}장`;
+    button.append(image, name, count);
+    button.addEventListener("click", () => {
+      styleState.confirmedDuplicateStyleIndex = index;
+      styleState.confirmedDuplicateImageIndex = 0;
+      renderConfirmedDuplicateCandidates(group);
+    });
+    panel.append(button);
+  });
+  const style = suspects[styleState.confirmedDuplicateStyleIndex];
+  const images = Array.isArray(style.images) && style.images.length
+    ? style.images
+    : [{ image_url: style.image_url, width: style.width, height: style.height }];
+  styleState.confirmedDuplicateImageIndex = Math.max(0, Math.min(styleState.confirmedDuplicateImageIndex, images.length - 1));
+  const selectedImage = images[styleState.confirmedDuplicateImageIndex] || {};
+  const image = styleElement("confirmedStyleDuplicateDetailImage");
+  if (image) image.src = selectedImage.image_url || style.image_url || "";
+  const name = styleElement("confirmedStyleDuplicateDetailName");
+  if (name) name.textContent = style.name || `확정 그림체 #${style.id}`;
+  const counter = styleElement("confirmedStyleDuplicateDetailCounter");
+  if (counter) counter.textContent = `후보 ${styleState.confirmedDuplicateStyleIndex + 1}/${suspects.length} · 이미지 ${styleState.confirmedDuplicateImageIndex + 1}/${images.length}`;
+  ["confirmedStyleDuplicatePrevImage", "confirmedStyleDuplicateNextImage"].forEach((id) => {
+    const button = styleElement(id);
+    if (button) button.disabled = images.length < 2;
+  });
+  const info = styleElement("confirmedStyleDuplicateDetailInfo");
+  if (info) {
+    info.replaceChildren();
+    appendMetaRow(info, "작가 프롬프트", style.artist_prompt);
+    appendMetaRow(info, "퀄리티 프롬프트", style.quality_prompt);
+    appendMetaRow(info, "고정 프롬프트", style.fixed_prompt);
+    appendMetaRow(info, "캐릭터 프롬프트", (style.character_prompts || []).join("\n"));
+    appendMetaRow(info, "네거티브", style.negative_prompt);
+    appendMetaRow(info, "이미지 크기", `${selectedImage.width || style.width || "?"}×${selectedImage.height || style.height || "?"}`);
+    appendMetaRow(info, "생성 설정", `${style.model || "모델 미상"} · ${style.sampler || "샘플러 미상"} / ${style.noise_schedule || "스케줄러 미상"} · ${style.steps || "?"} steps · CFG ${style.scale ?? "?"}`);
+    if (style.description) appendMetaRow(info, "설명", style.description);
+  }
+}
+
+function openConfirmedDuplicateReview() {
+  const suspects = confirmedCurrentImportGroup()?.suspectedStyles || [];
+  if (!suspects.length) return;
+  styleState.confirmedDuplicatePanelOpen = true;
+  styleState.confirmedDuplicateStyleIndex = 0;
+  styleState.confirmedDuplicateImageIndex = 0;
+  renderConfirmedDuplicateCandidates(confirmedCurrentImportGroup());
+}
+
+function closeConfirmedDuplicateReview() {
+  styleState.confirmedDuplicatePanelOpen = false;
+  styleElement("confirmedStyleDuplicateModal")?.classList.add("hidden");
+}
+
+function moveConfirmedDuplicateImage(delta) {
+  const suspects = confirmedCurrentImportGroup()?.suspectedStyles || [];
+  const style = suspects[styleState.confirmedDuplicateStyleIndex];
+  const length = Array.isArray(style?.images) && style.images.length ? style.images.length : 1;
+  if (length < 2) return;
+  styleState.confirmedDuplicateImageIndex = (styleState.confirmedDuplicateImageIndex + delta + length) % length;
+  renderConfirmedDuplicateCandidates(confirmedCurrentImportGroup());
+}
+
+function renderConfirmedImportNavigator() {
+  const groups = styleState.confirmedImportGroups;
+  const group = confirmedCurrentImportGroup();
+  const items = group?.items || [];
+  const item = items[styleState.confirmedImportImageIndex] || null;
+  const strip = styleElement("confirmedStyleGroupStrip");
+  if (strip) {
+    strip.replaceChildren();
+    groups.forEach((entry, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "confirmed-style-group-thumb";
+      const active = index === styleState.confirmedImportGroupIndex;
+      button.classList.toggle("active", active);
+      const thumbIndex = active ? Math.min(styleState.confirmedImportImageIndex, entry.items.length - 1) : 0;
+      const thumbMetadata = entry.items[thumbIndex]?.metadata || {};
+      const missingMetadata = thumbMetadata.metadata_status !== "ok"
+        && !thumbMetadata.artist_prompt && !thumbMetadata.quality_prompt && !(thumbMetadata.character_prompts || []).length;
+      button.classList.toggle("metadata-missing", missingMetadata);
+      const image = document.createElement("img");
+      image.src = entry.items[thumbIndex]?.objectUrl || "";
+      image.alt = `그림체 ${index + 1}`;
+      const count = document.createElement("span");
+      count.textContent = active && entry.items.length > 1
+        ? `${index + 1} · ${thumbIndex + 1}/${entry.items.length}`
+        : `${index + 1} · ${entry.items.length}장`;
+      button.append(image, count);
+      button.addEventListener("click", () => selectConfirmedImportItem(index, 0));
+      strip.append(button);
+      if (active) requestAnimationFrame(() => button.scrollIntoView({ block: "nearest", inline: "nearest" }));
+    });
+    strip.classList.toggle("hidden", !groups.length);
+  }
+  if (item) setConfirmedPreview(item.objectUrl || "");
+  else if (!styleState.confirmedModalSource && !styleState.confirmedModalEditId) setConfirmedPreview("", true);
+  const counter = styleElement("confirmedStyleImportCounter");
+  if (counter) {
+    const missingMetadata = item?.metadata?.metadata_status !== "ok"
+      && !item?.metadata?.artist_prompt && !item?.metadata?.quality_prompt && !(item?.metadata?.character_prompts || []).length;
+    const baseText = group
+      ? `그림체 ${styleState.confirmedImportGroupIndex + 1}/${groups.length} · 같은 그림 ${styleState.confirmedImportImageIndex + 1}/${items.length}`
+      : "가져온 이미지 없음";
+    counter.textContent = `${baseText}${missingMetadata ? " · 프롬프트 메타데이터 없음" : ""}`;
+    counter.classList.toggle("metadata-missing", Boolean(missingMetadata));
+    counter.classList.toggle("hidden", !group && Boolean(styleState.confirmedModalSource || styleState.confirmedModalEditId));
+  }
+  renderConfirmedDuplicateCandidates(group);
+  const editing = Boolean(styleState.confirmedModalEditId);
+  const busy = styleState.confirmedImportBusy;
+  const controls = {
+    confirmedStylePrevGroup: busy || groups.length < 2,
+    confirmedStyleNextGroup: busy || groups.length < 2,
+    confirmedStylePrevImage: busy || items.length < 2,
+    confirmedStyleNextImage: busy || items.length < 2,
+    splitConfirmedStyleImage: busy || items.length < 2,
+    removeConfirmedStyleGroup: busy || !group,
+    chooseConfirmedStyleImage: busy,
+    chooseConfirmedStyleFolder: busy,
+  };
+  Object.entries(controls).forEach(([id, disabled]) => {
+    const element = styleElement(id);
+    if (element) element.disabled = editing || disabled;
+  });
+  ["saveConfirmedStyle", "saveAllConfirmedStyles"].forEach((id) => {
+    const element = styleElement(id);
+    if (element) element.disabled = busy;
+  });
+}
+
+function selectConfirmedImportItem(groupIndex, imageIndex, { capture = true } = {}) {
+  if (capture) captureConfirmedImportGroupData();
+  const groups = styleState.confirmedImportGroups;
+  if (!groups.length) {
+    styleState.confirmedImportGroupIndex = 0;
+    styleState.confirmedImportImageIndex = 0;
+    renderConfirmedImportNavigator();
+    return;
+  }
+  styleState.confirmedImportGroupIndex = (Number(groupIndex) + groups.length) % groups.length;
+  styleState.confirmedDuplicatePanelOpen = false;
+  const group = confirmedCurrentImportGroup();
+  styleState.confirmedImportImageIndex = (Number(imageIndex) + group.items.length) % group.items.length;
+  applyExtractedConfirmedMetadata(group.items[styleState.confirmedImportImageIndex]?.metadata || group.data || {});
+  renderConfirmedImportNavigator();
+}
+
+function moveConfirmedImportGroup(delta) {
+  selectConfirmedImportItem(styleState.confirmedImportGroupIndex + delta, 0);
+}
+
+function moveConfirmedImportImage(delta) {
+  selectConfirmedImportItem(
+    styleState.confirmedImportGroupIndex,
+    styleState.confirmedImportImageIndex + delta,
+  );
+}
+
+function splitConfirmedImportImage() {
+  const group = confirmedCurrentImportGroup();
+  if (!group || group.items.length < 2) return;
+  captureConfirmedImportGroupData();
+  const [item] = group.items.splice(styleState.confirmedImportImageIndex, 1);
+  const newGroup = {
+    signature: `manual:${Date.now()}:${Math.random()}`,
+    items: [item],
+    data: { ...(item.metadata || group.data || {}) },
+  };
+  const nextIndex = styleState.confirmedImportGroupIndex + 1;
+  styleState.confirmedImportGroups.splice(nextIndex, 0, newGroup);
+  selectConfirmedImportItem(nextIndex, 0, { capture: false });
+}
+
+function removeConfirmedImportGroup() {
+  const group = confirmedCurrentImportGroup();
+  if (!group) return;
+  revokeConfirmedImportGroups([group]);
+  styleState.confirmedImportGroups.splice(styleState.confirmedImportGroupIndex, 1);
+  const nextIndex = Math.min(styleState.confirmedImportGroupIndex, styleState.confirmedImportGroups.length - 1);
+  selectConfirmedImportItem(Math.max(0, nextIndex), 0, { capture: false });
+}
+
 function confirmedGeneratedSourceValues(item) {
   return {
     ...item,
@@ -3494,7 +4155,13 @@ function openConfirmedStyleModal(item = null, editing = false) {
     ? { source_type: styleState.managerMode === "shared" ? "shared" : "generated", source_id: item.id }
     : null;
   styleState.confirmedModalEditId = editing ? item.id : null;
+  styleState.confirmedModalPreviewData = source;
   styleState.confirmedModalFile = null;
+  revokeConfirmedImportGroups();
+  styleState.confirmedImportGroups = [];
+  styleState.confirmedImportGroupIndex = 0;
+  styleState.confirmedImportImageIndex = 0;
+  styleState.confirmedDuplicatePanelOpen = false;
   styleState.confirmedModalExcludedTags = [...(source.excluded_quality_tags || [])];
   styleState.confirmedModalOriginalQualityPrompt = source.original_quality_prompt || source.quality_prompt || source.base_prompt || "";
   if (styleState.confirmedModalObjectUrl) URL.revokeObjectURL(styleState.confirmedModalObjectUrl);
@@ -3504,6 +4171,7 @@ function openConfirmedStyleModal(item = null, editing = false) {
   confirmedFormValue("confirmedStyleArtistPrompt", source.artist_prompt || "");
   confirmedFormValue("confirmedStyleQualityPrompt", source.quality_prompt || source.base_prompt || source.prompt || "");
   confirmedFormValue("confirmedStyleFixedPrompt", source.fixed_prompt || "");
+  confirmedFormValue("confirmedStyleCharacterPrompts", (source.character_prompts || []).map((entry) => typeof entry === "string" ? entry : entry?.prompt || "").filter(Boolean).join("\n"));
   confirmedFormValue("confirmedStyleNegativePrompt", source.negative_prompt || "");
   confirmedFormValue("confirmedStyleSampler", source.sampler || "");
   confirmedFormValue("confirmedStyleScheduler", source.noise_schedule || "");
@@ -3518,18 +4186,35 @@ function openConfirmedStyleModal(item = null, editing = false) {
   if (title) title.textContent = editing ? "확정 그림체 수정" : item ? "확정 그림체로 추가" : "그림체 직접 추가";
   const choose = styleElement("chooseConfirmedStyleImage");
   if (choose) choose.disabled = editing;
+  const chooseFolder = styleElement("chooseConfirmedStyleFolder");
+  if (chooseFolder) chooseFolder.disabled = editing;
+  const saveAll = styleElement("saveAllConfirmedStyles");
+  if (saveAll) saveAll.classList.toggle("hidden", editing || Boolean(item));
   const status = styleElement("confirmedStyleMetadataStatus");
   if (status) status.textContent = editing ? "저장된 정보를 수정합니다." : item ? "원본의 저장 정보를 불러왔습니다." : "PNG 원본이면 NovelAI 설정을 자동으로 읽습니다.";
   const modalStatus = styleElement("confirmedStyleModalStatus");
   if (modalStatus) modalStatus.textContent = "";
+  styleState.confirmedFolderPending = false;
+  renderConfirmedFolderContents([]);
+  setConfirmedImportProgress(0, 0);
   styleElement("confirmedStyleModal")?.classList.remove("hidden");
+  renderConfirmedImportNavigator();
 }
 
 function closeConfirmedStyleModal() {
+  closeConfirmedDuplicateReview();
+  closeConfirmedFolderReview();
   styleElement("confirmedStyleModal")?.classList.add("hidden");
   if (styleState.confirmedModalObjectUrl) URL.revokeObjectURL(styleState.confirmedModalObjectUrl);
   styleState.confirmedModalObjectUrl = "";
   styleState.confirmedModalFile = null;
+  styleState.confirmedModalPreviewData = null;
+  revokeConfirmedImportGroups();
+  styleState.confirmedImportGroups = [];
+  styleState.confirmedDuplicatePanelOpen = false;
+  styleState.confirmedFolderPending = false;
+  renderConfirmedFolderContents([]);
+  setConfirmedImportProgress(0, 0);
   hidePromptTagAutocomplete();
 }
 
@@ -4098,6 +4783,7 @@ function applyExtractedConfirmedMetadata(metadata) {
   confirmedFormValue("confirmedStyleArtistPrompt", metadata.artist_prompt || "");
   confirmedFormValue("confirmedStyleQualityPrompt", metadata.quality_prompt || "");
   confirmedFormValue("confirmedStyleFixedPrompt", metadata.fixed_prompt || "");
+  confirmedFormValue("confirmedStyleCharacterPrompts", (metadata.character_prompts || []).map((entry) => typeof entry === "string" ? entry : entry?.prompt || "").filter(Boolean).join("\n"));
   confirmedFormValue("confirmedStyleNegativePrompt", metadata.negative_prompt || "");
   confirmedFormValue("confirmedStyleSampler", metadata.sampler || "");
   confirmedFormValue("confirmedStyleScheduler", metadata.noise_schedule || "");
@@ -4111,31 +4797,182 @@ function applyExtractedConfirmedMetadata(metadata) {
   renderConfirmedExcludedTags();
 }
 
-async function useConfirmedStyleFile(file) {
-  if (!(file instanceof Blob)) return;
-  if (file.size > 32 * 1024 * 1024) {
-    const status = styleElement("confirmedStyleModalStatus");
-    if (status) status.textContent = "이미지는 32MB 이하여야 합니다.";
-    return;
-  }
-  styleState.confirmedModalFile = file;
-  styleState.confirmedModalSource = null;
-  if (styleState.confirmedModalObjectUrl) URL.revokeObjectURL(styleState.confirmedModalObjectUrl);
-  styleState.confirmedModalObjectUrl = URL.createObjectURL(file);
-  setConfirmedPreview(styleState.confirmedModalObjectUrl);
+async function extractConfirmedImportFile(file) {
   const form = new FormData();
   form.append("image", file, file.name || "pasted.png");
-  const status = styleElement("confirmedStyleMetadataStatus");
-  if (status) status.textContent = "이미지 정보를 읽는 중…";
-  try {
-    const metadata = await apiFetch("/api/confirmed-styles/extract", { method: "POST", body: form });
-    applyExtractedConfirmedMetadata(metadata);
-    if (status) status.textContent = metadata.metadata_status === "ok"
-      ? "NovelAI 메타데이터를 불러왔습니다."
-      : "메타데이터가 없어 이미지 크기만 읽었습니다. 나머지는 직접 입력하세요.";
-  } catch (error) {
-    if (status) status.textContent = error.message;
+  const metadata = await apiFetch("/api/confirmed-styles/extract", { method: "POST", body: form });
+  metadata.model = normalizeConfirmedModelName(metadata.model);
+  return { file, metadata, objectUrl: URL.createObjectURL(file) };
+}
+
+function renderConfirmedFolderContents(files) {
+  const button = styleElement("confirmedStyleFolderContents");
+  const summary = styleElement("confirmedStyleFolderSummary");
+  const list = styleElement("confirmedStyleFolderContentsList");
+  if (!button || !summary || !list) return;
+  const items = [...(files || [])];
+  styleState.confirmedFolderPreviewUrls.forEach((url) => URL.revokeObjectURL(url));
+  styleState.confirmedFolderPreviewUrls = [];
+  styleState.confirmedFolderFiles = items;
+  button.classList.toggle("hidden", !items.length);
+  button.textContent = items.length ? `폴더 이미지 ${items.length}장 확인` : "";
+  summary.textContent = items.length ? `이미지 ${items.length}장 · 썸네일을 누르면 크게 볼 수 있습니다.` : "";
+  list.replaceChildren();
+  const viewerItems = [];
+  items.forEach((file, index) => {
+    const objectUrl = URL.createObjectURL(file);
+    styleState.confirmedFolderPreviewUrls.push(objectUrl);
+    viewerItems.push({
+      image_url: objectUrl,
+      base_prompt: file.webkitRelativePath || file.name || `이미지 ${index + 1}`,
+      negative_prompt: "",
+      character_prompts: [],
+      width: "?",
+      height: "?",
+      sampler: "",
+      noise_schedule: "",
+      steps: "?",
+      scale: "?",
+      cfg_rescale: "?",
+      seed: "?",
+    });
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "confirmed-style-folder-card";
+    const image = document.createElement("img");
+    image.src = objectUrl;
+    image.loading = "lazy";
+    image.alt = file.name || `폴더 이미지 ${index + 1}`;
+    const label = document.createElement("span");
+    label.textContent = file.webkitRelativePath || file.name || "이름 없는 이미지";
+    card.append(image, label);
+    card.addEventListener("click", () => openGeneratedImage(viewerItems, index));
+    list.append(card);
+  });
+  if (!items.length) closeConfirmedFolderReview();
+}
+
+function openConfirmedFolderReview() {
+  if (!styleElement("confirmedStyleFolderContentsList")?.children.length) return;
+  styleElement("importConfirmedStyleFolder")?.classList.toggle("hidden", !styleState.confirmedFolderPending);
+  styleElement("confirmedStyleFolderModal")?.classList.remove("hidden");
+}
+
+function closeConfirmedFolderReview() {
+  styleElement("confirmedStyleFolderModal")?.classList.add("hidden");
+}
+
+function cancelConfirmedFolderReview() {
+  closeConfirmedFolderReview();
+  if (!styleState.confirmedFolderPending) return;
+  styleState.confirmedFolderPending = false;
+  renderConfirmedFolderContents([]);
+}
+
+function stageConfirmedFolderFiles(files) {
+  const candidates = [...(files || [])].filter((file) => (
+    file instanceof Blob && (!file.type || file.type.startsWith("image/"))
+  ));
+  if (!candidates.length) return;
+  styleState.confirmedFolderPending = true;
+  renderConfirmedFolderContents(candidates);
+  openConfirmedFolderReview();
+}
+
+async function confirmConfirmedFolderImport() {
+  const files = [...styleState.confirmedFolderFiles];
+  if (!files.length) return;
+  styleState.confirmedFolderPending = false;
+  closeConfirmedFolderReview();
+  await useConfirmedStyleFiles(files);
+}
+
+function setConfirmedImportProgress(completed, total) {
+  const container = styleElement("confirmedStyleImportProgress");
+  const bar = styleElement("confirmedStyleImportProgressBar");
+  const text = styleElement("confirmedStyleImportProgressText");
+  const active = total > 0 && completed < total;
+  container?.classList.toggle("hidden", !active);
+  styleElement("confirmedStyleImageColumn")?.classList.toggle("importing", active);
+  if (bar) {
+    bar.max = Math.max(1, total);
+    bar.value = Math.max(0, Math.min(completed, total));
   }
+  if (text) text.textContent = total
+    ? `가져오는 중 ${completed}/${total} · 남음 ${Math.max(0, total - completed)}`
+    : "";
+}
+
+async function useConfirmedStyleFiles(files, { showFolderContents = false } = {}) {
+  if (styleState.confirmedModalEditId || styleState.confirmedImportBusy) return;
+  const candidates = [...(files || [])].filter((file) => (
+    file instanceof Blob && (!file.type || file.type.startsWith("image/"))
+  ));
+  if (!candidates.length) return;
+  renderConfirmedFolderContents(showFolderContents ? candidates : []);
+  const currentCount = styleState.confirmedImportGroups.reduce((total, group) => total + group.items.length, 0);
+  if (currentCount + candidates.length > 500) {
+    const status = styleElement("confirmedStyleModalStatus");
+    if (status) status.textContent = "이미지는 한 번에 최대 500장까지 가져올 수 있습니다.";
+    return;
+  }
+  const oversized = candidates.find((file) => file.size > 32 * 1024 * 1024);
+  if (oversized) {
+    const status = styleElement("confirmedStyleModalStatus");
+    if (status) status.textContent = `${oversized.name || "이미지"}: 32MB 이하여야 합니다.`;
+    return;
+  }
+  styleState.confirmedImportBusy = true;
+  styleState.confirmedModalSource = null;
+  const status = styleElement("confirmedStyleMetadataStatus");
+  const extracted = [];
+  let completed = 0;
+  setConfirmedImportProgress(completed, candidates.length);
+  renderConfirmedImportNavigator();
+  try {
+    for (let offset = 0; offset < candidates.length; offset += 4) {
+      const results = await Promise.allSettled(candidates.slice(offset, offset + 4).map(async (file) => {
+        const item = await extractConfirmedImportFile(file);
+        completed += 1;
+        setConfirmedImportProgress(completed, candidates.length);
+        if (status) status.textContent = `이미지 정보를 읽는 중 · ${completed}/${candidates.length} · 남음 ${candidates.length - completed}`;
+        return item;
+      }));
+      results.forEach((result) => {
+        if (result.status === "fulfilled") extracted.push(result.value);
+      });
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure) throw failure.reason;
+    }
+    const incomingGroups = groupConfirmedImportItems(extracted);
+    if (status) status.textContent = "이미 추가된 그림체가 있는지 확인하는 중…";
+    attachConfirmedStyleSuspects(incomingGroups, await apiFetch("/api/confirmed-styles"));
+    incomingGroups.forEach((incoming) => {
+      const existing = incoming.signature && styleState.confirmedImportGroups.find((group) => group.signature === incoming.signature);
+      if (existing) {
+        existing.items.push(...incoming.items);
+        existing.suspectedStyles = incoming.suspectedStyles;
+      }
+      else styleState.confirmedImportGroups.push(incoming);
+    });
+    if (styleState.confirmedImportGroups.length === incomingGroups.length) {
+      selectConfirmedImportItem(0, 0, { capture: false });
+    } else {
+      renderConfirmedImportNavigator();
+    }
+    if (status) status.textContent = `${candidates.length}장을 읽어 ${incomingGroups.length}개 그림체 후보로 분류했습니다.`;
+  } catch (error) {
+    extracted.forEach((item) => URL.revokeObjectURL(item.objectUrl));
+    if (status) status.textContent = error.message;
+  } finally {
+    styleState.confirmedImportBusy = false;
+    setConfirmedImportProgress(candidates.length, candidates.length);
+    renderConfirmedImportNavigator();
+  }
+}
+
+async function useConfirmedStyleFile(file) {
+  return useConfirmedStyleFiles(file ? [file] : []);
 }
 
 function nullableConfirmedNumber(id) {
@@ -4155,6 +4992,7 @@ function readConfirmedStyleForm() {
     original_quality_prompt: styleState.confirmedModalOriginalQualityPrompt || styleElement("confirmedStyleQualityPrompt")?.value || "",
     excluded_quality_tags: [...styleState.confirmedModalExcludedTags],
     fixed_prompt: styleElement("confirmedStyleFixedPrompt")?.value || "",
+    character_prompts: (styleElement("confirmedStyleCharacterPrompts")?.value || "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
     negative_prompt: styleElement("confirmedStyleNegativePrompt")?.value || "",
     sampler: styleElement("confirmedStyleSampler")?.value || "",
     noise_schedule: styleElement("confirmedStyleScheduler")?.value || "",
@@ -4166,7 +5004,40 @@ function readConfirmedStyleForm() {
   };
 }
 
-async function saveConfirmedStyleFromModal() {
+async function saveConfirmedImportGroups(saveAll) {
+  captureConfirmedImportGroupData();
+  const selectedIndexes = saveAll
+    ? styleState.confirmedImportGroups.map((_, index) => index)
+    : [styleState.confirmedImportGroupIndex];
+  const selectedGroups = selectedIndexes.map((index) => styleState.confirmedImportGroups[index]).filter(Boolean);
+  if (!selectedGroups.length) throw new Error("저장할 그림체 이미지를 추가해 주세요.");
+  const form = new FormData();
+  const manifest = [];
+  let fileIndex = 0;
+  selectedGroups.forEach((group) => {
+    const fileIndexes = [];
+    group.items.forEach((item) => {
+      form.append("images", item.file, item.file.name || `import-${fileIndex + 1}.png`);
+      fileIndexes.push(fileIndex);
+      fileIndex += 1;
+    });
+    manifest.push({ file_indexes: fileIndexes, data: group.data || group.items[0]?.metadata || {} });
+  });
+  form.append("manifest", JSON.stringify(manifest));
+  const result = await apiFetch("/api/confirmed-styles/import-batch", { method: "POST", body: form });
+  selectedIndexes.sort((left, right) => right - left).forEach((index) => {
+    const [removed] = styleState.confirmedImportGroups.splice(index, 1);
+    if (removed) revokeConfirmedImportGroups([removed]);
+  });
+  styleState.confirmedImportGroupIndex = Math.min(
+    styleState.confirmedImportGroupIndex,
+    Math.max(0, styleState.confirmedImportGroups.length - 1),
+  );
+  styleState.confirmedImportImageIndex = 0;
+  return result;
+}
+
+async function saveConfirmedStyleFromModal(saveAll = false) {
   const status = styleElement("confirmedStyleModalStatus");
   const data = readConfirmedStyleForm();
   try {
@@ -4176,11 +5047,8 @@ async function saveConfirmedStyleFromModal() {
         method: "PATCH",
         body: JSON.stringify(data),
       });
-    } else if (styleState.confirmedModalFile) {
-      const form = new FormData();
-      form.append("image", styleState.confirmedModalFile, styleState.confirmedModalFile.name || "pasted.png");
-      form.append("data", JSON.stringify(data));
-      result = await apiFetch("/api/confirmed-styles", { method: "POST", body: form });
+    } else if (styleState.confirmedImportGroups.length) {
+      result = await saveConfirmedImportGroups(saveAll);
     } else if (styleState.confirmedModalSource) {
       result = await apiFetch("/api/confirmed-styles", {
         method: "POST",
@@ -4189,8 +5057,14 @@ async function saveConfirmedStyleFromModal() {
     } else {
       throw new Error("대표 이미지를 추가해 주세요.");
     }
-    closeConfirmedStyleModal();
-    setStyleManagerMode("confirmed");
+    styleState.managerDirty = true;
+    if (styleState.confirmedImportGroups.length && !saveAll) {
+      selectConfirmedImportItem(styleState.confirmedImportGroupIndex, 0, { capture: false });
+      if (status) status.textContent = "현재 그림체 묶음을 저장했습니다. 남은 묶음을 계속 확인할 수 있습니다.";
+    } else {
+      closeConfirmedStyleModal();
+      setStyleManagerMode("confirmed");
+    }
     return result;
   } catch (error) {
     if (status) status.textContent = error.message;
@@ -4279,8 +5153,7 @@ function initializeStyleMaker() {
   styleElement("rerollStyleArtists")?.addEventListener("click", () => loadStyleArtists("artists"));
   styleElement("rerollStyleWeights")?.addEventListener("click", () => loadStyleArtists("weights"));
   styleElement("rerollStyleAll")?.addEventListener("click", () => loadStyleArtists("all"));
-  styleElement("sortStyleAsc")?.addEventListener("click", () => sortStyleArtists("asc"));
-  styleElement("sortStyleDesc")?.addEventListener("click", () => sortStyleArtists("desc"));
+  document.querySelectorAll("[data-weight-table-sort]").forEach((button) => button.addEventListener("click", cycleWeightTableSort));
   styleElement("styleArtistSearch")?.addEventListener("input", () => {
     renderRatedArtistSelect();
     clearTimeout(styleState.styleArtistAutocompleteTimer);
@@ -4291,7 +5164,21 @@ function initializeStyleMaker() {
     const input = styleElement("styleArtistSearch");
     if (input && event.target.value) input.value = event.target.value;
   });
-  styleElement("addStyleArtist")?.addEventListener("click", addStyleArtist);
+  styleElement("addStyleArtist")?.addEventListener("click", () => addStyleArtist("main"));
+  styleElement("openWeightTable")?.addEventListener("click", openWeightTableModal);
+  styleElement("closeWeightTable")?.addEventListener("click", closeWeightTableModal);
+  document.querySelectorAll("[data-close-weight-table]").forEach((item) => item.addEventListener("click", closeWeightTableModal));
+  styleElement("weightTableArtistSearch")?.addEventListener("input", () => {
+    renderRatedArtistSelect();
+    clearTimeout(styleState.styleArtistAutocompleteTimer);
+    styleState.styleArtistAutocompleteTimer = setTimeout(() => updateStyleArtistAutocomplete("modal"), 220);
+  });
+  styleElement("weightTableArtistSearch")?.addEventListener("keydown", (event) => handleStyleArtistAutocompleteKeydown(event, "modal"));
+  styleElement("weightTableArtistSelect")?.addEventListener("change", (event) => {
+    const input = styleElement("weightTableArtistSearch");
+    if (input && event.target.value) input.value = event.target.value;
+  });
+  styleElement("weightTableAddArtist")?.addEventListener("click", () => addStyleArtist("modal"));
   styleElement("openRatingTagRules")?.addEventListener("click", openRatingTagRulesModal);
   styleElement("closeRatingTagRules")?.addEventListener("click", closeRatingTagRulesModal);
   styleElement("cancelRatingTagRules")?.addEventListener("click", closeRatingTagRulesModal);
@@ -4324,14 +5211,12 @@ function initializeStyleMaker() {
   styleElement("fixedPrompt")?.addEventListener("input", savePromptDraft);
   ["basePrompt", "fixedPrompt", "negativePrompt"]
     .forEach((id) => bindPromptTagAutocomplete(styleElement(id)));
-  styleElement("promptPresetSelect")?.addEventListener("change", (event) => {
-    styleState.selectedPromptPresetKey = event.target.value;
-    savePromptPresetSettings();
-  });
-  styleElement("applyPromptPreset")?.addEventListener("click", () => {
-    const key = styleElement("promptPresetSelect")?.value;
-    applyPromptPreset(styleState.promptPresets.find((preset) => preset.key === key));
-  });
+  styleElement("openPromptPresetModal")?.addEventListener("click", openPromptPresetModal);
+  styleElement("closePromptPresetModal")?.addEventListener("click", closePromptPresetModal);
+  styleElement("cancelPromptPresetModal")?.addEventListener("click", closePromptPresetModal);
+  document.querySelectorAll("[data-close-prompt-preset]").forEach((item) => item.addEventListener("click", closePromptPresetModal));
+  styleElement("promptPresetQualityEditor")?.addEventListener("input", updatePromptPresetFullPreview);
+  styleElement("saveAndApplyPromptPreset")?.addEventListener("click", saveAndApplyPromptPreset);
   styleElement("toggleGenerationParameters")?.addEventListener("click", () => {
     const panel = styleElement("generationParameters");
     const button = styleElement("toggleGenerationParameters");
@@ -4530,19 +5415,36 @@ if (typeof document !== "undefined") {
   styleElement("closeConfirmedStyleModal")?.addEventListener("click", closeConfirmedStyleModal);
   styleElement("cancelConfirmedStyle")?.addEventListener("click", closeConfirmedStyleModal);
   document.querySelectorAll("[data-close-confirmed-style]").forEach((item) => item.addEventListener("click", closeConfirmedStyleModal));
-  styleElement("saveConfirmedStyle")?.addEventListener("click", saveConfirmedStyleFromModal);
+  styleElement("saveConfirmedStyle")?.addEventListener("click", () => saveConfirmedStyleFromModal(false));
+  styleElement("saveAllConfirmedStyles")?.addEventListener("click", () => saveConfirmedStyleFromModal(true));
   styleElement("chooseConfirmedStyleImage")?.addEventListener("click", () => styleElement("confirmedStyleFile")?.click());
-  styleElement("confirmedStyleFile")?.addEventListener("change", (event) => useConfirmedStyleFile(event.target.files?.[0]));
+  styleElement("chooseConfirmedStyleFolder")?.addEventListener("click", () => styleElement("confirmedStyleFolder")?.click());
+  styleElement("confirmedStyleFile")?.addEventListener("change", (event) => {
+    useConfirmedStyleFiles(event.target.files);
+    event.target.value = "";
+  });
+  styleElement("confirmedStyleFolder")?.addEventListener("change", (event) => {
+    stageConfirmedFolderFiles(event.target.files);
+    event.target.value = "";
+  });
+  styleElement("confirmedStylePrevGroup")?.addEventListener("click", () => moveConfirmedImportGroup(-1));
+  styleElement("confirmedStyleNextGroup")?.addEventListener("click", () => moveConfirmedImportGroup(1));
+  styleElement("confirmedStylePrevImage")?.addEventListener("click", () => moveConfirmedImportImage(-1));
+  styleElement("confirmedStyleNextImage")?.addEventListener("click", () => moveConfirmedImportImage(1));
+  styleElement("splitConfirmedStyleImage")?.addEventListener("click", splitConfirmedImportImage);
+  styleElement("removeConfirmedStyleGroup")?.addEventListener("click", removeConfirmedImportGroup);
+  styleElement("confirmedStyleDuplicateWarning")?.addEventListener("click", openConfirmedDuplicateReview);
+  styleElement("confirmedStyleFolderContents")?.addEventListener("click", openConfirmedFolderReview);
+  styleElement("closeConfirmedStyleFolder")?.addEventListener("click", cancelConfirmedFolderReview);
+  styleElement("cancelConfirmedStyleFolder")?.addEventListener("click", cancelConfirmedFolderReview);
+  styleElement("importConfirmedStyleFolder")?.addEventListener("click", confirmConfirmedFolderImport);
+  document.querySelectorAll("[data-close-confirmed-folder]").forEach((item) => item.addEventListener("click", cancelConfirmedFolderReview));
+  styleElement("closeConfirmedStyleDuplicate")?.addEventListener("click", closeConfirmedDuplicateReview);
+  document.querySelectorAll("[data-close-confirmed-duplicate]").forEach((item) => item.addEventListener("click", closeConfirmedDuplicateReview));
+  styleElement("confirmedStyleDuplicatePrevImage")?.addEventListener("click", () => moveConfirmedDuplicateImage(-1));
+  styleElement("confirmedStyleDuplicateNextImage")?.addEventListener("click", () => moveConfirmedDuplicateImage(1));
   const confirmedDropZone = styleElement("confirmedStyleDropZone");
-  confirmedDropZone?.addEventListener("click", () => {
-    if (!styleState.confirmedModalEditId) styleElement("confirmedStyleFile")?.click();
-  });
-  confirmedDropZone?.addEventListener("keydown", (event) => {
-    if ((event.key === "Enter" || event.key === " ") && !styleState.confirmedModalEditId) {
-      event.preventDefault();
-      styleElement("confirmedStyleFile")?.click();
-    }
-  });
+  styleElement("confirmedStylePreview")?.addEventListener("click", openConfirmedStylePreview);
   ["dragenter", "dragover"].forEach((eventName) => confirmedDropZone?.addEventListener(eventName, (event) => {
     event.preventDefault();
     confirmedDropZone.classList.add("drag-over");
@@ -4550,17 +5452,17 @@ if (typeof document !== "undefined") {
   ["dragleave", "drop"].forEach((eventName) => confirmedDropZone?.addEventListener(eventName, (event) => {
     event.preventDefault();
     confirmedDropZone.classList.remove("drag-over");
-    if (eventName === "drop" && !styleState.confirmedModalEditId) useConfirmedStyleFile(event.dataTransfer?.files?.[0]);
+    if (eventName === "drop" && !styleState.confirmedModalEditId) useConfirmedStyleFiles(event.dataTransfer?.files);
   }));
-  ["confirmedStyleArtistPrompt", "confirmedStyleQualityPrompt", "confirmedStyleFixedPrompt", "confirmedStyleNegativePrompt"]
+  ["confirmedStyleArtistPrompt", "confirmedStyleQualityPrompt", "confirmedStyleFixedPrompt", "confirmedStyleCharacterPrompts", "confirmedStyleNegativePrompt"]
     .forEach((id) => bindPromptTagAutocomplete(styleElement(id)));
   document.addEventListener("paste", (event) => {
     const modal = styleElement("confirmedStyleModal");
     if (!modal || modal.classList.contains("hidden") || styleState.confirmedModalEditId) return;
-    const file = [...(event.clipboardData?.files || [])].find((item) => item.type.startsWith("image/"));
-    if (file) {
+    const files = [...(event.clipboardData?.files || [])].filter((item) => item.type.startsWith("image/"));
+    if (files.length) {
       event.preventDefault();
-      useConfirmedStyleFile(file);
+      useConfirmedStyleFiles(files);
     }
   });
   styleElement("generatedImageClose")?.addEventListener("click", closeGeneratedImage);
@@ -4568,11 +5470,30 @@ if (typeof document !== "undefined") {
   styleElement("generatedImagePrev")?.addEventListener("click", () => moveGeneratedImage(-1));
   styleElement("generatedImageNext")?.addEventListener("click", () => moveGeneratedImage(1));
   document.addEventListener("keydown", (event) => {
-    const modal = styleElement("generatedImageModal");
-    if (!modal || modal.classList.contains("hidden")) return;
-    if (event.key === "Escape") closeGeneratedImage();
-    if (event.key === "ArrowLeft") moveGeneratedImage(-1);
-    if (event.key === "ArrowRight") moveGeneratedImage(1);
+    const promptPresetModal = styleElement("promptPresetModal");
+    if (promptPresetModal && !promptPresetModal.classList.contains("hidden")) {
+      if (event.key === "Escape") closePromptPresetModal();
+      return;
+    }
+    const imageModal = styleElement("generatedImageModal");
+    if (imageModal && !imageModal.classList.contains("hidden")) {
+      if (event.key === "Escape") closeGeneratedImage();
+      if (event.key === "ArrowLeft") moveGeneratedImage(-1);
+      if (event.key === "ArrowRight") moveGeneratedImage(1);
+      return;
+    }
+    const duplicateModal = styleElement("confirmedStyleDuplicateModal");
+    if (duplicateModal && !duplicateModal.classList.contains("hidden")) {
+      if (event.key === "Escape") closeConfirmedDuplicateReview();
+      if (event.key === "ArrowLeft") moveConfirmedDuplicateImage(-1);
+      if (event.key === "ArrowRight") moveConfirmedDuplicateImage(1);
+      return;
+    }
+    const folderModal = styleElement("confirmedStyleFolderModal");
+    if (folderModal && !folderModal.classList.contains("hidden")) {
+      if (event.key === "Escape") cancelConfirmedFolderReview();
+      return;
+    }
   });
 }
 
@@ -4588,6 +5509,7 @@ if (typeof module !== "undefined" && module.exports) {
     reorderArtists,
     runLatestStyleRequest,
     sortArtistsByWeight,
+    sortFixedArtistEntriesForTable,
     validateCustomRangeValues,
     interpolateWeightProfile,
     formatArtistPromptTag,
@@ -4616,10 +5538,15 @@ if (typeof module !== "undefined" && module.exports) {
     addPromptGroupItem,
     cleanPromptGroups,
     buildEffectivePromptText,
+    promptPresetFullText,
     reachedGenerationLimit,
     toggleSelectedStyleId,
     managerCombinedPromptText,
     confirmedGeneratedSourceValues,
+    normalizeConfirmedModelName,
+    confirmedArtistPromptSignature,
+    groupConfirmedImportItems,
+    attachConfirmedStyleSuspects,
     filterStyleManagerItems,
     paginateStyleManagerItems,
     normalizeStyleManagerPageSize,

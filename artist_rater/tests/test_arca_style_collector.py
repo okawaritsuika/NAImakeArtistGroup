@@ -86,11 +86,14 @@ def png_with_text(key, value):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"tEXt", key.encode() + b"\0" + value.encode()) + chunk(b"IEND", b"")
 
 
-def png_with_stealth(metadata):
-    compressed = gzip.compress(json.dumps(metadata, ensure_ascii=False).encode("utf-8"))
-    bit_text = "".join(f"{byte:08b}" for byte in b"stealth_pngcomp")
-    bit_text += f"{len(compressed) * 8:032b}"
-    bit_text += "".join(f"{byte:08b}" for byte in compressed)
+def png_with_stealth(metadata, compressed=True):
+    payload = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+    if compressed:
+        payload = gzip.compress(payload)
+    signature = b"stealth_pngcomp" if compressed else b"stealth_pnginfo"
+    bit_text = "".join(f"{byte:08b}" for byte in signature)
+    bit_text += f"{len(payload) * 8:032b}"
+    bit_text += "".join(f"{byte:08b}" for byte in payload)
     height = 64
     width = (len(bit_text) + height - 1) // height
     image = Image.new("RGBA", (width, height), (10, 20, 30, 254))
@@ -102,6 +105,22 @@ def png_with_stealth(metadata):
     image.putalpha(Image.frombytes("L", image.size, bytes(alpha)))
     output = io.BytesIO()
     image.save(output, "PNG")
+    return output.getvalue()
+
+
+def webp_with_exif_user_comment(metadata):
+    payload = json.dumps(metadata, ensure_ascii=False).encode("utf-16-be")
+    exif = Image.Exif()
+    exif[37510] = b"UNICODE\x00" + payload
+    output = io.BytesIO()
+    Image.new("RGB", (8, 8), (20, 30, 40)).save(output, "WEBP", lossless=True, exif=exif)
+    return output.getvalue()
+
+
+def webp_with_stealth(metadata):
+    output = io.BytesIO()
+    with Image.open(io.BytesIO(png_with_stealth(metadata))) as image:
+        image.save(output, "WEBP", lossless=True)
     return output.getvalue()
 
 
@@ -1219,6 +1238,10 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual(result["presets"][0]["negative_prompt"], "lowres, bad hands")
         self.assertEqual(result["presets"][0]["match_count"], 1)
         self.assertEqual(
+            result["presets"][0]["representative_image"]["remote_image_url"],
+            "https://img/1.png",
+        )
+        self.assertEqual(
             [item["prompt"] for item in result["presets"][0]["excluded_tags"]],
             ["1girl", "blue_hair", "full body"],
         )
@@ -1358,6 +1381,72 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual(meta["negative_prompt"], "lowres, bad anatomy")
         self.assertEqual(meta["seed"], "1234")
 
+    def test_extracts_outer_stealth_source_and_nested_character_prompt(self):
+        nested = {
+            "prompt": "artist:foo, masterpiece",
+            "uc": "lowres",
+            "seed": 77,
+            "sampler": "k_euler",
+            "v4_prompt": {"caption": {
+                "base_caption": "artist:foo, masterpiece",
+                "char_captions": [{"char_caption": "1girl, blue eyes", "centers": []}],
+            }},
+        }
+        data = png_with_stealth({
+            "Software": "NovelAI",
+            "Source": "NovelAI Diffusion V4.5 4BDE2A90",
+            "Comment": json.dumps(nested),
+        })
+        meta = extract_novelai_metadata(data, "image/png")
+        self.assertEqual(meta["model"], "NovelAI Diffusion V4.5 4BDE2A90")
+        self.assertEqual(meta["character_prompts"][0]["prompt"], "1girl, blue eyes")
+
+    def test_extracts_uncompressed_stealth_description_without_comment(self):
+        data = png_with_stealth({
+            "Description": "artist:foo, watercolor",
+            "Software": "NovelAI",
+            "Source": "NovelAI Diffusion V4.5 4BDE2A90",
+        }, compressed=False)
+        meta = extract_novelai_metadata(data, "image/png")
+        self.assertEqual(meta["metadata_status"], "ok")
+        self.assertEqual(meta["prompt"], "artist:foo, watercolor")
+        self.assertEqual(meta["model"], "NovelAI Diffusion V4.5 4BDE2A90")
+
+    def test_extracts_novelai_webp_exif_user_comment(self):
+        data = webp_with_exif_user_comment({
+            "prompt": "masterpiece, artist:webp",
+            "uc": "lowres, bad anatomy",
+            "seed": 2468,
+            "sampler": "k_euler_ancestral",
+            "steps": 28,
+            "scale": 5,
+            "source": "NovelAI Diffusion V4.5 Full",
+        })
+
+        meta = extract_novelai_metadata(data, "image/webp")
+
+        self.assertEqual(meta["metadata_status"], "ok")
+        self.assertEqual(meta["prompt"], "masterpiece, artist:webp")
+        self.assertEqual(meta["negative_prompt"], "lowres, bad anatomy")
+        self.assertEqual(meta["seed"], "2468")
+        self.assertEqual(meta["model"], "NovelAI Diffusion V4.5 Full")
+
+    def test_extracts_novelai_webp_stealth_prompt(self):
+        data = webp_with_stealth({
+            "prompt": "masterpiece, artist:stealth webp",
+            "uc": "lowres, bad anatomy",
+            "seed": 1357,
+            "sampler": "k_euler_ancestral",
+            "steps": 28,
+        })
+
+        meta = extract_novelai_metadata(data, "image/webp")
+
+        self.assertEqual(meta["metadata_status"], "ok")
+        self.assertEqual(meta["prompt"], "masterpiece, artist:stealth webp")
+        self.assertEqual(meta["negative_prompt"], "lowres, bad anatomy")
+        self.assertEqual(meta["seed"], "1357")
+
     def test_broken_stealth_compression_does_not_abort_collection(self):
         data = png_with_stealth({"prompt": "artist:foo", "seed": 1, "sampler": "k_euler"})
         with patch("arca_style_collector.gzip.decompress", side_effect=zlib.error("invalid distance")):
@@ -1444,13 +1533,19 @@ class ArcaCollectorTest(unittest.TestCase):
         )
         self.assertEqual(retry_count, 0)
 
-    def test_save_article_stops_non_png_response_before_reading_body(self):
+    def test_save_article_downloads_webp_and_extracts_stealth_metadata(self):
+        payload = webp_with_stealth({
+            "prompt": "masterpiece, artist:archive webp",
+            "uc": "lowres",
+            "seed": 8642,
+            "sampler": "k_euler_ancestral",
+        })
+
         class Response:
             headers = {"Content-Type": "image/webp"}
             closed = False
             def raise_for_status(self): pass
-            def iter_content(self, _size):
-                raise AssertionError("non-PNG body must not be read")
+            def iter_content(self, _size): return [payload]
             def close(self): self.closed = True
 
         response = Response()
@@ -1461,20 +1556,74 @@ class ArcaCollectorTest(unittest.TestCase):
         article = {
             "source_url": "https://arca.live/b/aiart/header-non-png", "article_id": "header-non-png", "board_tab": "NAI",
             "title": "style", "author": "a", "posted_at": "2026-06-01", "body_text": "",
-            "image_urls": ["https://img.example/resource"],
+            "image_urls": ["https://img.example/resource.webp"],
         }
+        image_dir = Path(self.temp.name) / "images"
         summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
         network_count, item_id = _save_article(
-            self.db_path, Path(self.temp.name) / "images", Session(), article, summary,
+            self.db_path, image_dir, Session(), article, summary,
         )
-        self.assertEqual(network_count, 0)
+        self.assertEqual(network_count, 1)
         self.assertTrue(response.closed)
         with closing(sqlite3.connect(self.db_path)) as conn:
             row = conn.execute(
-                "SELECT content_type,metadata_status,image_path FROM arca_style_images WHERE item_id=?",
+                "SELECT content_type,metadata_status,image_path,prompt FROM arca_style_images WHERE item_id=?",
                 (item_id,),
             ).fetchone()
-        self.assertEqual(row, ("image/webp", "no_metadata", ""))
+        self.assertEqual(row[:2], ("image/webp", "ok"))
+        self.assertTrue(row[2].endswith(".webp"))
+        self.assertEqual(row[3], "masterpiece, artist:archive webp")
+        self.assertTrue((image_dir / row[2]).is_file())
+
+    def test_save_article_retries_webp_previously_cached_without_metadata(self):
+        image_url = "https://img.example/previously-skipped.webp"
+        image_dir = Path(self.temp.name) / "images"
+        image_dir.mkdir()
+        (image_dir / "previously-skipped.webp").write_bytes(b"old webp without extracted metadata")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at) VALUES(?,?,?)",
+                ("https://arca.live/b/aiart/retry-webp", "now", "now"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,image_path,content_type,metadata_status,created_at) VALUES(?,?,?,?,?,?)",
+                (item_id, image_url, "previously-skipped.webp", "image/webp", "no_metadata", "now"),
+            )
+
+        payload = webp_with_stealth({
+            "prompt": "artist:recovered webp",
+            "seed": 9753,
+            "sampler": "k_euler",
+        })
+
+        class Response:
+            headers = {"Content-Type": "image/webp"}
+            def raise_for_status(self): pass
+            def iter_content(self, _size): return [payload]
+            def close(self): pass
+
+        class Session:
+            def __init__(self): self.calls = 0
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                return Response()
+
+        session = Session()
+        summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
+        downloaded, _ = _save_article(self.db_path, image_dir, session, {
+            "source_url": "https://arca.live/b/aiart/retry-webp", "article_id": "retry-webp",
+            "board_tab": "NAI", "title": "style", "author": "a", "posted_at": "2026-06-01",
+            "body_text": "", "image_urls": [image_url],
+        }, summary)
+
+        self.assertEqual((downloaded, session.calls), (1, 1))
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT metadata_status,prompt,image_path FROM arca_style_images WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(row[:2], ("ok", "artist:recovered webp"))
+        self.assertTrue(row[2].endswith(".webp"))
 
     def test_save_article_negative_caches_png_without_novelai_metadata_without_file(self):
         payload = png_with_text("Software", "generic drawing tool")

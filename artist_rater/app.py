@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 import requests
 from flask import Flask, jsonify, render_template, request, send_from_directory
+from PIL import Image, ImageOps
 
 from arca_chrome_extension import (
     ArcaChromeExtensionError,
@@ -83,20 +84,24 @@ from style_store import (
     list_generated_images,
     list_styles,
     load_app_key,
+    load_prompt_preset_overrides,
     release_generation_request,
     reserve_generation_request,
     save_app_key,
+    save_prompt_preset_override,
     save_generated_result,
     delete_generated_image_batch,
 )
 from confirmed_style_store import (
     MAX_IMAGE_BYTES as MAX_CONFIRMED_IMAGE_BYTES,
     create_confirmed_style,
+    create_confirmed_style_group,
     delete_confirmed_style,
     get_confirmed_style,
     init_confirmed_style_tables,
     inspect_image,
     list_confirmed_styles,
+    normalize_confirmed_model_name,
     update_confirmed_style,
 )
 from comparison_store import (
@@ -590,8 +595,12 @@ def choose_candidate_pool(candidates, random_mode, limit):
     return pool
 
 
-def fetch_artist_samples(artist_tag, query_tags, sample_limit):
+def fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_first=False):
     sample_limit = max(1, min(int(sample_limit or 12), 30))
+    if latest_first:
+        posts = search_posts([artist_tag], fetch_pages=1)
+        return [sample for post in posts if (sample := post_to_sample(post))][:sample_limit]
+
     posts = []
     seen = set()
     for tags in ([artist_tag] + query_tags, [artist_tag]):
@@ -609,6 +618,23 @@ def fetch_artist_samples(artist_tag, query_tags, sample_limit):
                 raise
     random.shuffle(posts)
     return posts[:sample_limit]
+
+
+def choose_candidate_pool_with_exclusions(candidates, random_mode, limit, exclude_query_tags):
+    limit = max(1, min(int(limit or 12), 30))
+    pool = []
+    excluded_count = 0
+    remaining = list(candidates)
+    while remaining and len(pool) < limit:
+        selected = choose_candidate(remaining, random_mode)
+        remaining = [item for item in remaining if item["artist_tag"] != selected["artist_tag"]]
+        if exclude_query_tags and search_posts(
+            [selected["artist_tag"], *exclude_query_tags], fetch_pages=1, limit=1
+        ):
+            excluded_count += 1
+            continue
+        pool.append(selected)
+    return pool, excluded_count
 
 
 def candidate_prompt(artist_tag):
@@ -661,6 +687,8 @@ def global_artist_candidates(min_artist_post_count, pages_to_try):
 def build_candidate_pool(payload):
     query_text = payload.get("query_text", "")
     query_tags = normalize_query_text(query_text)
+    exclude_query_tags = normalize_query_text(payload.get("exclude_query_text", ""))
+    latest_samples = payload.get("latest_samples") is True
     min_artist_post_count = int(payload.get("min_artist_post_count") or 1000)
     min_match_count = int(payload.get("min_match_count") or 3)
     fetch_pages = int(payload.get("fetch_pages") or 5)
@@ -681,6 +709,7 @@ def build_candidate_pool(payload):
         "unique_artist_count": 0,
         "min_match_candidate_count": 0,
         "post_count_filtered_count": 0,
+        "exclude_prompt_filtered_count": 0,
         "final_candidate_count": 0,
     }
 
@@ -740,12 +769,28 @@ def build_candidate_pool(payload):
             "filter_stats": filter_stats,
         }
 
-    selected_pool = choose_candidate_pool(candidates, random_mode, candidate_limit)
+    selected_pool, exclude_prompt_filtered_count = choose_candidate_pool_with_exclusions(
+        candidates, random_mode, candidate_limit, exclude_query_tags
+    )
+    filter_stats["exclude_prompt_filtered_count"] = exclude_prompt_filtered_count
+    filter_stats["final_candidate_count"] = len(selected_pool)
+    if not selected_pool:
+        return {
+            "ok": False,
+            "reason": "제외 프롬프트를 적용한 뒤 표시할 후보 작가가 없습니다.",
+            "mode": mode,
+            "query_tags": query_tags,
+            "exclude_query_tags": exclude_query_tags,
+            "latest_samples": latest_samples,
+            "filter_stats": filter_stats,
+        }
     return {
         "ok": True,
         "mode": mode,
         "query_tags": query_tags,
-        "candidate_count": len(candidates),
+        "exclude_query_tags": exclude_query_tags,
+        "latest_samples": latest_samples,
+        "candidate_count": len(selected_pool),
         "candidates": [candidate_payload(candidate) for candidate in selected_pool],
         "filter_stats": filter_stats,
     }
@@ -765,7 +810,9 @@ def pick_random_artist(payload):
         }
 
     selected = pool["candidates"][0]
-    samples = fetch_artist_samples(selected["artist_tag"], pool["query_tags"], sample_limit)
+    samples = fetch_artist_samples(
+        selected["artist_tag"], pool["query_tags"], sample_limit, pool.get("latest_samples", False)
+    )
     if not samples:
         return {
             "ok": False,
@@ -820,8 +867,9 @@ def api_artist_samples():
         return json_response({"ok": False, "error": "artist_tag가 필요합니다."}, 400)
     query_tags = payload.get("query_tags") or normalize_query_text(payload.get("query_text", ""))
     sample_limit = int(payload.get("sample_limit") or 10)
+    latest_samples = payload.get("latest_samples") is True
     try:
-        samples = fetch_artist_samples(artist_tag, query_tags, sample_limit)
+        samples = fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_samples)
     except requests.RequestException as exc:
         return json_response({"ok": False, "error": f"Danbooru API 오류: {exc}"}, 502)
     if not samples:
@@ -1014,9 +1062,10 @@ def api_style_maker_artists():
             slot = item.get("slot")
             if slot is None:
                 continue
-            if type(slot) is not int or slot < 1:
-                raise ValueError("고정 작가 자리는 1 이상의 정수여야 합니다.")
-            fixed_slots.append(slot)
+            if type(slot) is not int or slot < 0:
+                raise ValueError("고정 작가 자리는 0 이상의 정수여야 합니다.")
+            if slot > 0:
+                fixed_slots.append(slot)
         fixed_names = {
             item["artist"].replace("_", " ").casefold()
             for item in fixed_artists
@@ -1256,8 +1305,37 @@ def api_style_maker_prompt_presets():
             payload.get("artists", []),
             payload.get("limit", 30),
         )
+        overrides = load_prompt_preset_overrides(SETTINGS_JSON_PATH, DATA_DIR)
+        for preset in result.get("presets", []):
+            preset["original_quality_prompt"] = preset.get("base_prompt") or preset.get("quality_prompt") or ""
+            override = overrides.get(preset.get("key"))
+            if override:
+                preset["base_prompt"] = override
+                preset["quality_prompt"] = override
+                preset["modified"] = True
+            image = preset.get("representative_image") or {}
+            image_path = image.get("image_path") or ""
+            image["image_url"] = f"/arca-style-images/{image_path}" if image_path else image.get("remote_image_url") or ""
+            image["thumbnail_url"] = f"/style-manager-thumbnails/shared/{image_path}" if image_path else image["image_url"]
         return json_response({"ok": True, **result})
-    except ArcaCollectorError as exc:
+    except (ArcaCollectorError, SettingsError) as exc:
+        return json_response({"ok": False, "error": str(exc)}, 400)
+
+
+@app.route("/api/style-maker/prompt-presets/<preset_key>", methods=["PATCH"])
+def api_update_style_maker_prompt_preset(preset_key):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response({"ok": False, "error": "요청 내용을 확인해 주세요."}, 400)
+    try:
+        quality_prompt = save_prompt_preset_override(
+            SETTINGS_JSON_PATH,
+            DATA_DIR,
+            preset_key,
+            payload.get("quality_prompt"),
+        )
+        return json_response({"ok": True, "key": preset_key, "quality_prompt": quality_prompt, "modified": True})
+    except (ValueError, SettingsError) as exc:
         return json_response({"ok": False, "error": str(exc)}, 400)
 
 
@@ -1500,6 +1578,7 @@ def _add_generated_urls(item):
     image_path = item.get("image_path") or ""
     if image_path:
         item["image_url"] = f"/generated/{image_path}"
+        item["thumbnail_url"] = f"/style-manager-thumbnails/generated/{image_path}"
     representative = item.get("representative_image_path") or ""
     if representative:
         item["representative_image_url"] = f"/generated/{representative}"
@@ -1576,6 +1655,10 @@ def _add_arca_urls(item):
 def _add_confirmed_url(item):
     if item and item.get("image_path"):
         item["image_url"] = f'/confirmed-style-images/{item["image_path"]}'
+        item["thumbnail_url"] = f'/style-manager-thumbnails/confirmed/{item["image_path"]}'
+    for image in (item or {}).get("images", []):
+        image_path = image.get("image_path") or ""
+        image["image_url"] = f"/confirmed-style-images/{image_path}" if image_path else ""
     return item
 
 
@@ -1596,6 +1679,11 @@ def _confirmed_metadata_from_bytes(image_bytes, content_type=""):
     metadata = extract_novelai_metadata(image_bytes, content_type)
     artist_prompt, quality_prompt = split_artist_quality_prompt(metadata.get("base_prompt") or "")
     raw_metadata = _json_object(metadata.get("raw_metadata_json"))
+    character_prompts = [
+        entry.get("prompt") if isinstance(entry, dict) else entry
+        for entry in metadata.get("character_prompts") or []
+    ]
+    character_prompts = [str(prompt).strip() for prompt in character_prompts if str(prompt or "").strip()]
     return {
         "metadata_status": metadata.get("metadata_status") or "no_metadata",
         "artist_prompt": artist_prompt,
@@ -1603,6 +1691,7 @@ def _confirmed_metadata_from_bytes(image_bytes, content_type=""):
         "original_quality_prompt": quality_prompt,
         "excluded_quality_tags": [],
         "fixed_prompt": "",
+        "character_prompts": character_prompts,
         "negative_prompt": metadata.get("negative_prompt") or "",
         "sampler": metadata.get("sampler") or "",
         "noise_schedule": metadata.get("noise_schedule") or "",
@@ -1611,7 +1700,7 @@ def _confirmed_metadata_from_bytes(image_bytes, content_type=""):
         "cfg_rescale": metadata.get("cfg_rescale"),
         "variety_plus": metadata.get("variety_plus"),
         "skip_cfg_above_sigma": metadata.get("skip_cfg_above_sigma"),
-        "model": metadata.get("model") or "",
+        "model": normalize_confirmed_model_name(metadata.get("model")),
         "width": metadata.get("width") or image_info["width"],
         "height": metadata.get("height") or image_info["height"],
         "seed": metadata.get("seed") or None,
@@ -1641,6 +1730,10 @@ def _confirmed_source(source_type, source_id):
                 excluded = json.loads(item.get("excluded_quality_tags_json") or "[]")
             except json.JSONDecodeError:
                 excluded = []
+            try:
+                character_prompts = json.loads(item.get("character_prompts_json") or "[]")
+            except json.JSONDecodeError:
+                character_prompts = []
             quality = item.get("quality_prompt") or item.get("base_prompt") or ""
             payload = {
                 "name": f"제작 그림체 #{source_id}",
@@ -1650,6 +1743,7 @@ def _confirmed_source(source_type, source_id):
                 "original_quality_prompt": item.get("original_quality_prompt") or quality,
                 "excluded_quality_tags": excluded,
                 "fixed_prompt": item.get("fixed_prompt") or "",
+                "character_prompts": character_prompts,
                 "negative_prompt": item.get("negative_prompt") or "",
                 "sampler": item.get("sampler") or "",
                 "noise_schedule": item.get("noise_schedule") or "",
@@ -1696,6 +1790,11 @@ def _confirmed_source(source_type, source_id):
                 "original_quality_prompt": quality_prompt,
                 "excluded_quality_tags": [],
                 "fixed_prompt": "",
+                "character_prompts": [
+                    entry.get("prompt") if isinstance(entry, dict) else entry
+                    for entry in image_metadata.get("character_prompts") or []
+                    if str(entry.get("prompt") if isinstance(entry, dict) else entry or "").strip()
+                ],
                 "negative_prompt": item.get("negative_prompt") or "",
                 "sampler": item.get("sampler") or "",
                 "noise_schedule": item.get("noise_schedule") or "",
@@ -1755,6 +1854,7 @@ def api_style_manager_shared():
     for item in result["items"]:
         local_path = item.get("image_path") or ""
         item["image_url"] = f"/arca-style-images/{local_path}" if local_path else item.get("remote_image_url") or ""
+        item["thumbnail_url"] = f"/style-manager-thumbnails/shared/{local_path}" if local_path else item["image_url"]
         item["image_available"] = bool(item["image_url"])
         if local_path and not item.get("model"):
             try:
@@ -1824,6 +1924,68 @@ def api_delete_confirmed_styles_batch():
         return json_response({"error": "style_ids must contain up to 500 positive integers."}, 400)
     deleted_ids = [style_id for style_id in dict.fromkeys(style_ids) if delete_confirmed_style(DB_PATH, CONFIRMED_STYLE_IMAGE_DIR, style_id)]
     return json_response({"deleted_ids": deleted_ids})
+
+
+@app.route("/api/confirmed-styles/import-batch", methods=["POST"])
+def api_import_confirmed_styles_batch():
+    uploads = request.files.getlist("images")
+    try:
+        manifest = json.loads(request.form.get("manifest") or "[]")
+        if not uploads or len(uploads) > 500:
+            raise ValueError("이미지는 한 번에 1장부터 500장까지 가져올 수 있습니다.")
+        if not isinstance(manifest, list) or not manifest or len(manifest) > 500:
+            raise ValueError("그림체 묶음 정보를 확인해 주세요.")
+        image_bytes = [upload.stream.read(MAX_CONFIRMED_IMAGE_BYTES + 1) for upload in uploads]
+        used_indexes = set()
+        normalized_groups = []
+        for group in manifest:
+            if not isinstance(group, dict) or not isinstance(group.get("file_indexes"), list):
+                raise ValueError("그림체 묶음 정보를 확인해 주세요.")
+            indexes = group["file_indexes"]
+            if (
+                not indexes
+                or any(type(index) is not int or index < 0 or index >= len(uploads) for index in indexes)
+                or len(set(indexes)) != len(indexes)
+                or used_indexes.intersection(indexes)
+            ):
+                raise ValueError("그림체 이미지 순서를 확인해 주세요.")
+            data = group.get("data") or {}
+            if not isinstance(data, dict):
+                raise ValueError("그림체 입력값을 확인해 주세요.")
+            used_indexes.update(indexes)
+            normalized_groups.append((indexes, data))
+        if used_indexes != set(range(len(uploads))):
+            raise ValueError("저장되지 않은 이미지가 있습니다.")
+
+        created = []
+        try:
+            for indexes, supplied in normalized_groups:
+                first = indexes[0]
+                extracted = _confirmed_metadata_from_bytes(
+                    image_bytes[first], uploads[first].mimetype or ""
+                )
+                payload = {
+                    **extracted,
+                    **supplied,
+                    "source_type": "manual",
+                    "source_id": None,
+                }
+                item = create_confirmed_style_group(
+                    DB_PATH,
+                    CONFIRMED_STYLE_IMAGE_DIR,
+                    [image_bytes[index] for index in indexes],
+                    payload,
+                )
+                created.append(item)
+        except Exception:
+            for item in created:
+                delete_confirmed_style(DB_PATH, CONFIRMED_STYLE_IMAGE_DIR, item["id"])
+            raise
+        return json_response([_add_confirmed_url(item) for item in created], 201)
+    except (ValueError, json.JSONDecodeError) as exc:
+        return json_response({"error": str(exc)}, 400)
+    except (OSError, sqlite3.Error):
+        return json_response({"error": "그림체 묶음을 저장하지 못했습니다."}, 500)
 
 
 @app.route("/api/confirmed-styles/<int:style_id>", methods=["GET", "PATCH", "DELETE"])
@@ -2339,6 +2501,51 @@ def confirmed_style_image(filename):
     if target.parent != root:
         return json_response({"error": "Invalid confirmed image path."}, 400)
     return send_from_directory(root, path.as_posix())
+
+
+@app.route("/style-manager-thumbnails/<source>/<path:filename>")
+def style_manager_thumbnail(source, filename):
+    roots = {
+        "generated": GENERATED_DIR,
+        "confirmed": CONFIRMED_STYLE_IMAGE_DIR,
+        "shared": ARCA_STYLE_IMAGE_DIR,
+    }
+    root = roots.get(source)
+    normalized = filename.replace("\\", "/")
+    path = Path(normalized)
+    if root is None or path.is_absolute() or ".." in path.parts or normalized != filename:
+        return json_response({"error": "Invalid style manager thumbnail path."}, 400)
+    resolved_root = root.resolve()
+    target = (resolved_root / path).resolve()
+    if resolved_root not in target.parents or not target.is_file():
+        return json_response({"error": "Style manager image not found."}, 404)
+
+    stat = target.stat()
+    cache_key = hashlib.sha256(
+        f"{source}\0{path.as_posix()}\0{stat.st_mtime_ns}\0{stat.st_size}".encode("utf-8")
+    ).hexdigest()
+    cache_root = DATA_DIR / "style_manager_thumbnails"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cached = cache_root / f"{cache_key}.webp"
+    if not cached.is_file():
+        temporary = cache_root / f"{cache_key}.{os.getpid()}.{random.getrandbits(64):016x}.tmp"
+        try:
+            with Image.open(target) as opened:
+                image = ImageOps.exif_transpose(opened)
+                image.thumbnail((384, 384), Image.Resampling.LANCZOS)
+                if image.mode not in {"RGB", "RGBA"}:
+                    image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+                image.save(temporary, format="WEBP", quality=82, method=2)
+            try:
+                temporary.replace(cached)
+            except FileExistsError:
+                temporary.unlink(missing_ok=True)
+        except (OSError, ValueError, Image.DecompressionBombError):
+            temporary.unlink(missing_ok=True)
+            return send_from_directory(resolved_root, path.as_posix())
+    response = send_from_directory(cache_root, cached.name, max_age=31536000)
+    response.mimetype = "image/webp"
+    return response
 
 
 @app.route("/comparison-images/<path:filename>")

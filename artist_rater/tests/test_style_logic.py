@@ -822,6 +822,20 @@ class ArtistStyleEndpointTest(unittest.TestCase):
         self.assertEqual({item["artist"] for item in artists if item.get("score")}, {"alpha", "beta"})
         self.assertFalse(any(item.get("shared_style") for item in artists))
 
+    def test_fixed_artist_slot_zero_is_accepted_as_random_order_marker(self):
+        response = self.client.post(
+            "/api/style-maker/artists",
+            json={
+                "count": 2,
+                "scores": [5],
+                "fixed_artists": [{"artist": "fixed_random_order", "weight": 1.2, "slot": 0}],
+                "rng_seed": 7,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.get_json()["artists"]), 2)
+
     def test_profile_uses_open_total_slots_when_fixed_artists_occupy_later_positions(self):
         fixed = [
             {"artist": f"fixed_{index}", "weight": 0.7 + index * 0.1, "slot": index + 3}

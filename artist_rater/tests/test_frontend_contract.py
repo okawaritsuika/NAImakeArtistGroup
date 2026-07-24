@@ -22,11 +22,16 @@ class FrontendContractTest(unittest.TestCase):
         self.assertIn('bindClick("candidateButton", async () => {', source)
         self.assertIn("if (loaded) await showNextArtist();", source)
 
-    def test_candidate_picker_has_no_exclusion_prompt(self):
+    def test_candidate_picker_sends_exclusion_prompt_and_latest_option(self):
         source = APP_JS.read_text(encoding="utf-8")
         html = INDEX_HTML.read_text(encoding="utf-8")
-        self.assertNotIn('id="excludeQueryText"', html)
-        self.assertNotIn('exclude_query_text:', source)
+        self.assertIn('id="excludeQueryText"', html)
+        self.assertIn('id="excludeAutocomplete"', html)
+        self.assertIn('id="latestSamples"', html)
+        self.assertIn('exclude_query_text: valueOf("excludeQueryText")', source)
+        self.assertIn('latest_samples: Boolean($("latestSamples")?.checked)', source)
+        self.assertIn('updateAutocomplete("exclude")', source)
+        self.assertIn('handleAutocompleteKeydown(event, "exclude")', source)
 
     def test_rating_editor_can_update_or_clear_the_query_prompt(self):
         source = APP_JS.read_text(encoding="utf-8")

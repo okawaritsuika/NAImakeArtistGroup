@@ -246,6 +246,38 @@ class StyleApiTest(unittest.TestCase):
         self.assertTrue(response.get_json()["ok"])
         get_presets.assert_called_once_with(app.DB_PATH, ["alpha"], 12)
 
+    @patch("app.get_style_maker_prompt_presets")
+    def test_edited_prompt_preset_is_persisted_and_returned_on_later_load(self, get_presets):
+        app.save_app_key(app.SETTINGS_JSON_PATH, SECRET_KEY, app.DATA_DIR)
+        get_presets.return_value = {
+            "presets": [{
+                "key": "0123456789abcdef",
+                "base_prompt": "original quality",
+                "quality_prompt": "original quality",
+                "negative_prompt": "lowres",
+                "excluded_tags": [{"tag": "1girl", "prompt": "1girl"}],
+                "representative_image": {"image_path": "sample.png"},
+            }],
+            "selected_artist_count": 0,
+        }
+        updated = self.client.patch(
+            "/api/style-maker/prompt-presets/0123456789abcdef",
+            json={"quality_prompt": "edited quality, cinematic lighting"},
+        )
+        self.assertEqual(updated.status_code, 200)
+
+        loaded = self.client.post(
+            "/api/style-maker/prompt-presets",
+            json={"artists": [], "limit": 30},
+        ).get_json()["presets"][0]
+        self.assertEqual(loaded["quality_prompt"], "edited quality, cinematic lighting")
+        self.assertEqual(loaded["original_quality_prompt"], "original quality")
+        self.assertTrue(loaded["modified"])
+        self.assertEqual(loaded["representative_image"]["thumbnail_url"], "/style-manager-thumbnails/shared/sample.png")
+        saved = json.loads(app.SETTINGS_JSON_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(saved["prompt_preset_overrides"]["0123456789abcdef"], "edited quality, cinematic lighting")
+        self.assertEqual(saved["novelai_app_key"], SECRET_KEY)
+
     def test_put_requires_json_object_and_rejects_malformed_keys(self):
         invalid_requests = (
             {"data": json.dumps({"app_key": SECRET_KEY}), "content_type": "text/plain"},
@@ -1276,6 +1308,28 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         ) = self.originals
         self.temp_dir.cleanup()
 
+    def test_style_manager_thumbnail_is_resized_and_cached(self):
+        from PIL import Image
+
+        app.GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+        source = app.GENERATED_DIR / "large.png"
+        source.write_bytes(valid_png(900, 600))
+
+        first = self.client.get("/style-manager-thumbnails/generated/large.png")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.mimetype, "image/webp")
+        with Image.open(io.BytesIO(first.data)) as thumbnail:
+            self.assertLessEqual(thumbnail.width, 384)
+            self.assertLessEqual(thumbnail.height, 384)
+
+        second = self.client.get("/style-manager-thumbnails/generated/large.png")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.data, first.data)
+        cache_files = list((app.DATA_DIR / "style_manager_thumbnails").glob("*.webp"))
+        self.assertEqual(len(cache_files), 1)
+        first.close()
+        second.close()
+
     @patch("app.generate_novelai_png")
     def test_comparison_deferred_generation_reports_each_result_and_replaces_it(self, generate):
         style = app.create_confirmed_style(
@@ -1327,16 +1381,20 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertEqual(len(list(app.COMPARISON_IMAGE_DIR.iterdir())), 1)
 
     @staticmethod
-    def metadata_png():
+    def metadata_png(source="NovelAI Diffusion V4.5"):
         from PIL import Image, PngImagePlugin
 
         output = io.BytesIO()
         png_info = PngImagePlugin.PngInfo()
         png_info.add_text("Software", "NovelAI")
-        png_info.add_text("Source", "NovelAI Diffusion V4.5")
+        png_info.add_text("Source", source)
+        prompt = "1.2::artist:test artist::, very aesthetic"
         png_info.add_text("Comment", json.dumps({
-            "prompt": "1.2::artist:test artist::, very aesthetic",
+            "prompt": prompt,
             "uc": "lowres",
+            "v4_prompt": {"caption": {"base_caption": prompt, "char_captions": [
+                {"char_caption": "1girl, blue hair", "centers": [{"x": 0.5, "y": 0.5}]},
+            ]}},
             "sampler": "k_euler_ancestral",
             "noise_schedule": "karras",
             "steps": 28,
@@ -1350,6 +1408,46 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         Image.new("RGB", (32, 48), "white").save(output, format="PNG", pnginfo=png_info)
         return output.getvalue()
 
+    @staticmethod
+    def metadata_webp():
+        from PIL import Image
+
+        output = io.BytesIO()
+        prompt = "1.2::artist:webp artist::, very aesthetic"
+        exif = Image.Exif()
+        exif[37510] = b"UNICODE\x00" + json.dumps({
+            "prompt": prompt,
+            "uc": "lowres",
+            "sampler": "k_euler_ancestral",
+            "steps": 28,
+            "source": "NovelAI Diffusion V4.5 Full",
+        }).encode("utf-16-be")
+        Image.new("RGB", (32, 48), "white").save(output, format="WEBP", lossless=True, exif=exif)
+        return output.getvalue()
+
+    def test_confirmed_extract_normalizes_v45_build_label_to_full(self):
+        extracted = self.client.post(
+            "/api/confirmed-styles/extract",
+            data={"image": (io.BytesIO(self.metadata_png("NovelAI Diffusion V4.5 4BDE2A90")), "style.png")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(extracted.status_code, 200)
+        self.assertEqual(extracted.get_json()["model"], "NovelAI Diffusion V4.5 Full")
+
+    def test_confirmed_extract_reads_webp_exif_user_comment(self):
+        extracted = self.client.post(
+            "/api/confirmed-styles/extract",
+            data={"image": (io.BytesIO(self.metadata_webp()), "style.webp")},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(extracted.status_code, 200)
+        metadata = extracted.get_json()
+        self.assertEqual(metadata["metadata_status"], "ok")
+        self.assertIn("artist:webp artist", metadata["artist_prompt"])
+        self.assertEqual(metadata["negative_prompt"], "lowres")
+        self.assertEqual(metadata["model"], "NovelAI Diffusion V4.5 Full")
+
     def test_manual_image_extract_create_update_and_delete(self):
         image_bytes = self.metadata_png()
         extracted = self.client.post(
@@ -1361,8 +1459,9 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         metadata = extracted.get_json()
         self.assertEqual(metadata["metadata_status"], "ok")
         self.assertIn("artist:test artist", metadata["artist_prompt"])
+        self.assertEqual(metadata["character_prompts"], ["1girl, blue hair"])
         self.assertTrue(metadata["variety_plus"])
-        self.assertEqual(metadata["model"], "NovelAI Diffusion V4.5")
+        self.assertEqual(metadata["model"], "NovelAI Diffusion V4.5 Full")
 
         created = self.client.post(
             "/api/confirmed-styles",
@@ -1375,6 +1474,9 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertEqual(created.status_code, 201)
         item = created.get_json()
         self.assertEqual(item["name"], "직접 그림체")
+        self.assertEqual(item["image_count"], 1)
+        self.assertEqual(item["character_prompts"], ["1girl, blue hair"])
+        self.assertEqual(len(item["images"]), 1)
         self.assertTrue((app.CONFIRMED_STYLE_IMAGE_DIR / item["image_path"]).is_file())
 
         updated = self.client.patch(f"/api/confirmed-styles/{item['id']}", json={"description": "수정한 설명"})
@@ -1382,6 +1484,41 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertEqual(updated.get_json()["description"], "수정한 설명")
         self.assertEqual(self.client.delete(f"/api/confirmed-styles/{item['id']}").status_code, 200)
         self.assertFalse((app.CONFIRMED_STYLE_IMAGE_DIR / item["image_path"]).exists())
+
+    def test_manual_batch_import_saves_and_deletes_images_as_one_style_group(self):
+        first = self.metadata_png()
+        second = self.metadata_png()
+        response = self.client.post(
+            "/api/confirmed-styles/import-batch",
+            data={
+                "images": [
+                    (io.BytesIO(first), "first.png"),
+                    (io.BytesIO(second), "second.png"),
+                ],
+                "manifest": json.dumps([
+                    {
+                        "file_indexes": [0, 1],
+                        "data": {
+                            "name": "묶음 그림체",
+                            "artist_prompt": "1.2::artist:test artist::",
+                        },
+                    }
+                ], ensure_ascii=False),
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        styles = response.get_json()
+        self.assertEqual(len(styles), 1)
+        self.assertEqual(styles[0]["image_count"], 2)
+        self.assertEqual(len(styles[0]["images"]), 2)
+        paths = [image["image_path"] for image in styles[0]["images"]]
+        self.assertTrue(all((app.CONFIRMED_STYLE_IMAGE_DIR / path).is_file() for path in paths))
+
+        deleted = self.client.delete(f"/api/confirmed-styles/{styles[0]['id']}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(all(not (app.CONFIRMED_STYLE_IMAGE_DIR / path).exists() for path in paths))
 
     def test_generated_results_are_individual_cards_and_copy_to_confirmed(self):
         common = {
@@ -1415,6 +1552,7 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertEqual(len(generated), 2)
         self.assertEqual({item["style_id"] for item in generated}, {first["style_id"]})
         self.assertTrue(all(item["image_url"].startswith("/generated/") for item in generated))
+        self.assertTrue(all(item["thumbnail_url"].startswith("/style-manager-thumbnails/generated/") for item in generated))
         self.assertTrue(all(item["sampler"] == "k_euler_ancestral" for item in generated))
         self.assertTrue(all(item["noise_schedule"] == "karras" for item in generated))
         self.assertTrue(all(item["steps"] == 28 for item in generated))
@@ -1432,6 +1570,7 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertEqual(confirmed_item["scale"], 5.0)
         self.assertEqual(confirmed_item["cfg_rescale"], 0.2)
         self.assertTrue(confirmed_item["image_url"].startswith("/confirmed-style-images/"))
+        self.assertTrue(confirmed_item["thumbnail_url"].startswith("/style-manager-thumbnails/confirmed/"))
         self.assertEqual(len(self.client.get("/api/style-manager/generated").get_json()), 2)
 
     def test_shared_gallery_flattens_images_from_the_same_post(self):
@@ -1459,6 +1598,7 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertEqual(len(data["items"]), 2)
         self.assertTrue(all(item["title"] == "공유글" for item in data["items"]))
         self.assertEqual({item["image_path"] for item in data["items"]}, {"one.png", "two.png"})
+        self.assertTrue(all(item["thumbnail_url"].startswith("/style-manager-thumbnails/shared/") for item in data["items"]))
         page_one = self.client.get("/api/style-manager/shared?offset=0&limit=1").get_json()
         page_two = self.client.get("/api/style-manager/shared?offset=1&limit=1").get_json()
         self.assertEqual(len(page_one["items"]), 1)
@@ -1500,7 +1640,7 @@ class ConfirmedStyleApiTest(unittest.TestCase):
             json={"source_type": "shared", "source_id": image_id, "model": ""},
         )
         self.assertEqual(confirmed.status_code, 201)
-        self.assertEqual(confirmed.get_json()["model"], "NovelAI Diffusion V4.5")
+        self.assertEqual(confirmed.get_json()["model"], "NovelAI Diffusion V4.5 Full")
 
     def test_shared_gallery_searches_and_filters_all_available_images(self):
         app.ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)

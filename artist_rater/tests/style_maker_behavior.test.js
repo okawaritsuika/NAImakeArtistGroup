@@ -11,6 +11,7 @@ const {
   reorderArtists,
   runLatestStyleRequest,
   sortArtistsByWeight,
+  sortFixedArtistEntriesForTable,
   validateCustomRangeValues,
   interpolateWeightProfile,
   formatArtistPromptTag,
@@ -40,9 +41,14 @@ const {
   addPromptGroupItem,
   cleanPromptGroups,
   buildEffectivePromptText,
+  promptPresetFullText,
   toggleSelectedStyleId,
   managerCombinedPromptText,
   confirmedGeneratedSourceValues,
+  normalizeConfirmedModelName,
+  confirmedArtistPromptSignature,
+  groupConfirmedImportItems,
+  attachConfirmedStyleSuspects,
   filterStyleManagerItems,
   paginateStyleManagerItems,
   normalizeStyleManagerPageSize,
@@ -159,6 +165,44 @@ test("generated style confirmation keeps its image and generation settings", () 
   assert.equal(source.variety_plus, true);
   assert.equal(source.model, "nai-diffusion-4-5-full");
   assert.equal(source.artist_prompt, "1.25::artist:sample artist::");
+});
+
+test("confirmed imports group exact weighted artist prompts and separate unknown prompts", () => {
+  assert.equal(
+    confirmedArtistPromptSignature("1.20::artist:Same Artist::"),
+    confirmedArtistPromptSignature("  1.2 :: artist:Same   Artist::  "),
+  );
+  const groups = groupConfirmedImportItems([
+    { file: "a", metadata: { artist_prompt: "1.2::artist:same artist::" } },
+    { file: "b", metadata: { artist_prompt: "1.2::artist:same   artist::" } },
+    { file: "c", metadata: { artist_prompt: "0.8::artist:other::" } },
+    { file: "d", metadata: { artist_prompt: "" } },
+    { file: "e", metadata: { artist_prompt: "" } },
+  ]);
+  assert.deepEqual(groups.map((group) => group.items.map((item) => item.file)), [
+    ["a", "b"], ["c"], ["d"], ["e"],
+  ]);
+});
+
+test("confirmed style models normalize NovelAI V4.5 build labels to Full", () => {
+  assert.equal(normalizeConfirmedModelName("NovelAI Diffusion V4.5 4BDE2A90"), "NovelAI Diffusion V4.5 Full");
+  assert.equal(normalizeConfirmedModelName("NovelAI Diffusion V4.5"), "NovelAI Diffusion V4.5 Full");
+  assert.equal(normalizeConfirmedModelName("NovelAI Diffusion V4.5 Curated"), "NovelAI Diffusion V4.5 Curated");
+});
+
+test("confirmed imports flag every existing style with the same weighted artist prompt", () => {
+  const groups = groupConfirmedImportItems([
+    { file: "new", metadata: { artist_prompt: "1.20::artist:same artist::" } },
+    { file: "unknown", metadata: { artist_prompt: "" } },
+  ]);
+  const result = attachConfirmedStyleSuspects(groups, [
+    { id: 7, artist_prompt: "1.2 :: artist:same   artist::" },
+    { id: 8, artist_prompt: "1.20::artist:same artist::" },
+    { id: 9, artist_prompt: "0.8::artist:other::" },
+  ]);
+
+  assert.deepEqual(result[0].suspectedStyles.map((style) => style.id), [7, 8]);
+  assert.deepEqual(result[1].suspectedStyles, []);
 });
 
 test("style manager filters each gallery mode and sorts visible cards", () => {
@@ -396,6 +440,39 @@ test("manual style artist entry accepts weighted NovelAI artist prompt lists", (
   assert.equal(chooseArtistsForPrompt(insertStyleArtistsAtPosition([], entries, { position: 1 })).length, 7);
 });
 
+test("prompt preset detail shows edited quality followed by every excluded tag", () => {
+  assert.equal(
+    promptPresetFullText({
+      base_prompt: "best quality",
+      excluded_tags: [
+        { tag: "1girl", prompt: "1girl" },
+        { tag: "blue eyes", prompt: "1.2::blue eyes::" },
+      ],
+    }, "edited quality, cinematic lighting"),
+    "edited quality, cinematic lighting, 1girl, 1.2::blue eyes::",
+  );
+});
+
+test("manual artist parser handles grouped weights, spaced delimiters, and adjacent blocks", () => {
+  const entries = parseStyleArtistEntries(
+    "0.37::artist:yd (orange maru):: 1.8 ::artist:null (nyanpyoun), pottsness, ciloranko:: 0.7::artist:freng, wow (cor369), tianliang duohe fangdongye:: year 2024 ::, 0.55::artist:horikoshi kouhei::",
+  );
+  assert.deepEqual(entries, [
+    { artist: "yd (orange maru)", weight: 0.37 },
+    { artist: "null (nyanpyoun)", weight: 1.8 },
+    { artist: "pottsness", weight: 1.8 },
+    { artist: "ciloranko", weight: 1.8 },
+    { artist: "freng", weight: 0.7 },
+    { artist: "wow (cor369)", weight: 0.7 },
+    { artist: "tianliang duohe fangdongye", weight: 0.7 },
+    { artist: "horikoshi kouhei", weight: 0.55 },
+  ]);
+  assert.deepEqual(
+    insertStyleArtistsAtPosition([], entries, { position: 2 }).map((item) => item.slot),
+    [2, 3, 4, 5, 6, 7, 8, 9],
+  );
+});
+
 test("manual style artists insert at a one-based prompt position", () => {
   const current = [
     { artist: "first", weight: 0.4 },
@@ -409,17 +486,17 @@ test("manual style artists insert at a one-based prompt position", () => {
   assert.deepEqual(added, [
     { artist: "first", weight: 0.4 },
     { artist: "new_a", weight: 1.25, fixed: true, slot: 2 },
-    { artist: "new_b", weight: 1.25, fixed: true, slot: 2 },
+    { artist: "new_b", weight: 1.25, fixed: true, slot: 3 },
     { artist: "last", weight: 2.0 },
   ]);
   assert.deepEqual(current.map((item) => item.artist), ["first", "last"]);
 });
 
 test("manual artists with the same slot stack and choose one prompt candidate", () => {
-  const added = insertStyleArtistsAtPosition([], ["new_a", "new_b"], {
-    position: 1,
-    weight: 1.25,
-  });
+  const added = [
+    { artist: "new_a", weight: 1.25, fixed: true, slot: 1 },
+    { artist: "new_b", weight: 1.25, fixed: true, slot: 1 },
+  ];
 
   assert.deepEqual(
     fixedArtistSlotEntries(added).map(({ artist, slot, stackIndex, stackSize }) => [artist.artist, slot, stackIndex, stackSize]),
@@ -433,6 +510,23 @@ test("manual artists with the same slot stack and choose one prompt candidate", 
     chooseArtistsForPrompt(added, () => 0.9).map((item) => item.artist),
     ["new_b"],
   );
+});
+
+test("manual artist random weight and zero position are resolved for each prompt", () => {
+  const added = insertStyleArtistsAtPosition(
+    [{ artist: "first", weight: 0.4 }, { artist: "last", weight: 2.0 }],
+    ["random_fixed"],
+    { position: 0, weight: 1.25, randomWeight: true },
+  );
+  assert.deepEqual(added[0], {
+    artist: "random_fixed", weight: 1.25, fixed: true, slot: 0, random_weight: true,
+  });
+
+  const values = [0.9, 0.5];
+  const promptArtists = chooseArtistsForPrompt(added, () => values.shift(), { minWeight: 0.1, maxWeight: 0.2 });
+  assert.deepEqual(promptArtists.map((item) => item.artist), ["first", "last", "random_fixed"]);
+  assert.equal(promptArtists[2].weight, 0.15);
+  assert.equal(added[0].weight, 1.25);
 });
 
 test("manual style artists promote existing random artists into fixed rows", () => {
@@ -701,6 +795,11 @@ test("fixed artists are included in the configured total artist count", () => {
 
   artists[1].slot = 2;
   assert.equal(buildStyleRequestPayload({ count: 3 }, artists, "all").fixed_artists[0].slot, 2);
+  artists[1].slot = 0;
+  artists[1].random_weight = true;
+  assert.deepEqual(buildStyleRequestPayload({ count: 3 }, artists, "all").fixed_artists[0], {
+    artist: "fixed-a", score: undefined, weight: 1.2, slot: 0, random_weight: true,
+  });
 });
 
 test("reroll all keeps manually fixed artists even when incoming result omits them", () => {
@@ -745,6 +844,18 @@ test("sort and reorder helpers return the requested artist order", () => {
   assert.deepEqual(sortArtistsByWeight(artists, "desc").map((item) => item.artist), ["high", "middle", "low"]);
   assert.deepEqual(reorderArtists(artists, 0, 2).map((item) => item.artist), ["high", "low", "middle"]);
   assert.deepEqual(artists.map((item) => item.artist), ["middle", "high", "low"]);
+});
+
+test("weight table display sorting cycles without changing prompt artist order", () => {
+  const artists = [
+    { artist: { artist: "middle", weight: 1.0 }, index: 0 },
+    { artist: { artist: "high", weight: 1.8 }, index: 1 },
+    { artist: { artist: "low", weight: 0.4 }, index: 2 },
+  ];
+  assert.deepEqual(sortFixedArtistEntriesForTable(artists, "asc").map((item) => item.artist.artist), ["low", "middle", "high"]);
+  assert.deepEqual(sortFixedArtistEntriesForTable(artists, "desc").map((item) => item.artist.artist), ["high", "middle", "low"]);
+  assert.deepEqual(sortFixedArtistEntriesForTable(artists, "default"), artists);
+  assert.deepEqual(artists.map((item) => item.artist.artist), ["middle", "high", "low"]);
 });
 
 test("custom range fields expose only Korean visible and accessible labels", () => {

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -13,6 +14,7 @@ from style_logic import build_artist_prompt, normalize_style_artists, style_hash
 
 
 MAX_APP_KEY_LENGTH = 8192
+MAX_PROMPT_PRESET_LENGTH = 16384
 ORPHAN_CLEANUP_AGE_SECONDS = 60 * 60
 
 
@@ -128,6 +130,37 @@ def delete_app_key(settings_path, trusted_root):
             path.unlink(missing_ok=True)
         except OSError as exc:
             raise SettingsError("Settings file could not be deleted.") from exc
+
+
+def load_prompt_preset_overrides(settings_path, trusted_root):
+    stored = _load_trusted_settings(settings_path, trusted_root).get("prompt_preset_overrides")
+    if not isinstance(stored, dict):
+        return {}
+    return {
+        key: value
+        for key, value in stored.items()
+        if isinstance(key, str) and re.fullmatch(r"[0-9a-f]{16}", key) and isinstance(value, str)
+    }
+
+
+def save_prompt_preset_override(settings_path, trusted_root, preset_key, quality_prompt):
+    if not isinstance(preset_key, str) or not re.fullmatch(r"[0-9a-f]{16}", preset_key):
+        raise ValueError("수집 프롬프트 키를 확인해 주세요.")
+    if not isinstance(quality_prompt, str):
+        raise ValueError("퀄리티 프롬프트는 문자열이어야 합니다.")
+    normalized = quality_prompt.strip()
+    if not normalized:
+        raise ValueError("퀄리티 프롬프트를 입력해 주세요.")
+    if len(normalized) > MAX_PROMPT_PRESET_LENGTH:
+        raise ValueError("퀄리티 프롬프트가 너무 깁니다.")
+    settings = _load_trusted_settings(settings_path, trusted_root)
+    overrides = settings.get("prompt_preset_overrides")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    overrides[preset_key] = normalized
+    settings["prompt_preset_overrides"] = overrides
+    _write_trusted_settings(settings_path, settings, trusted_root)
+    return normalized
 
 
 def connect_db(db_path):

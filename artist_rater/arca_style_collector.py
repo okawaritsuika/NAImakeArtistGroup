@@ -50,12 +50,13 @@ IMAGE_RESTORE_ESTIMATE_BYTES_PER_SECOND = 8 * 1024 * 1024
 GENERATION_KEYS = {"seed", "sampler", "steps", "scale", "noise_schedule", "model", "width", "height"}
 STYLE_SIMILARITY_THRESHOLD = 0.55
 TRANSIENT_TAG = re.compile(r"^(?:\d+(?:girl|boy)s?|solo|multiple girls|portrait|upper body|full body|looking at.*|smile|open mouth|.*hair|.*eyes|robot)$", re.I)
-NON_PNG_IMAGE_TYPES = {
+UNSUPPORTED_IMAGE_TYPES = {
     ".avif": "image/avif", ".bmp": "image/bmp", ".gif": "image/gif",
     ".ico": "image/x-icon", ".jfif": "image/jpeg", ".jpeg": "image/jpeg",
     ".jpg": "image/jpeg", ".svg": "image/svg+xml", ".tif": "image/tiff",
-    ".tiff": "image/tiff", ".webp": "image/webp",
+    ".tiff": "image/tiff",
 }
+SUPPORTED_ARCHIVE_IMAGE_TYPES = {"image/png", "image/webp"}
 
 
 class ArcaCollectorError(Exception):
@@ -1451,15 +1452,17 @@ def read_stealth_info(image_bytes):
     try:
         signature_bits = "".join(get_bit(index) for index in range(120))
         signature = bytes(int(signature_bits[index:index + 8], 2) for index in range(0, 120, 8)).decode("utf-8", "ignore")
-        if signature != "stealth_pngcomp":
+        if signature not in {"stealth_pngcomp", "stealth_pnginfo"}:
             return None
         length_bits = "".join(get_bit(index) for index in range(120, 152))
         payload_bit_length = int(length_bits, 2)
         if payload_bit_length <= 0 or payload_bit_length % 8 or 152 + payload_bit_length > width * height:
             return None
         payload_bits = "".join(get_bit(index) for index in range(152, 152 + payload_bit_length))
-        compressed = bytes(int(payload_bits[index:index + 8], 2) for index in range(0, payload_bit_length, 8))
-        return gzip.decompress(compressed).decode("utf-8")
+        payload = bytes(int(payload_bits[index:index + 8], 2) for index in range(0, payload_bit_length, 8))
+        if signature == "stealth_pngcomp":
+            payload = gzip.decompress(payload)
+        return payload.decode("utf-8")
     except (OSError, UnicodeDecodeError, ValueError, zlib.error):
         return None
 
@@ -1467,10 +1470,28 @@ def read_stealth_info(image_bytes):
 def _merge_raw_metadata(values, raw, allow_plain_prompt=True):
     try:
         parsed = json.loads(raw)
-        if isinstance(parsed, dict) and isinstance(parsed.get("Comment"), str):
-            nested = json.loads(parsed["Comment"])
-            if isinstance(nested, dict):
-                parsed = nested
+        if isinstance(parsed, dict):
+            outer = parsed
+            by_name = {str(key).casefold(): value for key, value in outer.items()}
+            comment = by_name.get("comment")
+            if isinstance(comment, str):
+                try:
+                    nested = json.loads(comment)
+                except json.JSONDecodeError:
+                    nested = None
+                if isinstance(nested, dict):
+                    parsed = nested
+            description = str(by_name.get("description") or "").strip()
+            source = str(by_name.get("source") or "").strip()
+            software = str(by_name.get("software") or "").strip()
+            if description:
+                parsed.setdefault("prompt", description)
+            if source:
+                parsed.setdefault("source", source)
+                if source.casefold().startswith("novelai diffusion"):
+                    parsed.setdefault("model", source)
+            if software:
+                parsed.setdefault("software", software)
         if isinstance(parsed, dict):
             values.update(parsed)
             return
@@ -1481,10 +1502,83 @@ def _merge_raw_metadata(values, raw, allow_plain_prompt=True):
         values.setdefault("prompt", prompt_text)
 
 
+def _decode_exif_user_comment(user_comment):
+    if isinstance(user_comment, bytes):
+        if user_comment.startswith(b"UNICODE\x00"):
+            payload = user_comment[8:]
+            for encoding in ("utf-16-be", "utf-16-le", "utf-16"):
+                try:
+                    return payload.decode(encoding, errors="strict").replace("\x00", "").strip()
+                except UnicodeDecodeError:
+                    continue
+        if user_comment.startswith(b"ASCII\x00\x00\x00"):
+            return user_comment[8:].decode("utf-8", errors="ignore").replace("\x00", "").strip()
+        return user_comment.decode("utf-8", errors="ignore").replace("\x00", "").strip()
+
+    text = str(user_comment or "")
+    if text.startswith("UNICODE") or text.startswith("ASCII"):
+        text = text[8:]
+    return text.replace("\x00", "").strip()
+
+
+def _extract_webp_metadata(image_bytes):
+    values = {}
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            if str(image.format or "").upper() != "WEBP":
+                return values
+
+            info_by_name = {str(key).casefold(): value for key, value in image.info.items()}
+            for key in ("parameters", "comment", "description", "prompt", "uc"):
+                raw = info_by_name.get(key)
+                if raw in (None, b"", ""):
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="ignore")
+                if key == "uc":
+                    values.setdefault("uc", str(raw))
+                else:
+                    _merge_raw_metadata(values, raw)
+
+            exif = image.getexif() if hasattr(image, "getexif") else None
+            if not exif:
+                return values
+
+            user_comment = exif.get(37510)
+            if user_comment in (None, b"", "") and hasattr(exif, "get_ifd"):
+                try:
+                    user_comment = exif.get_ifd(34665).get(37510)
+                except (KeyError, TypeError, ValueError):
+                    user_comment = None
+            if user_comment not in (None, b"", ""):
+                raw = _decode_exif_user_comment(user_comment)
+                if raw:
+                    _merge_raw_metadata(values, raw)
+
+            description = exif.get(270)
+            if description not in (None, b"", ""):
+                if isinstance(description, bytes):
+                    description = description.decode("utf-8", errors="ignore")
+                _merge_raw_metadata(values, description)
+
+            software = exif.get(305)
+            if software not in (None, b"", ""):
+                if isinstance(software, bytes):
+                    software = software.decode("utf-8", errors="ignore")
+                values.setdefault("software", str(software).strip())
+    except (OSError, SyntaxError, TypeError, ValueError):
+        return {}
+    return values
+
+
 def _is_novelai_metadata(values):
     if not isinstance(values, dict):
         return False
     if isinstance(values.get("v4_prompt"), dict):
+        return True
+    software = str(values.get("software") or "").casefold()
+    source = str(values.get("source") or "").casefold()
+    if values.get("prompt") and (software.startswith("novelai") or source.startswith("novelai diffusion")):
         return True
     return bool(values.get("prompt")) and len(GENERATION_KEYS.intersection(values)) >= 2
 
@@ -1508,26 +1602,36 @@ def _extract_prompt_parts(values):
 
 def extract_novelai_metadata(image_bytes, content_type=""):
     base = {"metadata_status": "no_metadata", "prompt": "", "base_prompt": "", "negative_prompt": "", "character_prompts": [], "seed": "", "sampler": "", "steps": None, "scale": None, "cfg_rescale": None, "noise_schedule": "", "model": "", "width": None, "height": None, "variety_plus": None, "skip_cfg_above_sigma": None, "raw_metadata_json": "{}"}
-    if not (image_bytes.startswith(b"\x89PNG") or "png" in content_type.lower()): return base
-    chunks = extract_png_text_chunks(image_bytes)
-    values = {}
-    for key, raw in chunks.items():
-        if key.lower() not in {"comment", "description", "software", "source", "parameters", "prompt", "uc"}: continue
-        lowered_key = key.lower()
-        if lowered_key == "uc":
-            values["uc"] = raw
-        elif lowered_key == "source":
-            source = str(raw or "").strip()
-            if source:
-                values.setdefault("source", source)
-                if source.casefold().startswith("novelai diffusion"):
-                    values.setdefault("model", source)
-        else:
-            _merge_raw_metadata(
-                values,
-                raw,
-                allow_plain_prompt=lowered_key not in {"software", "source"},
-            )
+    content_type = content_type.lower()
+    is_png = image_bytes.startswith(b"\x89PNG") or "png" in content_type
+    is_webp = (
+        len(image_bytes) >= 12
+        and image_bytes[:4] == b"RIFF"
+        and image_bytes[8:12] == b"WEBP"
+    ) or "webp" in content_type
+    if not (is_png or is_webp):
+        return base
+
+    values = _extract_webp_metadata(image_bytes) if is_webp else {}
+    if is_png:
+        chunks = extract_png_text_chunks(image_bytes)
+        for key, raw in chunks.items():
+            if key.lower() not in {"comment", "description", "software", "source", "parameters", "prompt", "uc"}: continue
+            lowered_key = key.lower()
+            if lowered_key == "uc":
+                values["uc"] = raw
+            elif lowered_key == "source":
+                source = str(raw or "").strip()
+                if source:
+                    values.setdefault("source", source)
+                    if source.casefold().startswith("novelai diffusion"):
+                        values.setdefault("model", source)
+            else:
+                _merge_raw_metadata(
+                    values,
+                    raw,
+                    allow_plain_prompt=lowered_key not in {"software", "source"},
+                )
     stealth_raw = read_stealth_info(image_bytes)
     if stealth_raw:
         _merge_raw_metadata(values, stealth_raw)
@@ -2074,8 +2178,8 @@ def _fetch_article_htmls(session, search_items):
                 pending[executor.submit(fetch_one, search_item)] = search_item
 
 
-def _obvious_non_png_content_type(image_url):
-    return NON_PNG_IMAGE_TYPES.get(Path(urlparse(str(image_url or "")).path).suffix.lower(), "")
+def _obvious_unsupported_content_type(image_url):
+    return UNSUPPORTED_IMAGE_TYPES.get(Path(urlparse(str(image_url or "")).path).suffix.lower(), "")
 
 
 def download_image(session, image_url):
@@ -2085,7 +2189,7 @@ def download_image(session, image_url):
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if not content_type.startswith("image/"):
             raise ArcaCollectorError("이미지 응답이 아닙니다.")
-        if content_type != "image/png":
+        if content_type not in SUPPORTED_ARCHIVE_IMAGE_TYPES:
             return None, content_type
         chunks, size = [], 0
         for chunk in response.iter_content(64 * 1024):
@@ -2505,6 +2609,10 @@ def _indexed_prompt_preset_rows(db_path):
                 ))
             indexed_rows.append({
                 "image_id": image_id,
+                "image_path": row["image_path"],
+                "remote_image_url": row["image_url"],
+                "title": row["title"],
+                "source_url": row["source_url"],
                 "base_prompt": base_prompt,
                 "negative_prompt": negative_prompt,
                 "excluded_tags": excluded_tags,
@@ -2578,6 +2686,13 @@ def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
             "sample_count": 0,
             "matched_artists": set(),
             "recommendations": [],
+            "representative_image": {
+                "id": row["image_id"],
+                "image_path": row["image_path"],
+                "remote_image_url": row["remote_image_url"],
+                "title": row["title"],
+                "source_url": row["source_url"],
+            },
         })
         entry["sample_count"] += 1
         entry["matched_artists"].update(matched)
@@ -2598,6 +2713,7 @@ def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
             "matched_artists": matched_artists,
             "match_count": len(matched_artists),
             "average_recommendations": round(sum(recommendations) / len(recommendations), 1) if recommendations else None,
+            "representative_image": entry["representative_image"],
         })
     presets.sort(key=lambda entry: (
         -entry["match_count"],
@@ -3068,11 +3184,14 @@ def _save_article(db_path, image_dir, session, article, summary, run_id=None):
         stored = existing.get(identity)
         stored_path = (image_root / stored["image_path"]).resolve() if stored and stored.get("image_path") else None
         if stored and stored.get("metadata_status") == "no_metadata":
-            resolved[identity] = stored_record(stored)
+            if stored.get("content_type") == "image/webp":
+                new_urls.append(image_url)
+            else:
+                resolved[identity] = stored_record(stored)
         elif stored and stored_path and image_root in stored_path.parents and stored_path.exists():
             resolved[identity] = stored_record(stored)
         else:
-            obvious_content_type = _obvious_non_png_content_type(image_url)
+            obvious_content_type = _obvious_unsupported_content_type(image_url)
             if obvious_content_type:
                 resolved[identity] = (image_url, "", obvious_content_type, extract_novelai_metadata(b""))
             else:

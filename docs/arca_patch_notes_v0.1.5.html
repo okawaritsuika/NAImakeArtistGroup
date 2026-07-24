@@ -1,0 +1,51 @@
+<div style="max-width:920px;margin:0 auto;padding:22px;color:#e8edf5;background:#171b22;border:1px solid #343c49;border-radius:14px;line-height:1.7;word-break:keep-all;">
+  <h1 style="margin:0 0 8px;font-size:28px;color:#7de0d6;">NovelAI 그림체 도구 v0.1.5 패치노트</h1>
+  <p style="margin:0 0 18px;color:#aeb8c7;">그림체 제작의 선택과 편집을 편하게 만들고, 여러 이미지를 확정 그림체로 가져오는 과정을 빠르고 분명하게 다듬은 업데이트입니다.</p>
+
+  <div style="margin:16px 0;padding:14px 16px;background:#202732;border:1px solid #3c4858;border-radius:10px;">
+    <strong style="color:#ffffff;">기존 사용자 업데이트</strong>
+    <p style="margin:6px 0 0;">v0.1.1 이상은 리모콘에서 <strong style="color:#7de0d6;">업데이트 확인 → 업데이트 받기</strong>를 누르면 됩니다. 기존 평가, 확정 그림체, 생성 기록, App Key와 로컬 이미지는 유지됩니다.</p>
+  </div>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">1. 수집 프롬프트 갤러리</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">그림체 제작의 수집 프롬프트 선택 상자를 이미지 갤러리 버튼으로 바꿨습니다.</li>
+    <li style="margin:7px 0;">그림을 한 번 누르면 퀄리티 프롬프트와 제외된 태그 전체를 옆에서 확인하고 수정할 수 있습니다.</li>
+    <li style="margin:7px 0;">수정값 저장 후 적용을 누르면 다음 실행에서도 수정한 프롬프트를 그대로 불러옵니다.</li>
+    <li style="margin:7px 0;">그림을 더블클릭하면 편집 과정 없이 바로 적용합니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">2. 작가 선택과 가중치 편집</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">후보 수집에서 제외할 프롬프트를 지정하고 최신 이미지부터 확인할 수 있습니다.</li>
+    <li style="margin:7px 0;">작가 가중치 표를 큰 화면으로 열어 추가·수정·정렬할 수 있습니다.</li>
+    <li style="margin:7px 0;">작가 위치를 0으로 지정하면 생성할 때마다 무작위 순서에 배치됩니다.</li>
+    <li style="margin:7px 0;">개별 작가의 가중치를 현재 최소·최대 범위 안에서 매번 무작위로 바꿀 수 있습니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">3. 여러 이미지와 폴더 가져오기</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">여러 이미지나 폴더 전체를 한 번에 선택해 확정 그림체로 가져올 수 있습니다.</li>
+    <li style="margin:7px 0;">작가 프롬프트가 같은 이미지는 한 그림체 묶음으로 자동 분류하며, 필요한 이미지는 따로 분리할 수 있습니다.</li>
+    <li style="margin:7px 0;">폴더 내용, 현재 처리 장수, 남은 장수와 메타데이터 누락 여부를 가져오기 전에 확인할 수 있습니다.</li>
+    <li style="margin:7px 0;">같은 작가 프롬프트로 이미 저장된 확정 그림체를 찾아 이미지와 설정을 비교할 수 있습니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">4. 이미지 메타데이터 호환</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">PNG와 WebP의 EXIF 및 NovelAI stealth 메타데이터를 읽습니다.</li>
+    <li style="margin:7px 0;">퀄리티·네거티브·캐릭터 프롬프트와 NovelAI V4.5 모델명을 더 정확하게 복원합니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">5. 그림체 관리 로딩 개선</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">제작 기록·확정 그림체·공유 그림체를 열 때 목록 준비와 이미지 완료 수를 진행 막대로 표시합니다.</li>
+    <li style="margin:7px 0;">목록에는 가벼운 WebP 썸네일을 만들어 재사용하고, 상세 보기와 저장에는 원본 이미지를 유지합니다.</li>
+    <li style="margin:7px 0;">이미지가 많은 페이지도 첫 조회 뒤에는 썸네일 캐시로 더 빠르게 다시 열립니다.</li>
+  </ul>
+
+  <div style="margin-top:26px;padding:14px 16px;background:#202732;border-left:4px solid #7de0d6;border-radius:8px;">
+    <strong style="color:#ffffff;">안전한 업데이트</strong>
+    <p style="margin:6px 0 0;">배포 파일에는 개인 평가, NovelAI App Key, 로그인 정보와 사용자가 만든 이미지가 포함되지 않습니다.</p>
+  </div>
+</div>

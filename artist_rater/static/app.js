@@ -11,6 +11,8 @@ const state = {
   savingRating: false,
   autocompleteItems: [],
   autocompleteIndex: -1,
+  excludeAutocompleteItems: [],
+  excludeAutocompleteIndex: -1,
   manualArtistItems: [],
   manualArtistIndex: -1,
   manualPreviewSamples: [],
@@ -87,6 +89,8 @@ function requestPayload() {
     candidate_limit: Number(valueOf("candidateLimit", 12) || 12),
     sample_limit: Number(valueOf("sampleLimit", 10) || 10),
     random_mode: valueOf("randomMode", "soft_weighted"),
+    exclude_query_text: valueOf("excludeQueryText"),
+    latest_samples: Boolean($("latestSamples")?.checked),
     exclude_artist_tags: Array.from(state.seenArtists),
   };
 }
@@ -110,87 +114,101 @@ function formatFilterStats(stats) {
   if (stats.unique_artist_count) parts.push(`고유 작가 ${stats.unique_artist_count}명`);
   if (stats.min_match_candidate_count) parts.push(`최소 출현 통과 ${stats.min_match_candidate_count}명`);
   if (stats.post_count_filtered_count) parts.push(`게시물 수 필터 제외 ${stats.post_count_filtered_count}명`);
+  if (stats.exclude_prompt_filtered_count) parts.push(`제외 프롬프트 일치 ${stats.exclude_prompt_filtered_count}명`);
   parts.push(`최종 ${stats.final_candidate_count || 0}명`);
   return parts.join(" · ");
 }
 
-async function updateAutocomplete() {
-  const box = $("autocomplete");
-  const textarea = $("queryText");
+function autocompleteConfig(kind = "query") {
+  return kind === "exclude"
+    ? { inputId: "excludeQueryText", boxId: "excludeAutocomplete", itemsKey: "excludeAutocompleteItems", indexKey: "excludeAutocompleteIndex" }
+    : { inputId: "queryText", boxId: "autocomplete", itemsKey: "autocompleteItems", indexKey: "autocompleteIndex" };
+}
+
+async function updateAutocomplete(kind = "query") {
+  const config = autocompleteConfig(kind);
+  const box = $(config.boxId);
+  const textarea = $(config.inputId);
   if (!box || !textarea) return;
   const q = lastTagFragment(textarea.value);
   if (!q || q.length < 2) {
     box.classList.add("hidden");
-    state.autocompleteItems = [];
-    state.autocompleteIndex = -1;
+    state[config.itemsKey] = [];
+    state[config.indexKey] = -1;
     return;
   }
   try {
     const items = await apiFetch(`/api/tags/autocomplete?q=${encodeURIComponent(q)}`);
     if (!Array.isArray(items) || !items.length) {
       box.classList.add("hidden");
-      state.autocompleteItems = [];
-      state.autocompleteIndex = -1;
+      state[config.itemsKey] = [];
+      state[config.indexKey] = -1;
       return;
     }
-    state.autocompleteItems = items;
-    state.autocompleteIndex = -1;
+    state[config.itemsKey] = items;
+    state[config.indexKey] = -1;
     box.innerHTML = "";
     items.forEach((item, index) => {
       const button = document.createElement("button");
       button.type = "button";
       button.dataset.index = String(index);
       button.innerHTML = `<span>${item.name}</span><span>${item.category_name} · ${item.post_count}</span>`;
-      button.addEventListener("mouseenter", () => setAutocompleteIndex(index));
-      button.addEventListener("click", () => applyAutocompleteItem(index));
+      button.addEventListener("mouseenter", () => setAutocompleteIndex(index, kind));
+      button.addEventListener("click", () => applyAutocompleteItem(index, kind));
       box.appendChild(button);
     });
     box.classList.remove("hidden");
   } catch {
     box.classList.add("hidden");
-    state.autocompleteItems = [];
-    state.autocompleteIndex = -1;
+    state[config.itemsKey] = [];
+    state[config.indexKey] = -1;
   }
 }
 
-function setAutocompleteIndex(index) {
-  const box = $("autocomplete");
-  if (!box || !state.autocompleteItems.length) return;
-  state.autocompleteIndex = (index + state.autocompleteItems.length) % state.autocompleteItems.length;
+function setAutocompleteIndex(index, kind = "query") {
+  const config = autocompleteConfig(kind);
+  const box = $(config.boxId);
+  const items = state[config.itemsKey];
+  if (!box || !items.length) return;
+  state[config.indexKey] = (index + items.length) % items.length;
   box.querySelectorAll("button").forEach((button, buttonIndex) => {
-    button.classList.toggle("active", buttonIndex === state.autocompleteIndex);
+    button.classList.toggle("active", buttonIndex === state[config.indexKey]);
   });
 }
 
-function applyAutocompleteItem(index = state.autocompleteIndex) {
-  const textarea = $("queryText");
-  const box = $("autocomplete");
-  const item = state.autocompleteItems[index];
+function applyAutocompleteItem(index, kind = "query") {
+  const config = autocompleteConfig(kind);
+  const textarea = $(config.inputId);
+  const box = $(config.boxId);
+  const resolvedIndex = index ?? state[config.indexKey];
+  const item = state[config.itemsKey][resolvedIndex];
   if (!textarea || !box || !item) return;
   textarea.value = replaceLastFragment(textarea.value, item.name);
   box.classList.add("hidden");
-  state.autocompleteItems = [];
-  state.autocompleteIndex = -1;
+  state[config.itemsKey] = [];
+  state[config.indexKey] = -1;
   textarea.focus();
 }
 
-function handleAutocompleteKeydown(event) {
-  const box = $("autocomplete");
-  if (!box || box.classList.contains("hidden") || !state.autocompleteItems.length) return;
+function handleAutocompleteKeydown(event, kind = "query") {
+  const config = autocompleteConfig(kind);
+  const box = $(config.boxId);
+  const items = state[config.itemsKey];
+  if (!box || box.classList.contains("hidden") || !items.length) return;
   if (event.key === "ArrowDown") {
     event.preventDefault();
-    setAutocompleteIndex(state.autocompleteIndex + 1);
+    setAutocompleteIndex(state[config.indexKey] + 1, kind);
   } else if (event.key === "ArrowUp") {
     event.preventDefault();
-    setAutocompleteIndex(state.autocompleteIndex <= 0 ? state.autocompleteItems.length - 1 : state.autocompleteIndex - 1);
+    setAutocompleteIndex(state[config.indexKey] <= 0 ? items.length - 1 : state[config.indexKey] - 1, kind);
   } else if (event.key === "Enter") {
-    if (state.autocompleteIndex >= 0) {
+    if (state[config.indexKey] >= 0) {
       event.preventDefault();
-      applyAutocompleteItem();
+      applyAutocompleteItem(undefined, kind);
     }
   } else if (event.key === "Escape") {
     box.classList.add("hidden");
-    state.autocompleteIndex = -1;
+    state[config.indexKey] = -1;
   }
 }
 
@@ -470,6 +488,7 @@ async function loadCandidatePool(force = false) {
       query_tags: data.query_tags || [],
       candidate_count: data.candidate_count || state.candidatePool.length,
       requested_count: Number(valueOf("candidateLimit", 12) || 12),
+      latest_samples: data.latest_samples === true,
       filter_stats: data.filter_stats || null,
     };
     updatePoolStatus();
@@ -520,6 +539,7 @@ async function showNextArtist() {
         mode: state.candidateMeta.mode,
         query_tags: state.candidateMeta.query_tags,
         sample_limit: Number(valueOf("sampleLimit", 10) || 10),
+        latest_samples: state.candidateMeta.latest_samples === true,
       }),
     });
     if (!data.ok) {
@@ -858,6 +878,14 @@ if (queryText) {
     window.autocompleteTimer = setTimeout(updateAutocomplete, 250);
   });
   queryText.addEventListener("keydown", handleAutocompleteKeydown);
+}
+const excludeQueryText = $("excludeQueryText");
+if (excludeQueryText) {
+  excludeQueryText.addEventListener("input", () => {
+    clearTimeout(window.excludeAutocompleteTimer);
+    window.excludeAutocompleteTimer = setTimeout(() => updateAutocomplete("exclude"), 250);
+  });
+  excludeQueryText.addEventListener("keydown", (event) => handleAutocompleteKeydown(event, "exclude"));
 }
 bindClick("candidateButton", async () => {
   const loaded = await loadCandidatePool(true);

@@ -83,8 +83,7 @@ class StyleFrontendContractTest(unittest.TestCase):
             'id="rerollStyleArtists"',
             'id="rerollStyleWeights"',
             'id="rerollStyleAll"',
-            'id="sortStyleAsc"',
-            'id="sortStyleDesc"',
+            'data-weight-table-sort',
             'id="weightGraph"',
             'id="artistPromptPreview"',
             'id="styleArtistSearch"',
@@ -143,6 +142,40 @@ class StyleFrontendContractTest(unittest.TestCase):
             self.html.index('id="artistPromptPreview"'),
         )
 
+    def test_weight_table_has_full_size_editor_modal_and_random_controls(self):
+        for marker in (
+            'id="openWeightTable"',
+            'id="weightTableModal"',
+            'id="weightTableArtistList"',
+            'id="weightTableArtistSearch"',
+            'id="weightTableArtistAutocomplete"',
+            'id="weightTableArtistSelect"',
+            'id="weightTableArtistPosition"',
+            'id="weightTableArtistWeight"',
+            'id="weightTableArtistRandomWeight"',
+            'id="weightTableAddArtist"',
+            'id="styleArtistRandomWeight"',
+            '순서 0은',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        self.assertIn('position.min = "0"', self.script)
+        self.assertIn('randomWeightInput.checked = item.random_weight === true', self.script)
+        self.assertIn('updateStyleArtistAutocomplete("modal")', self.script)
+        self.assertIn(".weight-table-dialog", self.css)
+        self.assertEqual(self.html.count("data-weight-table-sort"), 2)
+        self.assertIn("가중치 <span data-weight-sort-icon>↑↓</span>", self.html)
+        self.assertNotIn('id="weightTableSortAsc"', self.html)
+        self.assertNotIn('id="weightTableSortDesc"', self.html)
+        self.assertNotIn('id="sortStyleAsc"', self.html)
+        self.assertNotIn('id="sortStyleDesc"', self.html)
+        modal_start = self.html.index('id="weightTableModal"')
+        modal_add = self.html.index('class="artist-add-row weight-table-artist-add"', modal_start)
+        modal_table = self.html.index('class="weight-table-content"', modal_start)
+        self.assertLess(modal_add, modal_table)
+        self.assertIn(".style-artist-list .style-artist-row:hover", self.css)
+        self.assertIn("background: #202833", self.css)
+
     def test_style_settings_have_collapsible_groups_and_one_outer_scroll(self):
         self.assertNotIn('id="toggleStyleSettingsBody"', self.html)
         for label in ("작가 구성", "허용 평점", "가중치 설정", "가중치 표"):
@@ -152,9 +185,10 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn(".style-settings-body", self.css)
         self.assertIn("overflow-y: auto", self.css)
         self.assertIn("scrollbar-gutter: stable", self.css)
-        artist_list_start = self.css.index(".style-artist-list {")
-        artist_list_end = self.css.index("}", artist_list_start)
-        self.assertIn("overflow: visible", self.css[artist_list_start:artist_list_end])
+        self.assertEqual(self.html.count('class="style-artist-table-scroll"'), 2)
+        self.assertIn(".style-artist-table-scroll", self.css)
+        self.assertIn("overflow-x: auto", self.css)
+        self.assertIn("min-width: 430px", self.css)
 
     def test_weight_graph_edits_fixed_artists_as_overlays_not_bottom_table(self):
         overlay_start = self.script.index("function renderWeightGraphFixedArtistOverlays")
@@ -184,6 +218,14 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn("text-overflow: ellipsis", self.css)
         self.assertIn(".style-editor-head .status", self.css)
         self.assertIn("overflow-wrap: anywhere", self.css)
+
+    def test_random_weight_add_control_sits_below_the_weight_field(self):
+        rule_start = self.css.index(".artist-add-row > .style-artist-random-add {")
+        rule_end = self.css.index("}", rule_start)
+        rule = self.css[rule_start:rule_end]
+        self.assertIn("grid-column: 4 / 5", rule)
+        self.assertIn("grid-row: 2", rule)
+        self.assertEqual(self.html.count('class="compact-check style-artist-random-add"'), 2)
 
     def test_latest_generation_result_keeps_large_preview_space(self):
         self.assertIn("grid-template-rows: auto auto minmax(420px, 1fr) auto", self.css)
@@ -272,14 +314,20 @@ class StyleFrontendContractTest(unittest.TestCase):
 
     def test_collected_prompt_presets_follow_the_generation_random_targets(self):
         for marker in (
-            'id="promptPresetSelect"',
-            'id="applyPromptPreset"',
+            'id="openPromptPresetModal"',
+            'id="promptPresetModal"',
+            'id="promptPresetGallery"',
+            'id="promptPresetQualityEditor"',
+            'id="promptPresetFullPreview"',
+            'id="promptPresetExcludedList"',
+            'id="saveAndApplyPromptPreset"',
             'id="promptPresetStatus"',
             'id="excludedPromptTags"',
             'id="excludedPromptTagList"',
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
+        self.assertNotIn('id="promptPresetSelect"', self.html)
         self.assertNotIn('id="promptPresetMode"', self.html)
         self.assertNotIn('>자동 추천</option>', self.html)
         self.assertNotIn('>수동 고정</option>', self.html)
@@ -287,6 +335,10 @@ class StyleFrontendContractTest(unittest.TestCase):
         for marker in (
             'apiFetch("/api/style-maker/prompt-presets"',
             "function applyPromptPreset",
+            "function renderPromptPresetModal",
+            "function saveAndApplyPromptPreset",
+            'button.addEventListener("dblclick"',
+            'method: "PATCH"',
             "function refreshPromptPresetsForArtists",
             "function fixPromptPresetAfterManualEdit",
             "function restoreExcludedPromptTag",
@@ -349,7 +401,8 @@ class StyleFrontendContractTest(unittest.TestCase):
             'apiFetch("/api/style-maker/artists"',
             "function buildStyleRequestPayload",
             "function renderWeightGraph",
-            "function sortStyleArtists",
+            "function sortFixedArtistEntriesForTable",
+            "function cycleWeightTableSort",
             "function swapStyleArtists",
             "function addStyleArtist",
             "function removeStyleArtist",
@@ -391,6 +444,35 @@ class StyleFrontendContractTest(unittest.TestCase):
         detail_load = self.script.index('renderStyleManagerDetail(style);', selection_branch)
         self.assertLess(selection_branch, detail_load)
         self.assertNotIn('return;', self.script[selection_branch:detail_load])
+
+    def test_confirmed_style_import_supports_multiple_images_folders_and_group_navigation(self):
+        for marker in (
+            'id="confirmedStyleFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple',
+            'id="confirmedStyleFolder"',
+            'webkitdirectory',
+            'id="confirmedStyleGroupStrip"',
+            'id="confirmedStylePrevGroup"',
+            'id="confirmedStyleNextGroup"',
+            'id="confirmedStylePrevImage"',
+            'id="confirmedStyleNextImage"',
+            'id="splitConfirmedStyleImage"',
+            'id="removeConfirmedStyleGroup"',
+            'id="saveAllConfirmedStyles"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        for marker in (
+            "function groupConfirmedImportItems",
+            "function useConfirmedStyleFiles",
+            'apiFetch("/api/confirmed-styles/import-batch"',
+            "useConfirmedStyleFiles(event.dataTransfer?.files)",
+            "useConfirmedStyleFiles(files)",
+            "function splitConfirmedImportImage",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script)
+        self.assertIn(".confirmed-style-group-strip", self.css)
+        self.assertIn(".confirmed-style-import-navigator", self.css)
 
     def test_comparison_groups_use_folder_gallery_progress_and_reacquire(self):
         for marker in (
@@ -532,6 +614,84 @@ class StyleFrontendContractTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_confirmed_import_progress_folder_contents_and_duplicate_review_exist(self):
+        for marker in (
+            'id="confirmedStyleImportProgress"',
+            'id="confirmedStyleImportProgressBar"',
+            'id="confirmedStyleFolderContents"',
+            'id="confirmedStyleFolderContentsList"',
+            'id="confirmedStyleFolderModal"',
+            'id="confirmedStyleFolderSummary"',
+            'id="importConfirmedStyleFolder"',
+            'id="cancelConfirmedStyleFolder"',
+            'id="confirmedStyleDuplicateWarning"',
+            'id="confirmedStyleDuplicateCandidates"',
+            'id="confirmedStyleDuplicateModal"',
+            'id="confirmedStyleDuplicateDetailImage"',
+            'id="confirmedStyleDuplicateDetailInfo"',
+            'id="confirmedStyleDuplicatePrevImage"',
+            'id="confirmedStyleDuplicateNextImage"',
+            'id="confirmedStyleCharacterPrompts"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        for marker in (
+            "function renderConfirmedFolderContents(",
+            "function openConfirmedFolderReview(",
+            "function stageConfirmedFolderFiles(",
+            "function confirmConfirmedFolderImport(",
+            "function openConfirmedStylePreview(",
+            "function setConfirmedImportProgress(",
+            "function attachConfirmedStyleSuspects(",
+            "function openConfirmedDuplicateReview(",
+            "function moveConfirmedDuplicateImage(",
+            "Promise.allSettled(",
+            "남음 ${candidates.length - completed}",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script)
+        self.assertIn("cursor: not-allowed", self.css)
+        self.assertIn(".confirmed-style-duplicate-dialog", self.css)
+        self.assertIn(".confirmed-style-duplicate-detail-info", self.css)
+        self.assertIn(".confirmed-style-import-toolbar", self.css)
+        self.assertIn(".confirmed-style-image-scroller", self.css)
+        self.assertIn(".confirmed-style-folder-dialog", self.css)
+        self.assertIn("#generatedImageModal", self.css)
+        self.assertIn("z-index: 160", self.css)
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr)", self.css)
+        self.assertLess(self.html.index('id="confirmedStyleImportCounter"'), self.html.index('id="confirmedStyleGroupStrip"'))
+        self.assertLess(self.html.index('id="removeConfirmedStyleGroup"'), self.html.index('id="confirmedStyleGroupStrip"'))
+        self.assertLess(self.html.index('id="confirmedStyleMetadataStatus"'), self.html.index('id="confirmedStyleGroupStrip"'))
+        self.assertIn('styleElement("confirmedStylePreview")?.addEventListener("click", openConfirmedStylePreview)', self.script)
+        self.assertIn("stageConfirmedFolderFiles(event.target.files)", self.script)
+        self.assertIn("group.items[styleState.confirmedImportImageIndex]?.metadata", self.script)
+        self.assertIn("entry.items[thumbIndex]?.objectUrl", self.script)
+        self.assertIn("프롬프트 메타데이터 없음", self.script)
+        self.assertIn(".confirmed-style-group-thumb.metadata-missing", self.css)
+        self.assertNotIn('confirmedDropZone?.addEventListener("click"', self.script)
+        self.assertLess(
+            self.script.index('const imageModal = styleElement("generatedImageModal")'),
+            self.script.index('const folderModal = styleElement("confirmedStyleFolderModal")'),
+        )
+
+    def test_style_manager_reports_page_image_loading_progress_and_uses_thumbnails(self):
+        for marker in (
+            'id="styleManagerLoadProgress"',
+            'id="styleManagerLoadProgressBar"',
+            'id="styleManagerLoadProgressText"',
+        ):
+            self.assertIn(marker, self.html)
+        for marker in (
+            "function setStyleManagerLoadProgress(",
+            "function createStyleManagerImageProgress(",
+            'style.thumbnail_url || imageUrl',
+            'image.loading = "eager"',
+            'image.decoding = "async"',
+            "이미지 가져오는 중",
+        ):
+            self.assertIn(marker, self.script)
+        self.assertIn(".style-manager-load-progress", self.css)
 
 
 if __name__ == "__main__":

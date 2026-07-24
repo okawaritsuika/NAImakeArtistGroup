@@ -166,6 +166,33 @@ class CandidateFlowTest(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual([item["artist"] for item in data["candidates"]], ["artist_b"])
 
+    def test_candidates_are_drawn_then_filtered_by_exclusion_prompt(self):
+        candidates = [
+            {"artist_tag": "artist_a", "matched_post_count": 3, "artist_post_count": 2000},
+            {"artist_tag": "artist_b", "matched_post_count": 2, "artist_post_count": 2000},
+        ]
+
+        def search_posts(tags, fetch_pages=1, limit=100):
+            return [{"id": 1}] if tags == ["artist_a", "ai-generated"] else []
+
+        with patch("app.global_artist_candidates", return_value=candidates), patch(
+            "app.search_posts", side_effect=search_posts
+        ), patch("app.choose_candidate", side_effect=lambda items, mode: items[0]):
+            response = self.client.post(
+                "/api/candidates",
+                json={
+                    "exclude_query_text": "ai-generated",
+                    "candidate_limit": 1,
+                    "random_mode": "uniform",
+                },
+            )
+
+        data = response.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual([item["artist"] for item in data["candidates"]], ["artist_b"])
+        self.assertEqual(data["exclude_query_tags"], ["ai-generated"])
+        self.assertEqual(data["filter_stats"]["exclude_prompt_filtered_count"], 1)
+
     def test_artist_samples_endpoint_fetches_images_for_one_artist(self):
         sample = {
             "id": 10,
@@ -194,7 +221,7 @@ class CandidateFlowTest(unittest.TestCase):
         self.assertTrue(data["ok"])
         self.assertEqual(data["artist"], "artist_a")
         self.assertEqual(len(data["samples"]), 1)
-        fetch_samples.assert_called_once_with("artist_a", ["school_uniform"], 10)
+        fetch_samples.assert_called_once_with("artist_a", ["school_uniform"], 10, False)
 
     def test_fetch_artist_samples_shuffles_danbooru_order(self):
         posts = [
@@ -222,6 +249,20 @@ class CandidateFlowTest(unittest.TestCase):
             samples = app.fetch_artist_samples("artist_a", ["school_uniform"], 3)
 
         self.assertEqual([sample["id"] for sample in samples], [3, 2, 1])
+
+    def test_fetch_artist_samples_keeps_latest_danbooru_order_when_requested(self):
+        posts = [
+            {"id": 3, "created_at": "2025-01-03T00:00:00+00:00", "preview_file_url": "https://example.test/3.jpg"},
+            {"id": 2, "created_at": "2025-01-02T00:00:00+00:00", "preview_file_url": "https://example.test/2.jpg"},
+            {"id": 1, "created_at": "2025-01-01T00:00:00+00:00", "preview_file_url": "https://example.test/1.jpg"},
+        ]
+
+        with patch("app.search_posts", return_value=posts) as search_posts, patch("app.random.shuffle") as shuffle:
+            samples = app.fetch_artist_samples("artist_a", ["school_uniform"], 2, latest_first=True)
+
+        self.assertEqual([sample["id"] for sample in samples], [3, 2])
+        search_posts.assert_called_once_with(["artist_a"], fetch_pages=1)
+        shuffle.assert_not_called()
 
 
 if __name__ == "__main__":

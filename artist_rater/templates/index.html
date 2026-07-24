@@ -37,6 +37,12 @@
               <textarea id="queryText" placeholder="비워두면 전체 작가 중 랜덤으로 뽑습니다. 예: school_uniform, lying, looking_at_viewer"></textarea>
               <div id="autocomplete" class="autocomplete hidden"></div>
             </label>
+            <label class="field">
+              <span>제외할 태그/프롬프트</span>
+              <textarea id="excludeQueryText" placeholder="예: ai-generated, 3d"></textarea>
+              <div id="excludeAutocomplete" class="autocomplete hidden"></div>
+              <small class="help-text">뽑힌 작가와 이 조건을 함께 검색해 결과가 있으면 해당 작가를 제외합니다.</small>
+            </label>
             <div class="notice">
               <p>이미 평가한 작가는 자동으로 제외됩니다.</p>
               <p>이미지는 다음 작가를 볼 때만 가져옵니다.</p>
@@ -79,6 +85,10 @@
                 <option>12</option>
                 <option>16</option>
               </select>
+            </label>
+            <label class="candidate-option">
+              <input id="latestSamples" type="checkbox">
+              <span>최신 그림 우선 표시</span>
             </label>
             <label class="field">
               <span>랜덤 방식</span>
@@ -294,14 +304,19 @@
                 <div class="style-settings-section-body">
                   <div class="style-subhead compact">
                     <span>여기서도 바로 수정</span>
+                    <button id="openWeightTable" type="button">크게 보기</button>
                   </div>
-                  <div class="style-artist-row style-artist-row-head" aria-hidden="true">
-                    <span>순서</span>
-                    <span>작가</span>
-                    <span>가중치</span>
-                    <span></span>
+                  <div class="style-artist-table-scroll">
+                    <div class="style-artist-row style-artist-row-head">
+                      <span>순서</span>
+                      <span>작가</span>
+                      <button class="weight-table-sort-header" type="button" data-weight-table-sort aria-label="가중치 정렬: 원래 순서">가중치 <span data-weight-sort-icon>↑↓</span></button>
+                      <span>랜덤</span>
+                      <span></span>
+                    </div>
+                    <div id="styleArtistList" class="style-artist-list"></div>
                   </div>
-                  <div id="styleArtistList" class="style-artist-list"></div>
+                  <p class="help-text">순서 0은 그림을 만들 때마다 랜덤 위치입니다. “랜덤”을 켠 가중치는 입력값 대신 현재 최소~최대 범위에서 매번 다시 정합니다.</p>
                 </div>
               </details>
               <div id="styleSettingsError" class="status" role="alert"></div>
@@ -314,8 +329,6 @@
                 <button id="rerollStyleArtists" type="button" title="작가 다시 뽑기">작가 ↻</button>
                 <button id="rerollStyleWeights" type="button" title="가중치만 다시 뽑기">가중치 ↻</button>
                 <button id="rerollStyleAll" class="primary" type="button" title="작가와 가중치 다시 뽑기">전체 ↻</button>
-                <button id="sortStyleAsc" class="icon-button" type="button" title="가중치 오름차순" aria-label="가중치 오름차순">↑</button>
-                <button id="sortStyleDesc" class="icon-button" type="button" title="가중치 내림차순" aria-label="가중치 내림차순">↓</button>
               </div>
               <div id="styleMakerStatus" class="status" role="status"></div>
             </div>
@@ -331,12 +344,13 @@
               </label>
               <label class="field style-artist-small-field">
                 <span>위치</span>
-                <input id="styleArtistPosition" type="number" min="1" value="1">
+                <input id="styleArtistPosition" type="number" min="0" value="1" title="0이면 생성할 때마다 랜덤 순서">
               </label>
               <label class="field style-artist-small-field">
                 <span>가중치</span>
                 <input id="styleArtistWeight" type="number" min="0.01" step="0.01" value="1">
               </label>
+              <label class="compact-check style-artist-random-add"><input id="styleArtistRandomWeight" type="checkbox"> 가중치 랜덤</label>
               <button id="addStyleArtist" class="icon-button primary" type="button" title="작가 추가" aria-label="작가 추가">＋</button>
             </div>
             <section id="latestStyleResult" class="latest-style-result" aria-live="polite">
@@ -368,8 +382,9 @@
                     <strong id="promptPresetTitle">수집 그림체 프롬프트</strong>
                   </div>
                   <div class="prompt-preset-row">
-                    <select id="promptPresetSelect" aria-label="수집 프롬프트 세트"><option value="">수집 세트를 불러오는 중...</option></select>
-                    <button id="applyPromptPreset" type="button">적용</button>
+                    <button id="openPromptPresetModal" type="button" disabled>
+                      <span id="promptPresetButtonText">수집 세트를 불러오는 중...</span>
+                    </button>
                   </div>
                   <p id="promptPresetStatus" class="prompt-preset-status">아래 랜덤 대상에서 퀄리티 프롬·네거 프롬을 켜면 생성할 때마다 수집 세트에서 무작위로 바뀝니다.</p>
                   <div id="excludedPromptTags" class="excluded-prompt-tags hidden">
@@ -483,6 +498,10 @@
             <label class="field"><span>그림 크기</span><select id="styleManagerCardSize"><option value="small">작게</option><option value="medium" selected>보통</option><option value="large">크게</option></select></label>
           </section>
           <div id="styleManagerStatus" class="status"></div>
+          <div id="styleManagerLoadProgress" class="style-manager-load-progress hidden" aria-live="polite">
+            <progress id="styleManagerLoadProgressBar" value="0" max="1"></progress>
+            <span id="styleManagerLoadProgressText"></span>
+          </div>
           <div id="styleManagerList" class="style-manager-list"></div>
           <nav id="styleManagerPagination" class="style-manager-pagination" aria-label="그림체 관리 목록 페이지">
             <button id="styleManagerPrevPage" type="button">이전</button>
@@ -778,6 +797,45 @@
       </section>
     </div>
 
+    <div id="promptPresetModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="promptPresetModalTitle">
+      <div class="modal-backdrop" data-close-prompt-preset></div>
+      <section class="modal-dialog prompt-preset-dialog">
+        <div class="modal-head">
+          <div>
+            <h2 id="promptPresetModalTitle">수집 그림체 퀄리티 프롬프트</h2>
+            <p>한 번 클릭해서 확인·수정하거나, 그림을 더블클릭해서 바로 적용할 수 있습니다.</p>
+          </div>
+          <button id="closePromptPresetModal" class="ghost" type="button">닫기</button>
+        </div>
+        <div class="prompt-preset-browser">
+          <div id="promptPresetGallery" class="prompt-preset-gallery" aria-label="수집 퀄리티 프롬프트 그림 목록"></div>
+          <section class="prompt-preset-detail">
+            <div class="prompt-preset-detail-head">
+              <h3 id="promptPresetDetailTitle">그림을 선택해 주세요.</h3>
+              <span id="promptPresetDetailMeta"></span>
+            </div>
+            <label class="field">
+              <span>적용할 퀄리티 프롬프트</span>
+              <textarea id="promptPresetQualityEditor" maxlength="16384" autocomplete="off"></textarea>
+            </label>
+            <div class="prompt-preset-full-section">
+              <strong>제외 태그까지 포함한 전체 프롬프트</strong>
+              <pre id="promptPresetFullPreview"></pre>
+            </div>
+            <div class="prompt-preset-excluded-section">
+              <strong>적용할 때 제외 목록으로 유지되는 태그</strong>
+              <div id="promptPresetExcludedList" class="prompt-preset-excluded-list"></div>
+            </div>
+            <div id="promptPresetModalStatus" class="status" role="status"></div>
+          </section>
+        </div>
+        <div class="modal-actions">
+          <button id="cancelPromptPresetModal" class="ghost" type="button">취소</button>
+          <button id="saveAndApplyPromptPreset" class="primary" type="button">수정값 저장 후 적용</button>
+        </div>
+      </section>
+    </div>
+
     <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
       <div class="modal-backdrop" data-close-settings></div>
       <section class="modal-dialog compact-modal">
@@ -812,6 +870,30 @@
         <div class="modal-actions">
           <button id="cancelRatingTagRules" class="ghost" type="button">취소</button>
           <button id="saveRatingTagRules" class="primary" type="button">적용</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="weightTableModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="weightTableTitle">
+      <div class="modal-backdrop" data-close-weight-table></div>
+      <section class="modal-dialog weight-table-dialog">
+        <div class="modal-head">
+          <div><h2 id="weightTableTitle">작가 가중치 표</h2><p>순서 0은 생성할 때마다 랜덤 위치이며, 가중치 랜덤은 현재 최소~최대 범위에서 매번 새 값을 사용합니다.</p></div>
+          <button id="closeWeightTable" class="ghost" type="button">닫기</button>
+        </div>
+        <div class="artist-add-row weight-table-artist-add">
+          <label class="field style-artist-search-field"><span>추가할 작가</span><textarea id="weightTableArtistSearch" autocomplete="off" placeholder="작가 이름 또는 가중치::artist:작가명:: 형식"></textarea><div id="weightTableArtistAutocomplete" class="autocomplete hidden"></div></label>
+          <label class="field style-artist-select-field"><span>저장된 작가 빠른 선택</span><select id="weightTableArtistSelect"></select></label>
+          <label class="field style-artist-small-field"><span>위치</span><input id="weightTableArtistPosition" type="number" min="0" value="1" title="0이면 생성할 때마다 랜덤 순서"></label>
+          <label class="field style-artist-small-field"><span>가중치</span><input id="weightTableArtistWeight" type="number" min="0.01" step="0.01" value="1"></label>
+          <label class="compact-check style-artist-random-add"><input id="weightTableArtistRandomWeight" type="checkbox"> 가중치 랜덤</label>
+          <button id="weightTableAddArtist" class="icon-button primary" type="button" title="작가 추가" aria-label="작가 추가">＋</button>
+        </div>
+        <div class="weight-table-content">
+          <div class="style-artist-table-scroll">
+            <div class="style-artist-row style-artist-row-head"><span>순서</span><span>작가</span><button class="weight-table-sort-header" type="button" data-weight-table-sort aria-label="가중치 정렬: 원래 순서">가중치 <span data-weight-sort-icon>↑↓</span></button><span>랜덤</span><span></span></div>
+            <div id="weightTableArtistList" class="style-artist-list"></div>
+          </div>
         </div>
       </section>
     </div>
@@ -873,14 +955,40 @@
           <button id="closeConfirmedStyleModal" class="ghost" type="button">닫기</button>
         </div>
         <div class="confirmed-style-editor">
-          <section class="confirmed-style-image-column">
-            <div id="confirmedStyleDropZone" class="confirmed-style-drop-zone" tabindex="0">
-              <img id="confirmedStylePreview" class="hidden" alt="확정 그림체 미리보기">
-              <span id="confirmedStyleDropHint">이미지를 드래그하거나 붙여넣으세요.</span>
+          <section id="confirmedStyleImageColumn" class="confirmed-style-image-column">
+            <div class="confirmed-style-import-toolbar">
+              <div id="confirmedStyleImportCounter" class="confirmed-style-import-counter">가져온 이미지 없음</div>
+              <div class="confirmed-style-import-actions">
+                <button id="chooseConfirmedStyleImage" type="button">이미지 선택</button>
+                <button id="chooseConfirmedStyleFolder" type="button">폴더 선택</button>
+                <button id="splitConfirmedStyleImage" type="button">다른 그림체로 분리</button>
+                <button id="removeConfirmedStyleGroup" class="danger-button" type="button">현재 그림체 묶음 제거</button>
+              </div>
+              <button id="confirmedStyleDuplicateWarning" class="confirmed-style-duplicate-warning hidden" type="button"></button>
+              <button id="confirmedStyleFolderContents" class="confirmed-style-folder-button hidden" type="button"></button>
+              <div id="confirmedStyleImportProgress" class="confirmed-style-import-progress hidden" aria-live="polite">
+                <progress id="confirmedStyleImportProgressBar" value="0" max="1"></progress>
+                <span id="confirmedStyleImportProgressText"></span>
+              </div>
+              <div id="confirmedStyleMetadataStatus" class="confirmed-style-toolbar-status status"></div>
             </div>
-            <input id="confirmedStyleFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp">
-            <button id="chooseConfirmedStyleImage" type="button">이미지 선택</button>
-            <div id="confirmedStyleMetadataStatus" class="status"></div>
+            <div class="confirmed-style-image-scroller">
+              <div id="confirmedStyleGroupStrip" class="confirmed-style-group-strip hidden" aria-label="다른 그림체 미리보기"></div>
+              <div class="confirmed-style-import-navigator">
+                <button id="confirmedStylePrevGroup" class="arrow" type="button" aria-label="이전 그림체">‹</button>
+                <div class="confirmed-style-same-group-nav">
+                  <button id="confirmedStylePrevImage" class="arrow vertical" type="button" aria-label="같은 그림체 이전 이미지">↑</button>
+                  <div id="confirmedStyleDropZone" class="confirmed-style-drop-zone">
+                    <img id="confirmedStylePreview" class="hidden" alt="확정 그림체 미리보기">
+                    <span id="confirmedStyleDropHint">이미지 여러 장을 드래그하거나 붙여넣으세요.</span>
+                  </div>
+                  <button id="confirmedStyleNextImage" class="arrow vertical" type="button" aria-label="같은 그림체 다음 이미지">↓</button>
+                </div>
+                <button id="confirmedStyleNextGroup" class="arrow" type="button" aria-label="다음 그림체">›</button>
+              </div>
+              <input id="confirmedStyleFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple>
+              <input id="confirmedStyleFolder" class="hidden" type="file" accept="image/png,image/jpeg,image/webp" webkitdirectory directory multiple>
+            </div>
           </section>
           <section class="confirmed-style-fields">
             <div class="confirmed-style-basic-grid">
@@ -891,6 +999,7 @@
             <label class="field"><span>퀄리티 프롬프트</span><textarea id="confirmedStyleQualityPrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
             <div id="confirmedStyleExcludedSection" class="excluded-prompt-tags hidden"><span>제외된 퀄리티 태그 · 누르면 복구</span><div id="confirmedStyleExcludedTags" class="excluded-prompt-tag-list"></div></div>
             <label class="field"><span>고정 프롬프트</span><textarea id="confirmedStyleFixedPrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+            <label class="field"><span>캐릭터 프롬프트 · 줄마다 1개</span><textarea id="confirmedStyleCharacterPrompts" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
             <label class="field"><span>네거티브 프롬프트</span><textarea id="confirmedStyleNegativePrompt" autocomplete="off"></textarea><div class="autocomplete prompt-tag-autocomplete hidden"></div></label>
             <div class="confirmed-style-parameter-grid">
               <label class="field"><span>샘플러</span><input id="confirmedStyleSampler" type="text"></label>
@@ -912,7 +1021,54 @@
         <div id="confirmedStyleModalStatus" class="status"></div>
         <div class="modal-actions">
           <button id="cancelConfirmedStyle" class="ghost" type="button">취소</button>
-          <button id="saveConfirmedStyle" class="primary" type="button">확정 그림체 저장</button>
+          <button id="saveConfirmedStyle" type="button">현재 그림체 저장</button>
+          <button id="saveAllConfirmedStyles" class="primary" type="button">모든 그림체 저장</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="confirmedStyleDuplicateModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirmedStyleDuplicateTitle">
+      <div class="modal-backdrop" data-close-confirmed-duplicate></div>
+      <section class="modal-dialog confirmed-style-duplicate-dialog">
+        <div class="modal-head">
+          <div>
+            <h2 id="confirmedStyleDuplicateTitle">이미 추가된 그림체 확인</h2>
+            <p>작가 프롬프트가 같은 기존 그림체입니다.</p>
+          </div>
+          <button id="closeConfirmedStyleDuplicate" class="ghost" type="button">닫기</button>
+        </div>
+        <div class="confirmed-style-duplicate-review">
+          <aside id="confirmedStyleDuplicateCandidates" class="confirmed-style-duplicate-candidates" aria-label="중복 의심 그림체 목록"></aside>
+          <section class="confirmed-style-duplicate-detail">
+            <div class="confirmed-style-duplicate-image-stage">
+              <button id="confirmedStyleDuplicatePrevImage" class="arrow" type="button" aria-label="이전 이미지">‹</button>
+              <img id="confirmedStyleDuplicateDetailImage" alt="중복 의심 그림체 이미지">
+              <button id="confirmedStyleDuplicateNextImage" class="arrow" type="button" aria-label="다음 이미지">›</button>
+            </div>
+            <div class="confirmed-style-duplicate-detail-head">
+              <h3 id="confirmedStyleDuplicateDetailName"></h3>
+              <span id="confirmedStyleDuplicateDetailCounter"></span>
+            </div>
+            <div id="confirmedStyleDuplicateDetailInfo" class="confirmed-style-duplicate-detail-info"></div>
+          </section>
+        </div>
+      </section>
+    </div>
+
+    <div id="confirmedStyleFolderModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirmedStyleFolderTitle">
+      <div class="modal-backdrop" data-close-confirmed-folder></div>
+      <section class="modal-dialog confirmed-style-folder-dialog">
+        <div class="modal-head">
+          <div>
+            <h2 id="confirmedStyleFolderTitle">선택한 폴더 내용</h2>
+            <p id="confirmedStyleFolderSummary"></p>
+          </div>
+          <button id="closeConfirmedStyleFolder" class="ghost" type="button">닫기</button>
+        </div>
+        <div id="confirmedStyleFolderContentsList" class="confirmed-style-folder-list"></div>
+        <div class="modal-actions">
+          <button id="cancelConfirmedStyleFolder" class="ghost" type="button">닫기</button>
+          <button id="importConfirmedStyleFolder" class="primary hidden" type="button">이 폴더 가져오기</button>
         </div>
       </section>
     </div>
