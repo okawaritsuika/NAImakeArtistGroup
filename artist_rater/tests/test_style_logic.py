@@ -86,6 +86,23 @@ class StyleIdentityTest(unittest.TestCase):
             "artist:foo 2 ::, best quality",
         )
 
+    def test_numeric_prompt_normalizes_spaced_openers_and_missing_group_separator(self):
+        self.assertEqual(
+            normalize_numeric_prompt_closers("1.5 ::foo:: 2::bar::"),
+            "1.5::foo::, 2::bar::",
+        )
+
+    def test_numeric_prompt_closer_spaces_unweighted_non_artist_numeric_tag(self):
+        self.assertEqual(
+            normalize_numeric_prompt_closers("year 2025::, clone::"),
+            "year 2025 ::, clone::",
+        )
+
+    def test_numeric_prompt_normalization_is_idempotent_and_preserves_separators(self):
+        prompt = "1.5::foo::, 2::year 2025 ::"
+        self.assertEqual(normalize_numeric_prompt_closers(prompt), prompt)
+        self.assertEqual(normalize_numeric_prompt_closers(prompt), normalize_numeric_prompt_closers(prompt))
+
     def test_prompt_preserves_artist_order(self):
         artists = [
             {"artist": "artist_b", "weight": 0.5, "score": 3},

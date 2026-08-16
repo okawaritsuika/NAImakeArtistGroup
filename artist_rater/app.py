@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import math
 import os
@@ -7,7 +8,7 @@ import re
 import sqlite3
 import sys
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -38,6 +39,7 @@ from arca_style_collector import (
     get_arca_quality_sequence_statistics,
     get_style_maker_prompt_presets,
     get_shared_style_artist_pool,
+    get_shared_style_dependency_images,
     get_completed_coverage,
     init_arca_style_tables,
     import_arca_browser_session,
@@ -80,14 +82,19 @@ from style_store import (
     SettingsError,
     delete_app_key,
     delete_style,
+    DELETE_CONFIRMATION_CATEGORIES,
+    default_delete_confirmation_preferences,
     get_style_detail,
     list_generated_images,
     list_styles,
     load_app_key,
+    load_skip_delete_confirmation,
+    normalize_delete_confirmation_preferences,
     load_prompt_preset_overrides,
     release_generation_request,
     reserve_generation_request,
     save_app_key,
+    save_skip_delete_confirmation,
     save_prompt_preset_override,
     save_generated_result,
     delete_generated_image_batch,
@@ -118,6 +125,7 @@ from comparison_store import (
 )
 
 from style_logic import (
+    SCORE_SELECTION_WEIGHT,
     assign_weights,
     build_artist_prompt,
     exact_score,
@@ -155,8 +163,7 @@ SETTINGS_JSON_PATH = DATA_DIR / "settings.json"
 DB_PATH = DATA_DIR / "artist_rater.sqlite"
 ARCA_SESSION_BRIDGE_SOURCE_DIR = RESOURCE_DIR / "static" / "arca_session_bridge"
 DANBOORU_BASE_URL = "https://danbooru.donmai.us"
-CUTOFF = datetime(2025, 1, 31, 23, 59, 59, tzinfo=timezone.utc)
-DATE_TAG = "date:<=2025-01-31"
+DEFAULT_CUTOFF_DATE = "2025-01-31"
 REQUEST_TIMEOUT = 12
 USER_AGENT = "DanbooruArtistRater/1.0 (local personal tool)"
 
@@ -222,6 +229,20 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS rating_examples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rating_id INTEGER NOT NULL,
+                post_id INTEGER NOT NULL,
+                image_path TEXT NOT NULL,
+                source_url TEXT DEFAULT '',
+                post_url TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                UNIQUE(rating_id, post_id)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS artist_cache (
                 artist_tag TEXT PRIMARY KEY,
                 artist_post_count INTEGER DEFAULT 0,
@@ -265,6 +286,10 @@ def init_db():
                 scale REAL NOT NULL,
                 cfg_rescale REAL NOT NULL,
                 model TEXT NOT NULL,
+                shared_dependency_reference_id INTEGER,
+                shared_dependency_reference_title TEXT,
+                shared_dependency_reference_source_url TEXT,
+                shared_dependency_artist_policy TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(style_id) REFERENCES art_styles(id)
             )
@@ -293,6 +318,10 @@ def init_db():
             "fixed_prompt": "TEXT NOT NULL DEFAULT ''",
             "variety_plus": "INTEGER",
             "skip_cfg_above_sigma": "REAL",
+            "shared_dependency_reference_id": "INTEGER",
+            "shared_dependency_reference_title": "TEXT",
+            "shared_dependency_reference_source_url": "TEXT",
+            "shared_dependency_artist_policy": "TEXT",
         }
         for column, declaration in generated_migrations.items():
             if column not in image_columns:
@@ -337,22 +366,40 @@ def normalize_query_text(text):
     return tags
 
 
-def parse_cutoff_date(value):
+def normalize_cutoff_date(value):
+    if value is None:
+        return DEFAULT_CUTOFF_DATE
+    if type(value) is not str or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValueError("cutoff_date는 YYYY-MM-DD 형식이어야 합니다.")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValueError("cutoff_date는 실제 유효한 날짜여야 합니다.")
+    return value
+
+
+def cutoff_datetime(cutoff_date=DEFAULT_CUTOFF_DATE):
+    normalized = normalize_cutoff_date(cutoff_date)
+    cutoff = datetime.combine(date.fromisoformat(normalized), time(23, 59, 59))
+    return cutoff.replace(tzinfo=timezone.utc)
+
+
+def parse_post_datetime(value):
     if not value:
         return None
     text = str(value).replace("Z", "+00:00")
     try:
-        dt = datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
-def is_before_cutoff(post):
-    created = parse_cutoff_date(post.get("created_at"))
-    return bool(created and created <= CUTOFF)
+def is_before_cutoff(post, cutoff_date=DEFAULT_CUTOFF_DATE):
+    created = parse_post_datetime(post.get("created_at"))
+    return bool(created and created <= cutoff_datetime(cutoff_date))
 
 
 def danbooru_get(path, params):
@@ -391,16 +438,17 @@ def post_to_sample(post):
     }
 
 
-def search_posts(tags, fetch_pages=1, limit=100):
+def search_posts(tags, fetch_pages=1, limit=100, cutoff_date=DEFAULT_CUTOFF_DATE):
     pages = max(1, min(int(fetch_pages or 1), 10))
     limit = max(1, min(int(limit or 100), 100))
-    query = " ".join([tag for tag in tags if tag] + [DATE_TAG])
+    cutoff_date = normalize_cutoff_date(cutoff_date)
+    query = " ".join([tag for tag in tags if tag] + [f"date:<={cutoff_date}"])
     posts = []
     for page in range(1, pages + 1):
         data = danbooru_get("/posts.json", {"tags": query, "limit": limit, "page": page})
         if not isinstance(data, list):
             break
-        filtered = [post for post in data if isinstance(post, dict) and is_before_cutoff(post)]
+        filtered = [post for post in data if isinstance(post, dict) and is_before_cutoff(post, cutoff_date)]
         posts.extend(filtered)
         if len(data) < limit:
             break
@@ -553,8 +601,9 @@ def download_thumbnail(url, artist_tag, post_id):
     parsed = urlparse(url or "")
     if parsed.scheme not in {"http", "https"}:
         return ""
-    filename = f"{safe_filename(artist_tag)}_{safe_filename(str(post_id or 'post'))}.jpg"
+    filename = f"{safe_filename(artist_tag)}_{safe_filename(str(post_id or 'post'))}.webp"
     target = THUMBNAIL_DIR / filename
+    temporary = target.with_name(f".{target.name}.tmp")
     try:
         response = requests.get(
             url,
@@ -563,13 +612,124 @@ def download_thumbnail(url, artist_tag, post_id):
             stream=True,
         )
         response.raise_for_status()
-        with target.open("wb") as handle:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    handle.write(chunk)
-    except requests.RequestException:
+        payload = io.BytesIO()
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                payload.write(chunk)
+        payload.seek(0)
+        with Image.open(payload) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.thumbnail((768, 768), Image.Resampling.LANCZOS)
+            has_alpha = "A" in image.getbands() or "transparency" in image.info
+            image = image.convert("RGBA" if has_alpha else "RGB")
+            THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
+            with temporary.open("wb") as handle:
+                image.save(handle, format="WEBP", quality=85, method=3)
+        os.replace(temporary, target)
+    except (requests.RequestException, OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        if temporary.exists():
+            temporary.unlink()
         return ""
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return filename
+
+
+def thumbnail_filename(artist_tag, post_id):
+    return f"{safe_filename(artist_tag)}_{safe_filename(str(post_id or 'post'))}.webp"
+
+
+def safe_thumbnail_path(filename):
+    if not filename:
+        return None
+    name = str(filename)
+    path = Path(name)
+    root = THUMBNAIL_DIR.resolve()
+    if path.is_absolute() or path.name != name:
+        return None
+    target = (THUMBNAIL_DIR / name).resolve()
+    if root not in target.parents:
+        return None
+    return target
+
+
+def remove_unreferenced_thumbnail_paths(filenames):
+    names = {str(filename) for filename in filenames if filename}
+    if not names:
+        return
+    with db() as conn:
+        referenced = {
+            row[0]
+            for row in conn.execute(
+                "SELECT representative_thumbnail_path FROM ratings WHERE representative_thumbnail_path IN ({})".format(
+                    ",".join("?" for _ in names)
+                ),
+                tuple(names),
+            ).fetchall()
+        }
+        referenced.update(
+            row[0]
+            for row in conn.execute(
+                "SELECT image_path FROM rating_examples WHERE image_path IN ({})".format(
+                    ",".join("?" for _ in names)
+                ),
+                tuple(names),
+            ).fetchall()
+        )
+    for filename in names - referenced:
+        target = safe_thumbnail_path(filename)
+        if target and target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+
+def rating_examples_payload(rating_id):
+    with db() as conn:
+        rating = conn.execute(
+            "SELECT id,artist_tag,representative_post_id,representative_thumbnail_path,representative_preview_url FROM ratings WHERE id = ?",
+            (rating_id,),
+        ).fetchone()
+        if not rating:
+            return None
+        rows = conn.execute(
+            "SELECT id,post_id,image_path,source_url,post_url,created_at FROM rating_examples WHERE rating_id = ? ORDER BY id",
+            (rating_id,),
+        ).fetchall()
+    representative_path = rating["representative_thumbnail_path"] or ""
+    representative_post_id = rating["representative_post_id"]
+    examples = []
+    for row in rows:
+        image_path = row["image_path"] or ""
+        image_url = f"/thumbnails/{image_path}" if safe_thumbnail_path(image_path) else ""
+        examples.append(
+            {
+                "id": row["id"],
+                "post_id": row["post_id"],
+                "image_url": image_url,
+                "source_url": row["source_url"] or "",
+                "post_url": row["post_url"] or "",
+                "created_at": row["created_at"] or "",
+                "is_thumbnail": bool(
+                    image_path == representative_path
+                    or row["post_id"] == representative_post_id
+                ),
+            }
+        )
+    return {
+        "ok": True,
+        "rating": {
+            "id": rating["id"],
+            "artist_tag": rating["artist_tag"],
+            "representative_post_id": rating["representative_post_id"],
+            "representative_thumbnail_path": representative_path,
+            "representative_preview_url": rating["representative_preview_url"] or "",
+            "thumbnail_url": f"/thumbnails/{representative_path}" if safe_thumbnail_path(representative_path) else "",
+        },
+        "examples": examples,
+    }
 
 
 def choose_candidate(candidates, random_mode):
@@ -595,17 +755,26 @@ def choose_candidate_pool(candidates, random_mode, limit):
     return pool
 
 
-def fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_first=False):
+def search_posts_for_cutoff(tags, fetch_pages=1, limit=100, cutoff_date=DEFAULT_CUTOFF_DATE):
+    kwargs = {"fetch_pages": fetch_pages}
+    if limit != 100:
+        kwargs["limit"] = limit
+    if cutoff_date != DEFAULT_CUTOFF_DATE:
+        kwargs["cutoff_date"] = cutoff_date
+    return search_posts(tags, **kwargs)
+
+
+def fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_first=False, cutoff_date=DEFAULT_CUTOFF_DATE):
     sample_limit = max(1, min(int(sample_limit or 12), 30))
     if latest_first:
-        posts = search_posts([artist_tag], fetch_pages=1)
+        posts = search_posts_for_cutoff([artist_tag], fetch_pages=1, cutoff_date=cutoff_date)
         return [sample for post in posts if (sample := post_to_sample(post))][:sample_limit]
 
     posts = []
     seen = set()
     for tags in ([artist_tag] + query_tags, [artist_tag]):
         try:
-            for post in search_posts(tags, fetch_pages=3):
+            for post in search_posts_for_cutoff(tags, fetch_pages=3, cutoff_date=cutoff_date):
                 post_id = post.get("id")
                 if post_id in seen:
                     continue
@@ -620,7 +789,7 @@ def fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_first=Fals
     return posts[:sample_limit]
 
 
-def choose_candidate_pool_with_exclusions(candidates, random_mode, limit, exclude_query_tags):
+def choose_candidate_pool_with_exclusions(candidates, random_mode, limit, exclude_query_tags, cutoff_date=DEFAULT_CUTOFF_DATE):
     limit = max(1, min(int(limit or 12), 30))
     pool = []
     excluded_count = 0
@@ -628,8 +797,8 @@ def choose_candidate_pool_with_exclusions(candidates, random_mode, limit, exclud
     while remaining and len(pool) < limit:
         selected = choose_candidate(remaining, random_mode)
         remaining = [item for item in remaining if item["artist_tag"] != selected["artist_tag"]]
-        if exclude_query_tags and search_posts(
-            [selected["artist_tag"], *exclude_query_tags], fetch_pages=1, limit=1
+        if exclude_query_tags and search_posts_for_cutoff(
+            [selected["artist_tag"], *exclude_query_tags], fetch_pages=1, limit=1, cutoff_date=cutoff_date
         ):
             excluded_count += 1
             continue
@@ -652,7 +821,7 @@ def candidate_payload(candidate):
     }
 
 
-def global_artist_candidates(min_artist_post_count, pages_to_try):
+def global_artist_candidates(min_artist_post_count, pages_to_try, cutoff_date=DEFAULT_CUTOFF_DATE):
     min_artist_post_count = max(0, int(min_artist_post_count or 0))
     pages_to_try = max(1, min(int(pages_to_try or 5), 10))
     pages = random.sample(range(1, 30), k=min(pages_to_try, 29))
@@ -695,6 +864,7 @@ def build_candidate_pool(payload):
     candidate_limit = int(payload.get("candidate_limit") or 12)
     random_mode = payload.get("random_mode") or "soft_weighted"
     random_mode = random_mode if random_mode in {"uniform", "weighted", "soft_weighted"} else "soft_weighted"
+    cutoff_date = normalize_cutoff_date(payload.get("cutoff_date"))
     rated = get_rated_artist_set()
     excluded_artists = rated | {
         str(artist).strip()
@@ -715,7 +885,7 @@ def build_candidate_pool(payload):
 
     if not query_tags:
         mode = "global_random"
-        raw_candidates = global_artist_candidates(min_artist_post_count, fetch_pages)
+        raw_candidates = global_artist_candidates(min_artist_post_count, fetch_pages, cutoff_date)
         filter_stats["unique_artist_count"] = len(raw_candidates)
         candidates = [
             item
@@ -726,7 +896,7 @@ def build_candidate_pool(payload):
         filter_stats["post_count_filtered_count"] = len(raw_candidates) - len(candidates)
     else:
         mode = "tag_filtered_random"
-        posts = search_posts(query_tags, fetch_pages=fetch_pages)
+        posts = search_posts_for_cutoff(query_tags, fetch_pages=fetch_pages, cutoff_date=cutoff_date)
         filter_stats["fetched_post_count"] = len(posts)
         artist_posts = {}
         for post in posts:
@@ -766,11 +936,12 @@ def build_candidate_pool(payload):
             "reason": "후보 작가가 없습니다. 태그 조건이 좁거나, fetch_pages/min_match_count/min_artist_post_count 설정이 빡빡하거나, 이미 평가한 작가가 많을 수 있습니다.",
             "mode": "global_random" if not query_tags else "tag_filtered_random",
             "query_tags": query_tags,
+            "cutoff_date": cutoff_date,
             "filter_stats": filter_stats,
         }
 
     selected_pool, exclude_prompt_filtered_count = choose_candidate_pool_with_exclusions(
-        candidates, random_mode, candidate_limit, exclude_query_tags
+        candidates, random_mode, candidate_limit, exclude_query_tags, cutoff_date
     )
     filter_stats["exclude_prompt_filtered_count"] = exclude_prompt_filtered_count
     filter_stats["final_candidate_count"] = len(selected_pool)
@@ -782,6 +953,7 @@ def build_candidate_pool(payload):
             "query_tags": query_tags,
             "exclude_query_tags": exclude_query_tags,
             "latest_samples": latest_samples,
+            "cutoff_date": cutoff_date,
             "filter_stats": filter_stats,
         }
     return {
@@ -790,6 +962,7 @@ def build_candidate_pool(payload):
         "query_tags": query_tags,
         "exclude_query_tags": exclude_query_tags,
         "latest_samples": latest_samples,
+        "cutoff_date": cutoff_date,
         "candidate_count": len(selected_pool),
         "candidates": [candidate_payload(candidate) for candidate in selected_pool],
         "filter_stats": filter_stats,
@@ -811,7 +984,7 @@ def pick_random_artist(payload):
 
     selected = pool["candidates"][0]
     samples = fetch_artist_samples(
-        selected["artist_tag"], pool["query_tags"], sample_limit, pool.get("latest_samples", False)
+        selected["artist_tag"], pool["query_tags"], sample_limit, pool.get("latest_samples", False), pool["cutoff_date"]
     )
     if not samples:
         return {
@@ -819,12 +992,14 @@ def pick_random_artist(payload):
             "reason": "선택된 작가의 표시 가능한 샘플 이미지를 찾지 못했습니다.",
             "mode": pool["mode"],
             "query_tags": pool["query_tags"],
+            "cutoff_date": pool["cutoff_date"],
         }
 
     return {
         "ok": True,
         "mode": pool["mode"],
         "query_tags": pool["query_tags"],
+        "cutoff_date": pool["cutoff_date"],
         "artist": selected["artist"],
         "matched_post_count": selected["matched_post_count"],
         "artist_post_count": selected["artist_post_count"],
@@ -869,7 +1044,13 @@ def api_artist_samples():
     sample_limit = int(payload.get("sample_limit") or 10)
     latest_samples = payload.get("latest_samples") is True
     try:
-        samples = fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_samples)
+        cutoff_date = normalize_cutoff_date(payload.get("cutoff_date"))
+        if cutoff_date == DEFAULT_CUTOFF_DATE:
+            samples = fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_samples)
+        else:
+            samples = fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_samples, cutoff_date)
+    except ValueError as exc:
+        return json_response({"ok": False, "error": str(exc)}, 400)
     except requests.RequestException as exc:
         return json_response({"ok": False, "error": f"Danbooru API 오류: {exc}"}, 502)
     if not samples:
@@ -879,6 +1060,7 @@ def api_artist_samples():
                 "reason": "선택된 작가의 표시 가능한 샘플 이미지를 찾지 못했습니다.",
                 "artist": artist_tag,
                 "query_tags": query_tags,
+                "cutoff_date": cutoff_date,
             }
         )
     return json_response(
@@ -886,6 +1068,7 @@ def api_artist_samples():
             "ok": True,
             "mode": payload.get("mode") or "tag_filtered_random",
             "query_tags": query_tags,
+            "cutoff_date": cutoff_date,
             "artist": artist_tag,
             "matched_post_count": int(payload.get("matched_post_count") or 0),
             "artist_post_count": int(payload.get("artist_post_count") or 0),
@@ -1071,8 +1254,60 @@ def api_style_maker_artists():
             for item in fixed_artists
         }
 
+        shared_dependency = payload.get("weight_mode") == "shared_dependency"
+        dependency_reference = None
+        dependency_reference_id = None
+        dependency_meta = {}
+        dependency_ratios = {"fixed": 0, "reference": 100, "rated": 0, "other_shared": 0}
+        dependency_reference_mode = "random"
+        dependency_artist_policy = "highest"
+        if shared_dependency:
+            (
+                requested_reference_id,
+                dependency_ratios,
+                dependency_reference_mode,
+                dependency_artist_policy,
+            ) = _shared_dependency_options(payload)
+            if reroll == "weights" and requested_reference_id is None:
+                raise ValueError("가중치 다시 뽑기에는 기존 공유 그림체 기준 이미지 ID가 필요합니다.")
+            if reroll != "weights" or requested_reference_id is not None:
+                dependency_images = get_shared_style_dependency_images(DB_PATH)
+                if not dependency_images:
+                    raise ValueError("기준으로 사용할 인식 가능한 공유 그림체 이미지가 없습니다.")
+                dependency_rng = random.Random(rng_seed)
+                if requested_reference_id is not None:
+                    requested_reference = next(
+                        (item for item in dependency_images if item.get("id") == requested_reference_id),
+                        None,
+                    )
+                    if requested_reference is None:
+                        raise ValueError("공유 그림체 기준 이미지를 찾을 수 없습니다.")
+                    dependency_reference = requested_reference if (dependency_reference_mode == "fixed" or reroll == "weights") else dependency_rng.choice(dependency_images)
+                elif reroll != "weights":
+                    dependency_reference = dependency_rng.choice(dependency_images)
+                if dependency_reference is not None:
+                    dependency_reference_id = dependency_reference["id"]
+                    dependency_meta = {
+                        "shared_dependency_reference_id": dependency_reference_id,
+                        "shared_dependency_reference": dependency_reference,
+                        "shared_dependency_scale": dependency_reference.get("scale"),
+                        "shared_dependency_cfg_rescale": dependency_reference.get("cfg_rescale"),
+                        "shared_dependency_reference_mode": dependency_reference_mode,
+                        "shared_dependency_artist_policy": dependency_artist_policy,
+                    }
+
         if reroll == "weights":
             artists = current_artists
+            if shared_dependency:
+                weighted = [dict(item) for item in current_artists]
+                artist_prompt = build_artist_prompt(weighted)
+                return json_response({
+                    "ok": True,
+                    "artists": weighted,
+                    "artist_prompt": artist_prompt,
+                    "style_hash": style_hash(weighted),
+                    **dependency_meta,
+                })
         else:
             scores = payload.get("scores", [1, 2, 3, 4, 5])
             if not isinstance(scores, list) or not scores:
@@ -1110,6 +1345,58 @@ def api_style_maker_artists():
                 for row in rated_rows
             ]
             target_count = payload.get("count", len(current_artists) if reroll == "artists" else 12)
+            if shared_dependency:
+                if dependency_reference is None:
+                    raise ValueError("공유 그림체 기준 이미지가 필요합니다. 가중치 다시 뽑기에는 기존 기준 이미지 ID를 보내세요.")
+                blocked_names = {
+                    _style_artist_key(item["artist"])
+                    for item in (current_artists or [])
+                } if reroll == "artists" else set()
+                selected_rated_rows = rated_rows
+                if rating_tag_rules:
+                    allowed_tags = {rule["tag"] for rule in rating_tag_rules}
+                    selected_rated_rows = [
+                        row for row in selected_rated_rows
+                        if any(rating_matches_tag_filter(row, tag) for tag in allowed_tags)
+                    ]
+                rated_pool_dependency = [
+                    {"artist": row["artist_tag"], "score": row["score"]}
+                    for row in selected_rated_rows
+                    if _style_artist_key(row["artist_tag"]) not in blocked_names
+                    and row["score"] in scores
+                ]
+                other_shared_pool = []
+                for image in dependency_images:
+                    if image.get("id") == dependency_reference_id:
+                        continue
+                    for item in image.get("artists", []):
+                        if _style_artist_key(item.get("artist")) not in blocked_names:
+                            other_shared_pool.append(dict(item))
+                weighted = _shared_dependency_result(
+                    target_count=len(dependency_reference.get("artists", [])),
+                    fixed_artists=fixed_artists,
+                    reference=dependency_reference,
+                    source_ratios=dependency_ratios,
+                    rated_pool=rated_pool_dependency,
+                    other_shared_pool=other_shared_pool,
+                    min_weight=payload.get("min_weight", 0.1),
+                    max_weight=payload.get("max_weight", 2.3),
+                    prefer_high_scores=prefer_high_scores,
+                    ranges=ranges,
+                    weight_mode=payload.get("weight_mode", "balanced"),
+                    weight_profile=payload.get("weight_profile"),
+                    rng_seed=rng_seed,
+                    blocked_names=blocked_names,
+                    artist_policy=dependency_artist_policy,
+                )
+                artist_prompt = build_artist_prompt(weighted)
+                return json_response({
+                    "ok": True,
+                    "artists": weighted,
+                    "artist_prompt": artist_prompt,
+                    "style_hash": style_hash(weighted),
+                    **dependency_meta,
+                })
             target_count = int(target_count)
             if target_count < 1:
                 raise ValueError("작가 수는 1명 이상이어야 합니다.")
@@ -1119,7 +1406,7 @@ def api_style_maker_artists():
                 raise ValueError("고정 작가 자리는 전체 작가 수를 넘을 수 없습니다.")
             random_target_count = target_count - len(fixed_artists)
             tagged_target_count = sum(rule["count"] for rule in rating_tag_rules)
-            if tagged_target_count + shared_artist_min > random_target_count:
+            if not shared_dependency and tagged_target_count + shared_artist_min > random_target_count:
                 raise ValueError(
                     "태그 지정 인원과 공유 작가 최소 인원의 합이 고정 작가를 제외한 남은 자리보다 많습니다."
                 )
@@ -1406,6 +1693,38 @@ def api_test_novelai_settings():
     )
 
 
+@app.route("/api/settings/preferences", methods=["GET", "PUT"])
+def api_settings_preferences():
+    try:
+        if request.method == "GET":
+            return json_response({
+                "skip_delete_confirmation": load_skip_delete_confirmation(
+                    SETTINGS_JSON_PATH, DATA_DIR
+                ),
+            })
+        if request.mimetype != "application/json":
+            return json_response({"error": "Request must use application/json."}, 400)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json_response({"error": "Request body must be a JSON object."}, 400)
+        if set(payload) != {"skip_delete_confirmation"}:
+            return json_response({"error": "Only skip_delete_confirmation is accepted."}, 400)
+        try:
+            value = payload.get("skip_delete_confirmation")
+            if not isinstance(value, dict):
+                raise ValueError("skip_delete_confirmation must be an object.")
+            value = normalize_delete_confirmation_preferences(value)
+            save_skip_delete_confirmation(SETTINGS_JSON_PATH, value, DATA_DIR)
+        except ValueError as exc:
+            return json_response({"error": str(exc)}, 400)
+        return json_response({"skip_delete_confirmation": value})
+    except SettingsError:
+        return json_response(
+            {"error": "Settings file is invalid or unsafe; no changes were made."},
+            409,
+        )
+
+
 def validate_supplied_style_artists(supplied, require_weights=False):
     if not isinstance(supplied, list) or not supplied:
         raise ValueError("작가 목록을 하나 이상 입력하세요.")
@@ -1418,7 +1737,8 @@ def validate_supplied_style_artists(supplied, require_weights=False):
         artist = str(item.get("artist") or "").strip()
         if not artist:
             raise ValueError("작가 태그를 확인하세요.")
-        if artist in seen:
+        normalized_name = _style_artist_key(artist)
+        if normalized_name in seen:
             raise ValueError("중복된 작가는 사용할 수 없습니다.")
         normalized = {"artist": artist}
         if item.get("score") is not None:
@@ -1430,10 +1750,294 @@ def validate_supplied_style_artists(supplied, require_weights=False):
             normalized["weight"] = normalize_style_artists([item])[0]["weight"]
         elif require_weights:
             raise ValueError("Artist reroll requires the current positional weights.")
+        if type(item.get("slot")) is int and item["slot"] >= 0:
+            normalized["slot"] = item["slot"]
+        if item.get("random_weight") is True:
+            normalized["random_weight"] = True
         artists.append(normalized)
-        seen.add(artist)
+        seen.add(normalized_name)
 
     return artists
+
+
+def _style_artist_key(value):
+    return str(value or "").replace("_", " ").strip().casefold()
+
+
+def _shared_dependency_options(payload):
+    """Validate the one-stage source allocation for shared dependency mode."""
+    if "shared_dependency_percent" in payload:
+        raise ValueError("공유 그림체 의존의 이전 퍼센트 설정은 사용할 수 없습니다.")
+    reference_id = payload.get("shared_dependency_reference_id")
+    if reference_id is not None and (type(reference_id) is not int or reference_id < 1):
+        raise ValueError("공유 그림체 기준 이미지 ID를 확인하세요.")
+    reference_mode = payload.get("shared_dependency_reference_mode")
+    if reference_mode is None:
+        # Before explicit modes were introduced, all/artist rerolls ignored
+        # the incoming reference ID and selected a fresh random basis. Weight
+        # rerolls still use that ID below to preserve the current basis.
+        reference_mode = "random"
+    if reference_mode not in {"random", "fixed"}:
+        raise ValueError("공유 그림체 기준 선택 방식은 random 또는 fixed여야 합니다.")
+    if reference_mode == "fixed" and reference_id is None and payload.get("reroll") != "weights":
+        raise ValueError("고정 기준 그림체 이미지 ID가 필요합니다.")
+    ratios = payload.get("shared_dependency_source_ratios", {
+        "fixed": 0,
+        "reference": 100,
+        "rated": 0,
+        "other_shared": 0,
+    })
+    if not isinstance(ratios, dict):
+        raise ValueError("공유 그림체 의존 공급원 비율 형식을 확인하세요.")
+    expected = {"fixed", "reference", "rated", "other_shared"}
+    if set(ratios) != expected:
+        raise ValueError("공유 그림체 의존 공급원 비율은 fixed, reference, rated, other_shared만 사용할 수 있습니다.")
+    normalized = {}
+    for name in ("fixed", "reference", "rated", "other_shared"):
+        value = ratios.get(name)
+        if type(value) is not int or not 0 <= value <= 100:
+            raise ValueError("공유 그림체 의존 공급원 비율은 0부터 100 사이의 정수여야 합니다.")
+        normalized[name] = value
+    if sum(normalized.values()) != 100:
+        raise ValueError("공유 그림체 의존 공급원 비율의 합은 100이어야 합니다.")
+    artist_policy = payload.get("shared_dependency_artist_policy")
+    if artist_policy is None:
+        for alias in (
+            "shared_dependency_reference_artist_policy",
+            "shared_dependency_artist_selection",
+            "shared_dependency_reference_artist_selection",
+            "shared_dependency_artist_mode",
+            "shared_dependency_reference_artist_mode",
+        ):
+            if alias in payload:
+                artist_policy = payload.get(alias)
+                break
+    if artist_policy is None:
+        artist_policy = "highest"
+    if artist_policy not in {"highest", "random"}:
+        raise ValueError("공유 그림체 기준 작가 선택 방식은 highest 또는 random이어야 합니다.")
+    return reference_id, normalized, reference_mode, artist_policy
+
+
+def _largest_remainder_counts(total, ratios):
+    if total <= 0:
+        return {name: 0 for name in ratios}
+    raw = {name: total * value / 100 for name, value in ratios.items()}
+    counts = {name: math.floor(value) for name, value in raw.items()}
+    remainder = total - sum(counts.values())
+    order = sorted(ratios, key=lambda name: (-(raw[name] - counts[name]), name))
+    for name in order[:remainder]:
+        counts[name] += 1
+    return counts
+
+
+def _shared_dependency_pick(pool, count, rng, preserve_weights=False):
+    if count <= 0:
+        return []
+    if count > len(pool):
+        raise ValueError("공유 그림체 의존 공급원에서 작가를 충분히 찾지 못했습니다.")
+    if preserve_weights:
+        indexes = list(range(len(pool)))
+        selected_indexes = rng.sample(indexes, count)
+        return [dict(pool[index]) for index in selected_indexes]
+    candidates = [dict(item) for item in pool]
+    selected = []
+    while len(selected) < count:
+        weights = [SCORE_SELECTION_WEIGHT.get(int(item.get("score", 3)), 0.55) for item in candidates]
+        index = rng.choices(range(len(candidates)), weights=weights, k=1)[0]
+        selected.append(candidates.pop(index))
+    return selected
+
+
+def _shared_dependency_result(
+    *,
+    target_count,
+    fixed_artists,
+    reference,
+    source_ratios,
+    rated_pool,
+    other_shared_pool,
+    min_weight,
+    max_weight,
+    prefer_high_scores,
+    ranges,
+    weight_mode,
+    weight_profile,
+    rng_seed,
+    blocked_names=None,
+    artist_policy="highest",
+):
+    all_reference_artists = []
+    reference_by_name = {}
+    for item in reference.get("artists", []):
+        key = _style_artist_key(item.get("artist"))
+        if key and key not in reference_by_name:
+            reference_by_name[key] = dict(item)
+            all_reference_artists.append(dict(item))
+    total_count = len(all_reference_artists)
+    if total_count < 1:
+        raise ValueError("기준 공유 그림체에서 파싱 가능한 작가를 찾지 못했습니다.")
+
+    rng = random.Random(rng_seed)
+    fixed_by_name = {}
+    for item in fixed_artists:
+        key = _style_artist_key(item.get("artist"))
+        if key and key not in fixed_by_name:
+            fixed_by_name[key] = dict(item)
+    blocked = {_style_artist_key(name) for name in (blocked_names or [])}
+    blocked -= set(fixed_by_name)
+    desired_counts = _largest_remainder_counts(total_count, source_ratios)
+    fixed_candidates = list(fixed_by_name.values())
+    selected_fixed = _shared_dependency_pick(
+        fixed_candidates,
+        min(desired_counts["fixed"], len(fixed_candidates)),
+        rng,
+        preserve_weights=True,
+    )
+    selected_fixed = [dict(item, shared_dependency_source="fixed") for item in selected_fixed]
+    fixed_names = {_style_artist_key(item["artist"]) for item in selected_fixed}
+    blocked |= fixed_names
+    def unique_pool(items, source, *, shared=False):
+        result = []
+        seen = set()
+        for item in items:
+            key = _style_artist_key(item.get("artist"))
+            if not key or key in seen or key in blocked:
+                continue
+            seen.add(key)
+            entry = dict(item, shared_dependency_source=source)
+            if shared:
+                entry["shared_style"] = True
+            result.append(entry)
+        return result
+
+    reference_pool = unique_pool(all_reference_artists, "reference", shared=True)
+    pools = {
+        "reference": reference_pool,
+        "rated": unique_pool(rated_pool, "rated"),
+        "other_shared": unique_pool(other_shared_pool, "other_shared", shared=True),
+    }
+    selected_by_source = {name: [] for name in pools}
+    used_names = set(fixed_names)
+
+    def select_reference(pool, count):
+        available = [item for item in pool if _style_artist_key(item["artist"]) not in used_names]
+        take = min(count, len(available))
+        if take <= 0:
+            return []
+        if artist_policy == "random":
+            return rng.sample(available, take)
+        highest = max(
+            available,
+            key=lambda item: (float(item.get("weight", 1.0)), -available.index(item)),
+        )
+        selected = [highest]
+        remaining = [item for item in available if item is not highest]
+        if take > 1:
+            selected.extend(rng.sample(remaining, take - 1))
+        selected_names = {_style_artist_key(item["artist"]) for item in selected}
+        return [item for item in available if _style_artist_key(item["artist"]) in selected_names]
+
+    def select_source(name, count):
+        available = [item for item in pools[name] if _style_artist_key(item["artist"]) not in used_names]
+        take = min(count, len(available))
+        if name == "reference":
+            selected = select_reference(available, take)
+        else:
+            selected = _shared_dependency_pick(
+                available, take, rng, preserve_weights=name == "other_shared"
+            )
+        selected_by_source[name].extend(selected)
+        used_names.update(_style_artist_key(item["artist"]) for item in selected)
+        return take
+
+    unavailable = desired_counts["fixed"] - len(selected_fixed)
+    for name in ("reference", "rated", "other_shared"):
+        unavailable += desired_counts[name] - select_source(name, desired_counts[name])
+    if unavailable:
+        fallback_sources = [
+            name for name in ("reference", "rated", "other_shared")
+            if source_ratios[name] > 0
+        ]
+        while unavailable:
+            progressed = False
+            for name in fallback_sources:
+                if select_source(name, 1):
+                    unavailable -= 1
+                    progressed = True
+                    if unavailable == 0:
+                        break
+            if not progressed:
+                break
+    if unavailable:
+        raise ValueError("공급원 후보가 부족하여 전체 작가 수를 채울 수 없습니다.")
+
+    reference_order = {
+        _style_artist_key(item["artist"]): index
+        for index, item in enumerate(all_reference_artists)
+    }
+    selected_by_source["reference"].sort(
+        key=lambda item: reference_order.get(_style_artist_key(item["artist"]), len(reference_order))
+    )
+    selected_reference = selected_by_source["reference"]
+    selected_fill = (
+        selected_reference
+        + selected_by_source["rated"]
+        + selected_by_source["other_shared"]
+    )
+    all_non_fixed = selected_fill
+    needs_weights = [item for item in all_non_fixed if "weight" not in item]
+    if needs_weights:
+        weighted = assign_weights(
+            all_non_fixed,
+            weight_mode if weight_mode in {"random", "balanced", "custom", "profile"} else "balanced",
+            min_weight,
+            max_weight,
+            prefer_high_scores,
+            ranges,
+            rng_seed=rng.randrange(0, 2**32),
+            profile=weight_profile,
+        )
+    else:
+        weighted = all_non_fixed
+    # Restore reference/other-shared source weights after assigning fill weights.
+    original_weights = {
+        _style_artist_key(item["artist"]): item.get("weight")
+        for item in selected_reference + selected_by_source["other_shared"]
+    }
+    for item in weighted:
+        key = _style_artist_key(item["artist"])
+        if key in original_weights and original_weights[key] is not None:
+            item["weight"] = round(float(original_weights[key]), 2)
+    # Keep explicit fixed table positions in the returned prompt order. Slot 0
+    # remains the existing random-order marker; unpositioned rows fill the
+    # remaining open positions after the dependency selection.
+    placed = [None] * total_count
+    pending_fixed = []
+    for item in selected_fixed:
+        slot = item.get("slot")
+        if type(slot) is int and 0 < slot <= total_count and placed[slot - 1] is None:
+            placed[slot - 1] = dict(item)
+        else:
+            pending_fixed.append(dict(item))
+    # Reserve the remaining positions for slot-0/unpositioned fixed rows
+    # before filling dependency artists; otherwise the latter can consume all
+    # empty slots and silently drop fixed rows.
+    remaining_fixed = iter(pending_fixed)
+    for index, item in enumerate(placed):
+        if item is None:
+            try:
+                placed[index] = next(remaining_fixed)
+            except StopIteration:
+                break
+    open_items = iter(weighted)
+    for index, item in enumerate(placed):
+        if item is None:
+            try:
+                placed[index] = next(open_items)
+            except StopIteration:
+                break
+    return [item for item in placed if item is not None]
 
 
 def _generation_response(result):
@@ -1453,7 +2057,30 @@ def _generation_response(result):
         "cfg_rescale": result["cfg_rescale"],
         "model": result["model"],
     }
+    for key in (
+        "shared_dependency_reference_id",
+        "shared_dependency_reference_mode",
+        "shared_dependency_reference_title",
+        "shared_dependency_reference_source_url",
+        "shared_dependency_scale_source",
+        "shared_dependency_cfg_rescale_source",
+        "shared_dependency_artist_policy",
+    ):
+        if key in result and result[key] is not None:
+            payload[key] = result[key]
     return payload
+
+
+def _valid_generation_reference_value(value, minimum, maximum):
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(numeric) or not minimum <= numeric <= maximum:
+        return None
+    return numeric
 
 
 def _validate_generation_request(payload):
@@ -1462,7 +2089,57 @@ def _validate_generation_request(payload):
     request_id = payload.get("request_id")
     if type(request_id) is not str or not SAFE_REQUEST_ID.fullmatch(request_id):
         raise ValueError("request_id must be a nonempty safe string up to 128 characters.")
-    normalized = normalize_generation_data(payload)
+    generation_payload = dict(payload)
+    if payload.get("weight_mode") == "shared_dependency":
+        artist_policy = payload.get("shared_dependency_artist_policy")
+        if artist_policy is None:
+            for alias in (
+                "shared_dependency_reference_artist_policy",
+                "shared_dependency_artist_selection",
+                "shared_dependency_reference_artist_selection",
+                "shared_dependency_artist_mode",
+                "shared_dependency_reference_artist_mode",
+            ):
+                if alias in payload:
+                    artist_policy = payload.get(alias)
+                    break
+        if artist_policy is None:
+            artist_policy = "highest"
+        if artist_policy not in {"highest", "random"}:
+            raise ValueError("공유 그림체 기준 작가 선택 방식은 highest 또는 random이어야 합니다.")
+        generation_payload["shared_dependency_artist_policy"] = artist_policy
+    reference_id = payload.get("shared_dependency_reference_id")
+    if payload.get("weight_mode") == "shared_dependency" and reference_id is not None:
+        reference_mode = payload.get("shared_dependency_reference_mode", "fixed")
+        if reference_mode not in {"random", "fixed"}:
+            raise ValueError("공유 그림체 기준 선택 방식은 random 또는 fixed여야 합니다.")
+        if type(reference_id) is not int or reference_id < 1:
+            raise ValueError("공유 그림체 기준 이미지 ID를 확인하세요.")
+        reference = next(
+            (
+                item for item in get_shared_style_dependency_images(DB_PATH)
+                if item.get("id") == reference_id
+            ),
+            None,
+        )
+        if reference is None:
+            raise ValueError("공유 그림체 기준 이미지를 찾을 수 없습니다.")
+        scale = _valid_generation_reference_value(reference.get("scale"), 0, 10)
+        cfg_rescale = _valid_generation_reference_value(reference.get("cfg_rescale"), 0, 1)
+        generation_payload["shared_dependency_scale_source"] = "reference" if scale is not None else "fallback"
+        generation_payload["shared_dependency_cfg_rescale_source"] = "reference" if cfg_rescale is not None else "fallback"
+        if scale is not None:
+            generation_payload["scale"] = scale
+        if cfg_rescale is not None:
+            generation_payload["cfg_rescale"] = cfg_rescale
+        generation_payload["shared_dependency_reference_id"] = reference_id
+        generation_payload["shared_dependency_reference_mode"] = reference_mode
+        generation_payload["shared_dependency_reference"] = {
+            "id": reference_id,
+            "title": reference.get("title") or "",
+            "source_url": reference.get("source_url") or "",
+        }
+    normalized = normalize_generation_data(generation_payload)
     normalized["request_id"] = request_id
     normalized["seed_provided"] = "seed" in payload
     normalized_artists = normalize_style_artists(payload.get("artists"))
@@ -1487,6 +2164,9 @@ def _generation_payload_hash(data):
         "steps": data["steps"],
         "scale": data["scale"],
         "cfg_rescale": data["cfg_rescale"],
+        "weight_mode": data.get("weight_mode"),
+        "shared_dependency_reference_id": data.get("shared_dependency_reference_id"),
+        "shared_dependency_reference_mode": data.get("shared_dependency_reference_mode"),
         "variety_plus": data["variety_plus"],
         "skip_cfg_above_sigma": data["skip_cfg_above_sigma"],
         "seed": data["seed"] if data["seed_provided"] else None,
@@ -1561,7 +2241,19 @@ def api_style_maker_generate():
             variety_plus=data["variety_plus"],
             skip_cfg_above_sigma=data["skip_cfg_above_sigma"],
             model=MODEL,
+            shared_dependency_reference=data.get("shared_dependency_reference"),
+            shared_dependency_artist_policy=data.get("shared_dependency_artist_policy"),
         )
+        for key in (
+            "shared_dependency_reference_id",
+            "shared_dependency_reference_title",
+            "shared_dependency_reference_source_url",
+            "shared_dependency_scale_source",
+            "shared_dependency_cfg_rescale_source",
+            "shared_dependency_artist_policy",
+        ):
+            if key in data:
+                result[key] = data[key]
         result["seed"] = actual_seed
         completed = True
         return json_response(_generation_response(result))
@@ -1851,11 +2543,18 @@ def api_style_manager_shared():
         )
     except ArcaCollectorError as exc:
         return json_response({"error": str(exc)}, 400)
+    dependency_by_id = {
+        candidate["id"]: candidate
+        for candidate in get_shared_style_dependency_images(DB_PATH)
+    }
     for item in result["items"]:
         local_path = item.get("image_path") or ""
         item["image_url"] = f"/arca-style-images/{local_path}" if local_path else item.get("remote_image_url") or ""
         item["thumbnail_url"] = f"/style-manager-thumbnails/shared/{local_path}" if local_path else item["image_url"]
         item["image_available"] = bool(item["image_url"])
+        dependency = dependency_by_id.get(item.get("id"))
+        item["shared_dependency_eligible"] = dependency is not None
+        item["shared_dependency_artists"] = dependency.get("artists", []) if dependency else []
         if local_path and not item.get("model"):
             try:
                 image_metadata = extract_novelai_metadata(
@@ -2608,7 +3307,7 @@ def api_find_rating_thumbnail(rating_id):
     if not samples:
         return json_response({"ok": False, "error": "Danbooru에서 썸네일을 찾지 못했습니다."}, 404)
     sample = samples[0]
-    preview_url = sample.get("preview_url") or sample.get("large_url") or ""
+    preview_url = sample.get("large_url") or sample.get("preview_url") or ""
     thumbnail = download_thumbnail(preview_url, row["artist_tag"], sample.get("id"))
     if not thumbnail:
         return json_response({"ok": False, "error": "썸네일 저장에 실패했습니다."}, 502)
@@ -2620,6 +3319,170 @@ def api_find_rating_thumbnail(rating_id):
     return json_response({"ok": True, "thumbnail_url": f"/thumbnails/{thumbnail}"})
 
 
+@app.route("/api/ratings/<int:rating_id>/examples", methods=["GET"])
+def api_list_rating_examples(rating_id):
+    payload = rating_examples_payload(rating_id)
+    if payload is None:
+        return json_response({"ok": False, "error": "평가를 찾을 수 없습니다."}, 404)
+    return json_response(payload)
+
+
+@app.route("/api/ratings/<int:rating_id>/examples/collect", methods=["POST"])
+def api_collect_rating_examples(rating_id):
+    with db() as conn:
+        rating = conn.execute(
+            "SELECT artist_tag,query_tags_json,representative_post_id FROM ratings WHERE id = ?",
+            (rating_id,),
+        ).fetchone()
+        if not rating:
+            return json_response({"ok": False, "error": "평가를 찾을 수 없습니다."}, 404)
+        stored_ids = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT post_id FROM rating_examples WHERE rating_id = ?",
+                (rating_id,),
+            ).fetchall()
+            if row[0] is not None
+        }
+    try:
+        query_tags = json.loads(rating["query_tags_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        query_tags = []
+    if not isinstance(query_tags, list):
+        query_tags = []
+    request_payload = request.get_json(silent=True)
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+    try:
+        sample_limit = max(1, min(int(request_payload.get("sample_limit") or 10), 30))
+    except (TypeError, ValueError):
+        sample_limit = 10
+    try:
+        samples = fetch_artist_samples(rating["artist_tag"], query_tags, sample_limit)
+    except requests.RequestException as exc:
+        return json_response({"ok": False, "error": f"Danbooru API 오류: {exc}"}, 502)
+
+    stored_count = 0
+    for sample in samples or []:
+        post_id = sample.get("id") if isinstance(sample, dict) else None
+        if post_id is None or str(post_id) == str(rating["representative_post_id"] or "") or str(post_id) in stored_ids:
+            continue
+        source_url = str(sample.get("large_url") or sample.get("preview_url") or "").strip()
+        if not source_url:
+            continue
+        filename = thumbnail_filename(rating["artist_tag"], post_id)
+        existing_path = safe_thumbnail_path(filename)
+        if existing_path and existing_path.exists():
+            continue
+        image_path = download_thumbnail(source_url, rating["artist_tag"], post_id)
+        if not image_path:
+            continue
+        post_url = str(sample.get("post_url") or "").strip()
+        if not post_url and str(post_id).isdigit():
+            post_url = f"{DANBOORU_BASE_URL}/posts/{post_id}"
+        try:
+            with db() as conn:
+                conn.execute(
+                    "INSERT INTO rating_examples (rating_id,post_id,image_path,source_url,post_url,created_at) VALUES (?,?,?,?,?,?)",
+                    (
+                        rating_id,
+                        post_id,
+                        image_path,
+                        source_url,
+                        post_url,
+                        now_text(),
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            remove_unreferenced_thumbnail_paths([image_path])
+            continue
+        stored_ids.add(str(post_id))
+        stored_count += 1
+
+    payload = rating_examples_payload(rating_id)
+    payload["saved_count"] = stored_count
+    return json_response(payload)
+
+
+@app.route("/api/ratings/<int:rating_id>/examples/<int:example_id>/thumbnail", methods=["POST"])
+def api_set_rating_example_thumbnail(rating_id, example_id):
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT e.id,e.post_id,e.image_path,e.source_url
+            FROM rating_examples e
+            JOIN ratings r ON r.id = e.rating_id
+            WHERE e.rating_id = ? AND e.id = ?
+            """,
+            (rating_id, example_id),
+        ).fetchone()
+        if not row:
+            return json_response({"ok": False, "error": "예제를 찾을 수 없습니다."}, 404)
+        example_ids = [
+            item[0]
+            for item in conn.execute(
+                "SELECT post_id FROM rating_examples WHERE rating_id = ? ORDER BY id",
+                (rating_id,),
+            ).fetchall()
+            if item[0] is not None
+        ]
+        conn.execute(
+            "UPDATE ratings SET representative_post_id=?,representative_thumbnail_path=?,representative_preview_url=?,sample_post_ids_json=?,updated_at=? WHERE id=?",
+            (
+                row["post_id"],
+                row["image_path"],
+                row["source_url"] or "",
+                json.dumps(example_ids, ensure_ascii=False),
+                now_text(),
+                rating_id,
+            ),
+        )
+    payload = rating_examples_payload(rating_id)
+    return json_response(payload)
+
+
+@app.route("/api/ratings/<int:rating_id>/examples/<int:example_id>", methods=["DELETE"])
+def api_delete_rating_example(rating_id, example_id):
+    with db() as conn:
+        rating = conn.execute(
+            "SELECT representative_post_id,representative_thumbnail_path,sample_post_ids_json FROM ratings WHERE id = ?",
+            (rating_id,),
+        ).fetchone()
+        row = conn.execute(
+            "SELECT id,post_id,image_path FROM rating_examples WHERE rating_id = ? AND id = ?",
+            (rating_id, example_id),
+        ).fetchone()
+        if not rating or not row:
+            return json_response({"ok": False, "error": "예제를 찾을 수 없습니다."}, 404)
+        is_current = bool(
+            rating["representative_thumbnail_path"]
+            and rating["representative_thumbnail_path"] == row["image_path"]
+        )
+        if is_current:
+            conn.execute(
+                "UPDATE ratings SET representative_post_id=NULL,representative_thumbnail_path='',representative_preview_url='',sample_post_ids_json='[]',updated_at=? WHERE id=?",
+                (now_text(), rating_id),
+            )
+        else:
+            try:
+                sample_ids = json.loads(rating["sample_post_ids_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                sample_ids = []
+            sample_ids = [item for item in sample_ids if str(item) != str(row["post_id"])]
+            conn.execute(
+                "UPDATE ratings SET sample_post_ids_json=?,updated_at=? WHERE id=?",
+                (json.dumps(sample_ids, ensure_ascii=False), now_text(), rating_id),
+            )
+        conn.execute(
+            "DELETE FROM rating_examples WHERE rating_id = ? AND id = ?",
+            (rating_id, example_id),
+        )
+    remove_unreferenced_thumbnail_paths([row["image_path"]])
+    payload = rating_examples_payload(rating_id)
+    payload["deleted_example_id"] = example_id
+    return json_response(payload)
+
+
 @app.route("/api/ratings/<int:rating_id>", methods=["DELETE"])
 def api_delete_rating(rating_id):
     with db() as conn:
@@ -2629,12 +3492,16 @@ def api_delete_rating(rating_id):
         ).fetchone()
         if not row:
             return json_response({"ok": False, "error": "평가를 찾을 수 없습니다."}, 404)
+        example_paths = [
+            item[0]
+            for item in conn.execute(
+                "SELECT image_path FROM rating_examples WHERE rating_id = ?",
+                (rating_id,),
+            ).fetchall()
+        ]
+        conn.execute("DELETE FROM rating_examples WHERE rating_id = ?", (rating_id,))
         conn.execute("DELETE FROM ratings WHERE id = ?", (rating_id,))
-    filename = row["representative_thumbnail_path"]
-    if filename:
-        target = (THUMBNAIL_DIR / filename).resolve()
-        if THUMBNAIL_DIR.resolve() in target.parents and target.exists():
-            target.unlink()
+    remove_unreferenced_thumbnail_paths([row["representative_thumbnail_path"], *example_paths])
     return json_response({"ok": True})
 
 

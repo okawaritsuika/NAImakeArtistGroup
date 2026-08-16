@@ -30,6 +30,7 @@ const {
   arcaRecommendationPreset,
   randomArcaStatisticsSamples,
   formatArcaRecommendation,
+  hasArcaDependencyArtists,
 } = require("../static/arca_style_collector.js");
 
 test("empty collection dates default to the local calendar day", () => {
@@ -247,4 +248,9 @@ test("style group helpers separate prompt sections", () => {
   assert.equal(promptKindClass("base"), "is-base");
   assert.equal(promptKindClass("negative"), "is-negative");
   assert.equal(promptKindClass("character"), "is-character");
+});
+
+test("shared dependency confirmation only accepts prompts with artist tags", () => {
+  assert.equal(hasArcaDependencyArtists({ base_prompt: "1.2::artist:sample::, masterpiece" }), true);
+  assert.equal(hasArcaDependencyArtists({ base_prompt: "masterpiece, quality" }), false);
 });

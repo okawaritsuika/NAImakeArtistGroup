@@ -3,8 +3,13 @@ const test = require("node:test");
 
 const {
   CUSTOM_RANGE_FIELDS,
+  STYLE_FIXED_ARTISTS_STORAGE_KEY,
   applyStyleRerollResult,
   buildStyleRequestPayload,
+  applySharedDependencyReference,
+  normalizeStoredFixedStyleArtists,
+  saveFixedStyleArtists,
+  loadFixedStyleArtists,
   normalizeRandomTargets,
   pickRandomPreset,
   normalizeSelectedScores,
@@ -34,6 +39,7 @@ const {
   limitArtistsToTotalCount,
   fixedArtistOverlayCoordinates,
   graphInsertionPositionFromRatio,
+  openWeightGraphModal,
   moveSelectedArtistsToPosition,
   fixedArtistSlotEntries,
   chooseArtistsForPrompt,
@@ -60,13 +66,51 @@ const {
   opusFreeGenerationIssues,
   normalizeComparisonCharacterPrompts,
   normalizeNumericPromptClosers,
+  sharedDependencyParameterValue,
+  normalizeSharedDependencyRatios,
+  sharedDependencyControlsState,
+  setSharedDependencyReferenceFromArca,
+  clearSharedDependencyReference,
+  normalizeStyleHistoryItem,
+  styleHistoryArtistPrompt,
+  styleHistoryPreviewMeta,
+  deleteConfirmationEnabledFromSkip,
+  skipDeleteConfirmationFromEnabled,
 } = require("../static/style_maker.js");
+
+test("delete confirmation settings use a positive UI value with legacy API inversion", () => {
+  assert.equal(deleteConfirmationEnabledFromSkip(false), true);
+  assert.equal(deleteConfirmationEnabledFromSkip(true), false);
+  assert.equal(deleteConfirmationEnabledFromSkip(undefined), true);
+  assert.equal(skipDeleteConfirmationFromEnabled(true), false);
+  assert.equal(skipDeleteConfirmationFromEnabled(false), true);
+});
 
 test("numeric prompt closers keep weight openers and space numeric tag endings", () => {
   assert.equal(
     normalizeNumericPromptClosers("1.5::artist:matrix16::, 2::year 2025::, -3::clone::"),
     "1.5::artist:matrix16 ::, 2::year 2025 ::, -3::clone::",
   );
+});
+
+test("numeric prompt normalizes spaced openers and inserts missing group separators", () => {
+  assert.equal(
+    normalizeNumericPromptClosers("1.5 ::foo:: 2::bar::"),
+    "1.5::foo::, 2::bar::",
+  );
+});
+
+test("numeric prompt closers space unweighted non-artist numeric tags", () => {
+  assert.equal(
+    normalizeNumericPromptClosers("year 2025::, clone::"),
+    "year 2025 ::, clone::",
+  );
+});
+
+test("numeric prompt normalization is idempotent and preserves existing separators", () => {
+  const prompt = "1.5::foo::, 2::year 2025 ::";
+  assert.equal(normalizeNumericPromptClosers(prompt), prompt);
+  assert.equal(normalizeNumericPromptClosers(prompt), normalizeNumericPromptClosers(prompt));
 });
 
 test("comparison character prompts allow none and normalize separate rows", () => {
@@ -165,6 +209,189 @@ test("generated style confirmation keeps its image and generation settings", () 
   assert.equal(source.variety_plus, true);
   assert.equal(source.model, "nai-diffusion-4-5-full");
   assert.equal(source.artist_prompt, "1.25::artist:sample artist::");
+});
+
+test("style history normalizes generated prompts and generation settings with legacy fallbacks", () => {
+  const item = normalizeStyleHistoryItem({
+    id: 7,
+    image_url: "/generated/7/image.png",
+    artist_prompt: "1.25::artist:sample artist::",
+    base_prompt: "masterpiece",
+    fixed_prompt: "upper body",
+    character_prompts: [{ prompt: "1girl" }, "blue eyes"],
+    width: 832,
+    height: 1216,
+    sampler: "karras",
+    noise_schedule: "karras",
+    steps: 28,
+    scale: 5,
+    cfg_rescale: 0,
+  });
+  assert.deepEqual(item.artists, [{ artist: "sample artist", weight: 1.25 }]);
+  assert.equal(item.base_prompt, "masterpiece");
+  assert.deepEqual(item.character_prompts, ["1girl", "blue eyes"]);
+  assert.deepEqual(item.generation_settings, {
+    width: 832,
+    height: 1216,
+    resolution_preset: "832x1216",
+    sampler: "karras",
+    scheduler: "karras",
+    steps: 28,
+    scale: 5,
+    cfg_rescale: 0,
+  });
+});
+
+test("style history prefers explicit generation settings and falls back from empty quality prompts", () => {
+  const item = normalizeStyleHistoryItem({
+    quality_prompt: "",
+    base_prompt: "legacy quality",
+    width: 1024,
+    height: 1024,
+    noise_schedule: "native",
+    generation_settings: {
+      width: 1216,
+      height: 832,
+      resolution_preset: "1216x832",
+      scheduler: "karras",
+      scale: 7,
+    },
+  });
+  assert.equal(item.base_prompt, "legacy quality");
+  assert.equal(item.generation_settings.width, 1216);
+  assert.equal(item.generation_settings.height, 832);
+  assert.equal(item.generation_settings.resolution_preset, "1216x832");
+  assert.equal(item.generation_settings.scheduler, "karras");
+  assert.equal(item.generation_settings.scale, 7);
+});
+
+test("style history preview metadata uses the generated image id and normalized settings", () => {
+  const meta = styleHistoryPreviewMeta({
+    id: 11,
+    artists: [{ artist: "sample", weight: 1 }],
+    width: 832,
+    height: 1216,
+    sampler: "k_euler_ancestral",
+    noise_schedule: "karras",
+    steps: 28,
+    scale: 5,
+    cfg_rescale: 0,
+    seed: 123,
+  });
+  assert.match(meta, /생성 #11/);
+  assert.match(meta, /작가 1명/);
+  assert.match(meta, /832×1216/);
+  assert.match(meta, /Seed 123/);
+});
+
+test("style history artist preview prefers the stored prompt and reconstructs a fallback", () => {
+  assert.equal(
+    styleHistoryArtistPrompt({
+      artist_prompt: "  1.25::artist:stored artist::  ",
+      artists: [{ artist: "ignored", weight: 1 }],
+    }),
+    "1.25::artist:stored artist::",
+  );
+  assert.equal(
+    styleHistoryArtistPrompt(normalizeStyleHistoryItem({
+      artists: [
+        { artist: "first_artist", weight: 1.2 },
+        { artist: "second", weight: 0.8 },
+      ],
+    })),
+    "1.2::artist:first artist::, 0.8::artist:second::",
+  );
+  assert.equal(styleHistoryArtistPrompt(null), "");
+});
+
+test("shared dependency reference is sent only for weight rerolls", () => {
+  const base = {
+    weight_mode: "shared_dependency",
+    shared_dependency_source_ratios: { fixed: 0, reference: 100, rated: 0, other_shared: 0 },
+  };
+  assert.deepEqual(
+    applySharedDependencyReference(base, "weights", "shared_dependency", 17),
+    { ...base, shared_dependency_reference_id: 17 },
+  );
+  for (const reroll of ["all", "artists"]) {
+    assert.deepEqual(applySharedDependencyReference({ ...base, shared_dependency_reference_id: 17 }, reroll, "shared_dependency", 17), base);
+  }
+  assert.deepEqual(applySharedDependencyReference(base, "weights", "balanced", 17), base);
+});
+
+test("fixed shared dependency references are sent for artist and all rerolls while random mode omits them", () => {
+  const base = { weight_mode: "shared_dependency" };
+  assert.deepEqual(
+    applySharedDependencyReference(base, "all", "shared_dependency", 21, "fixed"),
+    { ...base, shared_dependency_reference_mode: "fixed", shared_dependency_reference_id: 21 },
+  );
+  assert.deepEqual(
+    applySharedDependencyReference(base, "artists", "shared_dependency", 21, "fixed"),
+    { ...base, shared_dependency_reference_mode: "fixed", shared_dependency_reference_id: 21 },
+  );
+  assert.deepEqual(
+    applySharedDependencyReference(base, "all", "shared_dependency", 21, "random"),
+    { ...base, shared_dependency_reference_mode: "random" },
+  );
+  assert.deepEqual(
+    applySharedDependencyReference(base, "weights", "shared_dependency", 21, "random"),
+    { ...base, shared_dependency_reference_mode: "random", shared_dependency_reference_id: 21 },
+  );
+});
+
+test("arca reference confirmation provides a valid fixed reference", () => {
+  assert.equal(
+    setSharedDependencyReferenceFromArca(
+      { id: 37, title: "selected", base_prompt: "artist:sample" },
+      { title: "source" },
+    ),
+    true,
+  );
+});
+
+test("clearing a fixed shared dependency reference returns to random without a stale payload id", () => {
+  const cleared = clearSharedDependencyReference();
+  assert.equal(cleared.shared_dependency_reference_mode, "random");
+  assert.equal(cleared.shared_dependency_reference_id, null);
+  assert.equal(cleared.shared_dependency_reference, null);
+  assert.equal(cleared.shared_dependency_scale, null);
+  assert.equal(cleared.shared_dependency_cfg_rescale, null);
+  assert.deepEqual(
+    applySharedDependencyReference(
+      { weight_mode: "shared_dependency" },
+      "all",
+      "shared_dependency",
+      cleared.shared_dependency_reference_id,
+      cleared.shared_dependency_reference_mode,
+    ),
+    { weight_mode: "shared_dependency", shared_dependency_reference_mode: "random" },
+  );
+});
+
+test("shared dependency ratios use one canonical four-source payload", () => {
+  assert.deepEqual(normalizeSharedDependencyRatios({ fixed: 0, reference: 100, rated: 0, other_shared: 0 }), {
+    fixed: 0, reference: 100, rated: 0, other_shared: 0,
+  });
+  assert.throws(() => normalizeSharedDependencyRatios({ fixed: 0, reference: 50, rated: 0, other_shared: 0 }), /합/);
+  assert.throws(() => normalizeSharedDependencyRatios({ fixed: "50", reference: 50, rated: 0, other_shared: 0 }), /정수/);
+});
+
+test("shared dependency disables the user artist count and legacy shared range", () => {
+  assert.deepEqual(sharedDependencyControlsState("shared_dependency"), {
+    countDisabled: true,
+    sharedMinMaxDisabled: true,
+    countLabel: "기준 그림체 작가 수 사용",
+  });
+  assert.equal(sharedDependencyControlsState("balanced").countDisabled, false);
+});
+
+test("shared dependency generation metadata treats missing values as fallback but accepts zero", () => {
+  assert.equal(sharedDependencyParameterValue(null, 0, 10), null);
+  assert.equal(sharedDependencyParameterValue(undefined, 0, 1), null);
+  assert.equal(sharedDependencyParameterValue("", 0, 1), null);
+  assert.equal(sharedDependencyParameterValue(0, 0, 10), 0);
+  assert.equal(sharedDependencyParameterValue("0", 0, 1), 0);
+  assert.equal(sharedDependencyParameterValue("not-a-number", 0, 1), null);
 });
 
 test("confirmed imports group exact weighted artist prompts and separate unknown prompts", () => {
@@ -529,6 +756,74 @@ test("manual artist random weight and zero position are resolved for each prompt
   assert.equal(added[0].weight, 1.25);
 });
 
+test("profile weights follow the final randomized order for random and zero-slot artists", () => {
+  const artists = [
+    { artist: "random_a", weight: 0.4 },
+    { artist: "zero_a", weight: 0.8, fixed: true, slot: 0 },
+    { artist: "zero_b", weight: 1.2, fixed: true, slot: 0 },
+  ];
+  const profile = [
+    { position: 0, weight: 0.2 },
+    { position: 1, weight: 2.0 },
+  ];
+  const randomOrder = chooseArtistsForPrompt(artists, () => 0, { profile });
+  const alternateOrder = chooseArtistsForPrompt(artists, () => 0.99, { profile });
+
+  assert.deepEqual(randomOrder.map((item) => item.artist), ["zero_b", "zero_a", "random_a"]);
+  assert.deepEqual(randomOrder.map((item) => item.weight), [0.2, 1.1, 2]);
+  assert.notDeepEqual(alternateOrder.map((item) => item.artist), randomOrder.map((item) => item.artist));
+  assert.deepEqual(artists, [
+    { artist: "random_a", weight: 0.4 },
+    { artist: "zero_a", weight: 0.8, fixed: true, slot: 0 },
+    { artist: "zero_b", weight: 1.2, fixed: true, slot: 0 },
+  ]);
+});
+
+test("profile prioritizes slot zero while positioned fixed random weights stay random", () => {
+  const artists = [
+    { artist: "random_a", weight: 0.4 },
+    { artist: "fixed_a", weight: 1.4, fixed: true, slot: 1, random_weight: true },
+    { artist: "random_fixed", weight: 1.1, fixed: true, slot: 0, random_weight: true },
+  ];
+  const profile = [
+    { position: 0, weight: 0.2 },
+    { position: 1, weight: 2.0 },
+  ];
+  const values = [0.5, 0.5, 0.5];
+  const prompt = chooseArtistsForPrompt(artists, () => values.shift(), {
+    profile,
+    minWeight: 0.1,
+    maxWeight: 0.3,
+  });
+
+  assert.deepEqual(prompt.map((item) => item.artist), ["random_a", "random_fixed", "fixed_a"]);
+  assert.deepEqual(prompt.map((item) => item.weight), [0.2, 1.1, 0.2]);
+  assert.equal(
+    chooseArtistsForPrompt(
+      [{ artist: "fixed_manual", weight: 1.4, fixed: true, slot: 1 }],
+      () => 0.5,
+      { profile },
+    )[0].weight,
+    1.4,
+  );
+});
+
+test("profile prompt weights round interpolated positions to two decimals", () => {
+  const prompt = chooseArtistsForPrompt([
+    { artist: "artist_a", weight: 0.1 },
+    { artist: "artist_b", weight: 0.2 },
+    { artist: "artist_c", weight: 0.3 },
+    { artist: "artist_d", weight: 0.4 },
+  ], () => 0, {
+    profile: [
+      { position: 0, weight: 0.1 },
+      { position: 1, weight: 2.3 },
+    ],
+  });
+
+  assert.deepEqual(prompt.map((item) => item.weight), [0.1, 0.83, 1.57, 2.3]);
+});
+
 test("manual style artists promote existing random artists into fixed rows", () => {
   const current = [
     { artist: "first", score: 5, weight: 0.4 },
@@ -594,6 +889,74 @@ test("manual fixed style artist rows can edit artist, weight, and position", () 
     ["last", "first", "middle"],
   );
   assert.deepEqual(current.map((item) => item.artist), ["first", "middle", "last"]);
+});
+
+test("fixed style artists round-trip through local storage with their table fields", () => {
+  const originalStorage = global.localStorage;
+  const values = new Map();
+  global.localStorage = {
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, String(value)); },
+  };
+  try {
+    const stored = saveFixedStyleArtists([
+      { artist: "random", weight: 0.4 },
+      { artist: " saved_artist ", score: "5", weight: "1.356", fixed: true, slot: "2", random_weight: true },
+    ]);
+    assert.deepEqual(stored, [{ artist: "saved_artist", score: 5, weight: 1.36, slot: 2, random_weight: true }]);
+    assert.deepEqual(loadFixedStyleArtists(), [{
+      artist: "saved_artist", score: 5, weight: 1.36, fixed: true, slot: 2, random_weight: true,
+    }]);
+  } finally {
+    if (originalStorage === undefined) delete global.localStorage;
+    else global.localStorage = originalStorage;
+  }
+});
+
+test("a fixed artist weight update can be persisted without the graph DOM", () => {
+  const originalStorage = global.localStorage;
+  const values = new Map();
+  global.localStorage = {
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, String(value)); },
+  };
+  try {
+    const artists = updateStyleArtistAtIndex([
+      { artist: "fixed_artist", score: 4, weight: 0.8, fixed: true, slot: 1 },
+      { artist: "random_artist", weight: 1.2 },
+    ], 0, { weight: 1.47 });
+    saveFixedStyleArtists(artists);
+    assert.deepEqual(loadFixedStyleArtists(), [{
+      artist: "fixed_artist", score: 4, weight: 1.47, fixed: true, slot: 1,
+    }]);
+  } finally {
+    if (originalStorage === undefined) delete global.localStorage;
+    else global.localStorage = originalStorage;
+  }
+});
+
+test("stored fixed style artists ignore malformed rows and normalize optional fields", () => {
+  assert.deepEqual(normalizeStoredFixedStyleArtists([
+    { artist: "not fixed", weight: 1, fixed: false },
+    { artist: "missing weight" },
+    { artist: "bad weight", weight: "nope" },
+    { artist: "bad artist", weight: 1, artist: 123 },
+    { artist: "valid", score: 9, weight: "0.905", slot: "not an integer", random_weight: false },
+    { artist: "valid", score: 4, weight: 2, slot: 1 },
+  ]), [{ artist: "valid", weight: 0.91, fixed: true }]);
+
+  const originalStorage = global.localStorage;
+  global.localStorage = {
+    getItem() { return "{malformed"; },
+    setItem() {},
+  };
+  try {
+    assert.deepEqual(loadFixedStyleArtists(), []);
+    assert.equal(STYLE_FIXED_ARTISTS_STORAGE_KEY, "naiArtistRater.styleFixedArtists.v1");
+  } finally {
+    if (originalStorage === undefined) delete global.localStorage;
+    else global.localStorage = originalStorage;
+  }
 });
 
 test("selected fixed artists move together into an insertion slot", () => {
@@ -800,6 +1163,34 @@ test("fixed artists are included in the configured total artist count", () => {
   assert.deepEqual(buildStyleRequestPayload({ count: 3 }, artists, "all").fixed_artists[0], {
     artist: "fixed-a", score: undefined, weight: 1.2, slot: 0, random_weight: true,
   });
+});
+
+test("opening the weight graph preserves the selected weight mode", () => {
+  const originalDocument = global.document;
+  const mode = { value: "" };
+  const modal = { classList: { remove() {} } };
+  const graph = {
+    classList: { toggle() {} },
+    replaceChildren() {},
+  };
+  global.document = {
+    getElementById(id) {
+      return { weightMode: mode, weightGraphModal: modal, weightGraph: graph }[id] || null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+  };
+  try {
+    for (const selectedMode of ["random", "balanced"]) {
+      mode.value = selectedMode;
+      openWeightGraphModal();
+      assert.equal(mode.value, selectedMode);
+    }
+  } finally {
+    if (originalDocument === undefined) delete global.document;
+    else global.document = originalDocument;
+  }
 });
 
 test("reroll all keeps manually fixed artists even when incoming result omits them", () => {

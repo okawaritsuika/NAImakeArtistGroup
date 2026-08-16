@@ -41,6 +41,13 @@ const styleState = {
   managerDescriptions: false,
   managerFilterTimer: null,
   managerImageLoadToken: 0,
+  historyItems: [],
+  historySelectedId: null,
+  historyDirty: true,
+  historyRequestToken: 0,
+  generationRemoteCollapsed: false,
+  generationRemoteClosed: false,
+  generationRemoteDragging: false,
   confirmedModalSource: null,
   confirmedModalFile: null,
   confirmedModalObjectUrl: "",
@@ -62,6 +69,17 @@ const styleState = {
   ratingTagRuleDraft: [],
   ratingExcludeTags: [],
   ratingExcludeTagDraft: [],
+  sharedDependencyReferenceId: null,
+  sharedDependencyReference: null,
+  sharedDependencyReferenceMode: "random",
+  sharedDependencyArtistPolicy: "highest",
+  sharedDependencyScale: null,
+  sharedDependencyCfgRescale: null,
+  sharedDependencyPickerItems: [],
+  sharedDependencyPickerPage: 1,
+  sharedDependencyPickerTotalPages: 1,
+  sharedDependencyPickerSelected: null,
+  sharedDependencyPickerRequestToken: 0,
   promptGroups: [],
   promptPresets: [],
   selectedPromptPresetKey: "",
@@ -82,10 +100,16 @@ const PROMPT_PRESET_STORAGE_KEY = "naiArtistRater.promptPreset.v1";
 const STYLE_MANAGER_DESCRIPTION_KEY = "naiArtistRater.styleManagerDescriptions.v1";
 const STYLE_MANAGER_CARD_SIZE_KEY = "naiArtistRater.styleManagerCardSize.v1";
 const STYLE_MANAGER_PAGE_SIZE_KEY = "naiArtistRater.styleManagerPageSize.v1";
+const STYLE_FIXED_ARTISTS_STORAGE_KEY = "naiArtistRater.styleFixedArtists.v1";
+const GENERATION_REMOTE_POSITION_KEY = "naiArtistRater.generationRemotePosition.v1";
 const STYLE_MANAGER_PAGE_SIZES = [12, 24, 48, 96];
 const RANDOM_STYLE_TARGETS = ["artists", "weights", "quality", "negative"];
 const OPUS_FREE_MAX_STEPS = 28;
 const OPUS_FREE_MAX_PIXELS = 1024 * 1024;
+
+function normalizeSharedDependencyArtistPolicy(value) {
+  return value === "random" ? "random" : "highest";
+}
 
 const STYLE_REQUEST_CONTROL_IDS = [
   "rerollStyleArtists",
@@ -94,6 +118,11 @@ const STYLE_REQUEST_CONTROL_IDS = [
   "styleArtistCount",
   "sharedStyleArtistMin",
   "sharedStyleArtistMax",
+  "sharedDependencyFixedRatio",
+  "sharedDependencyReferenceRatio",
+  "sharedDependencyRatedRatio",
+  "sharedDependencyOtherRatio",
+  "sharedDependencyArtistPolicy",
   "openRatingTagRules",
   "styleScoreAll",
   "weightMode",
@@ -175,10 +204,87 @@ function buildStyleRequestPayload(options, artists, reroll) {
   return payload;
 }
 
+function normalizeSharedDependencyRatios(values = {}) {
+  const names = ["fixed", "reference", "rated", "other_shared"];
+  const ratios = Object.fromEntries(names.map((name) => [name, values[name] ?? 0]));
+  if (!names.every((name) => typeof ratios[name] === "number" && Number.isInteger(ratios[name]) && ratios[name] >= 0 && ratios[name] <= 100)) {
+    throw new Error("공유 그림체 의존 공급원 비율은 0~100 정수여야 합니다.");
+  }
+  if (names.reduce((sum, name) => sum + ratios[name], 0) !== 100) {
+    throw new Error("공유 그림체 의존 공급원 비율의 합은 100이어야 합니다.");
+  }
+  return ratios;
+}
+
+function sharedDependencyControlsState(mode) {
+  const active = mode === "shared_dependency";
+  return { countDisabled: active, sharedMinMaxDisabled: active, countLabel: active ? "기준 그림체 작가 수 사용" : "작가 수" };
+}
+
+function applySharedDependencyReference(payload, reroll, weightMode, referenceId, referenceMode) {
+  const next = { ...(payload || {}) };
+  delete next.shared_dependency_reference_id;
+  delete next.shared_dependency_reference_mode;
+  if (weightMode === "shared_dependency" && (referenceMode === "random" || referenceMode === "fixed")) {
+    next.shared_dependency_reference_mode = referenceMode;
+  }
+  if (
+    weightMode === "shared_dependency"
+    && referenceId
+    && (reroll === "weights" || referenceMode === "fixed")
+  ) {
+    next.shared_dependency_reference_id = referenceId;
+  }
+  return next;
+}
+
+function normalizeStoredFixedStyleArtists(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object" || item.fixed === false || typeof item.artist !== "string") return [];
+    const artist = item.artist.trim();
+    if (!artist || seen.has(artist)) return [];
+    const rawWeight = item.weight;
+    const weight = typeof rawWeight === "boolean" ? NaN : Number(rawWeight);
+    if (!Number.isFinite(weight) || weight <= 0) return [];
+    const normalizedWeight = Number(weight.toFixed(2));
+    if (!Number.isFinite(normalizedWeight) || normalizedWeight <= 0) return [];
+    const normalized = { artist, weight: normalizedWeight, fixed: true };
+    const rawScore = item.score;
+    const score = typeof rawScore === "boolean" ? NaN : Number(rawScore);
+    if (Number.isInteger(score) && score >= 1 && score <= 5) normalized.score = score;
+    const rawSlot = item.slot;
+    const slot = typeof rawSlot === "boolean" ? NaN : Number(rawSlot);
+    if (Number.isInteger(slot) && slot >= 0) normalized.slot = slot;
+    if (item.random_weight === true) normalized.random_weight = true;
+    seen.add(artist);
+    return [normalized];
+  });
+}
+
+function saveFixedStyleArtists(artists) {
+  const stored = normalizeStoredFixedStyleArtists(
+    (Array.isArray(artists) ? artists : []).filter((item) => item?.fixed === true),
+  ).map(({ fixed, ...item }) => item);
+  if (typeof localStorage === "undefined") return stored;
+  try { localStorage.setItem(STYLE_FIXED_ARTISTS_STORAGE_KEY, JSON.stringify(stored)); } catch (_) { /* Storage can be disabled. */ }
+  return stored;
+}
+
+function loadFixedStyleArtists() {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    return normalizeStoredFixedStyleArtists(JSON.parse(localStorage.getItem(STYLE_FIXED_ARTISTS_STORAGE_KEY) || "null"));
+  } catch (_) {
+    return [];
+  }
+}
+
 function applyStyleRerollResult(currentArtists, incomingArtists, reroll, preserveOrder = false) {
   const fixedByArtist = new Map((currentArtists || [])
     .map((item) => [item.artist, item.fixed === true
-      ? { fixed: true, slot: item.slot, random_weight: item.random_weight === true }
+      ? { fixed: true, score: item.score, slot: item.slot, random_weight: item.random_weight === true }
       : { fixed: false }]));
   const incomingNames = new Set((incomingArtists || []).map((item) => item.artist));
   const fixedAdditions = (currentArtists || [])
@@ -190,6 +296,7 @@ function applyStyleRerollResult(currentArtists, incomingArtists, reroll, preserv
     return {
       ...item,
       fixed: true,
+      ...(item.score === undefined && fixed.score !== undefined ? { score: fixed.score } : {}),
       ...(Number.isInteger(Number(fixed.slot)) ? { slot: Number(fixed.slot) } : {}),
       ...(fixed.random_weight ? { random_weight: true } : {}),
     };
@@ -493,9 +600,24 @@ function chooseArtistsForPrompt(artists, randomFn = Math.random, options = {}) {
   const maximum = Number.isFinite(Number(options.maxWeight)) ? Number(options.maxWeight) : styleNumber("styleMaxWeight", 2.3);
   const minCents = Math.max(1, Math.ceil(Math.min(minimum, maximum) * 100));
   const maxCents = Math.max(minCents, Math.floor(Math.max(minimum, maximum) * 100));
-  return ordered.map((item) => item.random_weight === true
-    ? { ...item, weight: (minCents + Math.floor(randomFn() * (maxCents - minCents + 1))) / 100 }
-    : { ...item });
+  const profile = Array.isArray(options.profile) ? options.profile : null;
+  const lastIndex = Math.max(1, ordered.length - 1);
+  return ordered.map((item, index) => {
+    const isProfileTarget = item.fixed !== true || normalizeFixedArtistSlot(item, 1) === 0;
+    if (profile && isProfileTarget) {
+      return {
+        ...item,
+        weight: Number(interpolateWeightProfile(profile, index / lastIndex).toFixed(2)),
+      };
+    }
+    if (item.random_weight === true) {
+      return {
+        ...item,
+        weight: (minCents + Math.floor(randomFn() * (maxCents - minCents + 1))) / 100,
+      };
+    }
+    return { ...item };
+  });
 }
 
 function hasProfileDragMoved(startX, startY, currentX, currentY) {
@@ -593,11 +715,25 @@ function normalizeStoredPrompts(value) {
 
 function normalizeNumericPromptClosers(prompt) {
   let text = String(prompt || "");
-  text = text.replace(/([+-]?\d+(?:\.\d+)?)::([\s\S]*?)::/g, (_, weight, rawBody) => {
+  text = text.replace(/([+-]?[0-9]+(?:\.[0-9]+)?)\s*::([\s\S]*?)::/g, (group, weight, rawBody, offset) => {
+    const prefix = text.slice(0, offset).trimEnd();
+    if (prefix && !prefix.endsWith(",") && !prefix.endsWith("::")) return group;
     const body = rawBody.trimEnd();
-    return `${weight}::${body}${/\d$/.test(body) ? " " : ""}::`;
+    return `${weight}::${body}${/[0-9]$/.test(body) ? " " : ""}::`;
   });
-  return text.replace(/(artist\s*:[^,\n]*?\d)\s*::/gi, "$1 ::");
+  const weightedSpans = [];
+  const weightedGroupPattern = /([+-]?[0-9]+(?:\.[0-9]+)?)\s*::([\s\S]*?)::/g;
+  let weightedMatch;
+  while ((weightedMatch = weightedGroupPattern.exec(text))) {
+    const prefix = text.slice(0, weightedMatch.index).trimEnd();
+    if (!prefix || prefix.endsWith(",") || prefix.endsWith("::")) weightedSpans.push([weightedMatch.index, weightedGroupPattern.lastIndex]);
+  }
+  text = text.replace(/(?<![0-9.])([+-]?[0-9]+(?:\.[0-9]+)?)\s*::/g, (marker, number, offset) => {
+    if (weightedSpans.some(([start, end]) => start <= offset && offset < end)) return marker;
+    const prefix = text.slice(0, offset).trimEnd();
+    return !prefix || prefix.endsWith(",") || prefix.endsWith("::") ? `${number}::` : `${number} ::`;
+  });
+  return text.replace(/::\s*(?=[+-]?[0-9]+(?:\.[0-9]+)?\s*::)/g, "::, ");
 }
 
 function combinePromptSections(...sections) {
@@ -718,6 +854,16 @@ function readGenerationSettings() {
     generation_count: Number(styleElement("generationCount")?.value || 10),
     shared_artist_min: Number(styleElement("sharedStyleArtistMin")?.value || 0),
     shared_artist_max: Number(styleElement("sharedStyleArtistMax")?.value || 0),
+    shared_dependency_source_ratios: {
+      fixed: Number(styleElement("sharedDependencyFixedRatio")?.value || 0),
+      reference: Number(styleElement("sharedDependencyReferenceRatio")?.value || 100),
+      rated: Number(styleElement("sharedDependencyRatedRatio")?.value || 0),
+      other_shared: Number(styleElement("sharedDependencyOtherRatio")?.value || 0),
+    },
+    shared_dependency_artist_policy: normalizeSharedDependencyArtistPolicy(
+      styleElement("sharedDependencyArtistPolicy")?.value,
+    ),
+    weight_mode: styleElement("weightMode")?.value || "balanced",
     rating_tag_rules: styleState.ratingTagRules.map((rule) => ({ ...rule })),
     rating_exclude_tags: [...styleState.ratingExcludeTags],
     random_targets: [...selectedRandomTargets()],
@@ -744,6 +890,26 @@ function applyGenerationSettings(settings = {}) {
   setValue("generationCount", settings.generation_count);
   setValue("sharedStyleArtistMin", settings.shared_artist_min ?? 0);
   setValue("sharedStyleArtistMax", settings.shared_artist_max);
+  setValue("weightMode", settings.weight_mode);
+  const sourceRatios = settings.shared_dependency_source_ratios || {};
+  setValue("sharedDependencyFixedRatio", sourceRatios.fixed ?? 0);
+  setValue("sharedDependencyReferenceRatio", sourceRatios.reference ?? 100);
+  setValue("sharedDependencyRatedRatio", sourceRatios.rated ?? 0);
+  setValue("sharedDependencyOtherRatio", sourceRatios.other_shared ?? 0);
+  const artistPolicy = settings.shared_dependency_artist_policy
+    ?? settings.shared_dependency_reference_artist_policy
+    ?? settings.shared_dependency_artist_selection
+    ?? settings.shared_dependency_reference_artist_selection
+    ?? settings.shared_dependency_artist_mode;
+  setValue("sharedDependencyArtistPolicy", normalizeSharedDependencyArtistPolicy(artistPolicy));
+  styleState.sharedDependencyArtistPolicy = normalizeSharedDependencyArtistPolicy(artistPolicy);
+  if (settings.shared_dependency_reference_id !== undefined) {
+    styleState.sharedDependencyReferenceId = settings.shared_dependency_reference_id;
+    styleState.sharedDependencyReference = settings.shared_dependency_reference || null;
+    styleState.sharedDependencyReferenceMode = settings.shared_dependency_reference_mode === "fixed" ? "fixed" : "random";
+    styleState.sharedDependencyScale = settings.shared_dependency_scale ?? settings.shared_dependency_reference?.scale ?? null;
+    styleState.sharedDependencyCfgRescale = settings.shared_dependency_cfg_rescale ?? settings.shared_dependency_reference?.cfg_rescale ?? null;
+  }
   styleState.ratingTagRules = normalizeRatingTagRules(
     Array.isArray(settings.rating_tag_rules)
       ? settings.rating_tag_rules
@@ -758,6 +924,8 @@ function applyGenerationSettings(settings = {}) {
   if (variety && typeof settings.variety_plus === "boolean") variety.checked = settings.variety_plus;
   const count = styleElement("generationCount");
   if (count) count.disabled = styleElement("generationLimitMode")?.value === "unlimited";
+  styleElement("customRangeSection")?.classList.toggle("hidden", styleElement("weightMode")?.value !== "custom");
+  syncSharedDependencyControls();
 }
 
 function addPromptGroupItem(group, item) {
@@ -1380,6 +1548,7 @@ function setStyleRequestPending(pending) {
     .forEach((control) => { control.disabled = pending; });
   document.querySelectorAll("#weightGraph .weight-column")
     .forEach((column) => { column.draggable = !pending; });
+  syncSharedDependencyControls();
 }
 
 function validateCustomRanges() {
@@ -1582,7 +1751,7 @@ function saveRatingTagRules() {
     const rules = validateRatingTagRules(styleState.ratingTagRuleDraft);
     const exclusions = validateRatingExcludeTags(styleState.ratingExcludeTagDraft);
     const counts = ratingTagComposition(rules);
-    if (counts.fixed + counts.tagged + counts.sharedMin > counts.total) {
+    if (styleElement("weightMode")?.value !== "shared_dependency" && counts.fixed + counts.tagged + counts.sharedMin > counts.total) {
       throw new Error("고정 작가, 태그 지정 인원, 공유 작가 최소 인원의 합이 전체 작가 수를 넘습니다.");
     }
     styleState.ratingTagRules = rules;
@@ -1595,13 +1764,302 @@ function saveRatingTagRules() {
   }
 }
 
+function renderSharedDependencyRatioSummary() {
+  const target = styleElement("sharedDependencyRatioSummary");
+  if (!target) return;
+  const values = [
+    "sharedDependencyFixedRatio",
+    "sharedDependencyReferenceRatio",
+    "sharedDependencyRatedRatio",
+    "sharedDependencyOtherRatio",
+  ].map((id) => Number(styleElement(id)?.value));
+  const total = values.every(Number.isFinite) ? values.reduce((sum, value) => sum + value, 0) : NaN;
+  target.textContent = Number.isInteger(total) && total === 100
+    ? "합계 100% · 후보가 부족하면 0%가 아닌 공급원으로 재분배합니다."
+    : `합계 ${Number.isFinite(total) ? total : "-"}% · 100%가 되도록 입력하세요.`;
+  target.classList.toggle("error", total !== 100);
+}
+
+function sharedDependencyReferenceTitle(reference) {
+  const title = String(reference?.title || "").trim();
+  const id = Number(reference?.id);
+  return title || (Number.isInteger(id) && id > 0 ? `공유 이미지 #${id}` : "기준 그림체");
+}
+
+function renderSharedDependencyReferenceSummary() {
+  const target = styleElement("sharedDependencyReferenceSummary");
+  if (!target) return;
+  const active = styleElement("weightMode")?.value === "shared_dependency";
+  const reference = styleState.sharedDependencyReference;
+  const id = Number(styleState.sharedDependencyReferenceId || reference?.id);
+  const modeLabel = styleState.sharedDependencyReferenceMode === "fixed" ? "고정 기준" : "랜덤 기준";
+  target.textContent = Number.isInteger(id) && id > 0
+    ? `${modeLabel} · ${sharedDependencyReferenceTitle({ ...reference, id })} (#${id})`
+    : `${modeLabel} · 아직 선택하지 않음`;
+  target.classList.toggle("is-fixed", styleState.sharedDependencyReferenceMode === "fixed");
+  const openButton = styleElement("openSharedDependencyReference");
+  if (openButton) openButton.disabled = !active || styleState.pending;
+  const randomButton = styleElement("randomizeSharedDependencyReference");
+  if (randomButton) randomButton.disabled = !active || styleState.pending;
+  const clearButton = styleElement("clearSharedDependencyReference");
+  if (clearButton) {
+    clearButton.disabled = !active
+      || styleState.pending
+      || styleState.sharedDependencyReferenceMode !== "fixed";
+  }
+}
+
+function normalizeSharedDependencyReferenceItem(item) {
+  if (!item || typeof item !== "object") return null;
+  const id = Number(item.id);
+  if (!Number.isInteger(id) || id < 1) return null;
+  const artists = Array.isArray(item.shared_dependency_artists)
+    ? item.shared_dependency_artists
+    : Array.isArray(item.artists) ? item.artists : [];
+  return {
+    ...item,
+    id,
+    title: String(item.title || "").trim(),
+    image_url: String(item.image_url || item.thumbnail_url || "").trim(),
+    thumbnail_url: String(item.thumbnail_url || item.image_url || "").trim(),
+    shared_dependency_eligible: item.shared_dependency_eligible === true || artists.length > 0,
+    shared_dependency_artists: artists,
+  };
+}
+
+function sharedDependencyReferenceQuery(page = 1) {
+  const query = new URLSearchParams({
+    offset: String(Math.max(0, (Math.max(1, Number(page) || 1) - 1) * 24)),
+    limit: "24",
+    q: String(styleElement("sharedDependencyReferenceSearch")?.value || "").trim(),
+    metadata: "all",
+    sort: "posted_desc",
+  });
+  return query;
+}
+
+function renderSharedDependencyReferenceDetail(item) {
+  const target = styleElement("sharedDependencyReferenceDetail");
+  if (!target) return;
+  target.replaceChildren();
+  if (!item) {
+    const empty = document.createElement("p");
+    empty.className = "latest-result-placeholder";
+    empty.textContent = "그림을 선택해 주세요.";
+    target.append(empty);
+    return;
+  }
+  const heading = document.createElement("h3");
+  heading.textContent = sharedDependencyReferenceTitle(item);
+  const meta = document.createElement("p");
+  meta.className = "shared-dependency-reference-meta";
+  const artistCount = item.shared_dependency_artists?.length || 0;
+  meta.textContent = item.shared_dependency_eligible
+    ? `작가 ${artistCount}명 · ${item.board_tab || "공유 그림체"}`
+    : "작가를 인식할 수 없어 기준으로 확정할 수 없습니다.";
+  if (item.image_url) {
+    const image = document.createElement("img");
+    image.className = "shared-dependency-reference-large-image";
+    image.src = item.image_url;
+    image.alt = `${sharedDependencyReferenceTitle(item)} 미리보기`;
+    target.append(image);
+  }
+  const prompt = document.createElement("pre");
+  prompt.className = "shared-dependency-reference-prompt";
+  prompt.textContent = item.base_prompt || item.prompt || "프롬프트 없음";
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "primary";
+  confirm.textContent = "이 그림체를 기준으로 확정";
+  confirm.disabled = !item.shared_dependency_eligible;
+  confirm.addEventListener("click", () => confirmSharedDependencyReference(item));
+  target.append(heading, meta, prompt, confirm);
+}
+
+function renderSharedDependencyReferenceList(items) {
+  const target = styleElement("sharedDependencyReferenceList");
+  if (!target) return;
+  target.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "latest-result-placeholder";
+    empty.textContent = "표시할 공유 그림체 이미지가 없습니다.";
+    target.append(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "shared-dependency-reference-card";
+    card.classList.toggle("is-selected", item.id === styleState.sharedDependencyPickerSelected?.id);
+    card.classList.toggle("is-ineligible", !item.shared_dependency_eligible);
+    card.setAttribute("aria-label", `${sharedDependencyReferenceTitle(item)} 상세 보기`);
+    if (item.thumbnail_url) {
+      const image = document.createElement("img");
+      image.src = item.thumbnail_url;
+      image.alt = "";
+      card.append(image);
+    }
+    const title = document.createElement("strong");
+    title.textContent = sharedDependencyReferenceTitle(item);
+    const badge = document.createElement("span");
+    badge.textContent = item.shared_dependency_eligible ? "기준 가능" : "작가 없음";
+    card.append(title, badge);
+    card.addEventListener("click", () => {
+      styleState.sharedDependencyPickerSelected = item;
+      renderSharedDependencyReferenceList(styleState.sharedDependencyPickerItems);
+      renderSharedDependencyReferenceDetail(item);
+    });
+    target.append(card);
+  });
+}
+
+async function loadSharedDependencyReferencePage(page = styleState.sharedDependencyPickerPage) {
+  const token = styleState.sharedDependencyPickerRequestToken + 1;
+  styleState.sharedDependencyPickerRequestToken = token;
+  showStyleStatus("기준 그림체 목록을 불러오는 중입니다...");
+  try {
+    const result = await apiFetch(`/api/style-manager/shared?${sharedDependencyReferenceQuery(page)}`);
+    if (token !== styleState.sharedDependencyPickerRequestToken) return;
+    styleState.sharedDependencyPickerItems = (Array.isArray(result?.items) ? result.items : [])
+      .map(normalizeSharedDependencyReferenceItem).filter(Boolean);
+    styleState.sharedDependencyPickerPage = Math.max(1, Number(result?.offset || 0) / 24 + 1);
+    styleState.sharedDependencyPickerTotalPages = Math.max(1, Math.ceil(Number(result?.total || 0) / 24));
+    renderSharedDependencyReferenceList(styleState.sharedDependencyPickerItems);
+    const current = styleState.sharedDependencyPickerItems.find((item) => item.id === Number(styleState.sharedDependencyReferenceId));
+    if (current) styleState.sharedDependencyPickerSelected = current;
+    renderSharedDependencyReferenceDetail(styleState.sharedDependencyPickerSelected || current || null);
+    const summary = styleElement("sharedDependencyReferencePageSummary");
+    if (summary) summary.textContent = `${styleState.sharedDependencyPickerPage} / ${styleState.sharedDependencyPickerTotalPages} 페이지`;
+    const previous = styleElement("sharedDependencyReferencePrev");
+    const next = styleElement("sharedDependencyReferenceNext");
+    if (previous) previous.disabled = styleState.sharedDependencyPickerPage <= 1;
+    if (next) next.disabled = styleState.sharedDependencyPickerPage >= styleState.sharedDependencyPickerTotalPages;
+    showStyleStatus("");
+  } catch (error) {
+    if (token === styleState.sharedDependencyPickerRequestToken) {
+      showStyleError(error.message);
+      const status = styleElement("sharedDependencyReferenceStatus");
+      if (status) status.textContent = error.message;
+    }
+  }
+}
+
+function setSharedDependencyReference(reference, mode = "fixed") {
+  const normalized = normalizeSharedDependencyReferenceItem(reference);
+  if (!normalized || !normalized.shared_dependency_eligible) return false;
+  styleState.sharedDependencyReferenceId = normalized.id;
+  styleState.sharedDependencyReference = normalized;
+  styleState.sharedDependencyReferenceMode = mode === "fixed" ? "fixed" : "random";
+  styleState.sharedDependencyScale = normalized.scale ?? null;
+  styleState.sharedDependencyCfgRescale = normalized.cfg_rescale ?? null;
+  renderSharedDependencyReferenceSummary();
+  return true;
+}
+
+function clearSharedDependencyReference() {
+  styleState.sharedDependencyReferenceMode = "random";
+  styleState.sharedDependencyReferenceId = null;
+  styleState.sharedDependencyReference = null;
+  styleState.sharedDependencyScale = null;
+  styleState.sharedDependencyCfgRescale = null;
+  styleState.sharedDependencyPickerSelected = null;
+  renderSharedDependencyReferenceSummary();
+  return {
+    shared_dependency_reference_mode: styleState.sharedDependencyReferenceMode,
+    shared_dependency_reference_id: styleState.sharedDependencyReferenceId,
+    shared_dependency_reference: styleState.sharedDependencyReference,
+    shared_dependency_scale: styleState.sharedDependencyScale,
+    shared_dependency_cfg_rescale: styleState.sharedDependencyCfgRescale,
+  };
+}
+
+function confirmSharedDependencyReference(item) {
+  if (!setSharedDependencyReference(item, "fixed")) return;
+  styleElement("sharedDependencyReferenceModal")?.classList.add("hidden");
+  const status = styleElement("sharedDependencyReferenceStatus");
+  if (status) status.textContent = "기준 그림체를 고정했습니다.";
+}
+
+async function randomizeSharedDependencyReference() {
+  styleState.sharedDependencyReferenceMode = "random";
+  const eligible = styleState.sharedDependencyPickerItems.filter((item) => item.shared_dependency_eligible);
+  if (!eligible.length) {
+    await loadSharedDependencyReferencePage(1);
+  }
+  const pool = styleState.sharedDependencyPickerItems.filter((item) => item.shared_dependency_eligible);
+  if (pool.length) {
+    const currentId = Number(styleState.sharedDependencyReferenceId);
+    const candidates = pool.filter((item) => item.id !== currentId);
+    setSharedDependencyReference((candidates.length ? candidates : pool)[Math.floor(Math.random() * (candidates.length ? candidates.length : pool.length))], "random");
+    styleState.sharedDependencyPickerSelected = styleState.sharedDependencyReference;
+    renderSharedDependencyReferenceList(styleState.sharedDependencyPickerItems);
+    renderSharedDependencyReferenceDetail(styleState.sharedDependencyReference);
+  }
+  renderSharedDependencyReferenceSummary();
+}
+
+function openSharedDependencyReferenceModal() {
+  styleElement("sharedDependencyReferenceModal")?.classList.remove("hidden");
+  void loadSharedDependencyReferencePage(styleState.sharedDependencyPickerPage);
+}
+
+function closeSharedDependencyReferenceModal() {
+  styleElement("sharedDependencyReferenceModal")?.classList.add("hidden");
+}
+
+function setSharedDependencyReferenceFromArca(image, item = {}) {
+  const reference = {
+    ...image,
+    id: image?.id,
+    title: item.title || image?.title,
+    source_url: item.source_url || image?.source_url,
+    shared_dependency_eligible: true,
+    shared_dependency_artists: image?.shared_dependency_artists || [{ artist: "parsed" }],
+  };
+  if (!setSharedDependencyReference(reference, "fixed")) return false;
+  closeSharedDependencyReferenceModal();
+  const weightMode = styleElement("weightMode");
+  if (weightMode) {
+    weightMode.value = "shared_dependency";
+    if (typeof Event !== "undefined") weightMode.dispatchEvent(new Event("change", { bubbles: true }));
+    else syncSharedDependencyControls();
+  }
+  styleElement("arcaStyleDialog")?.classList.add("hidden");
+  if (typeof document !== "undefined") document.querySelector('[data-tab="style-maker"]')?.click();
+  return true;
+}
+
+if (typeof globalThis !== "undefined") globalThis.setSharedDependencyReferenceFromArca = setSharedDependencyReferenceFromArca;
+
+function syncSharedDependencyControls() {
+  const active = styleElement("weightMode")?.value === "shared_dependency";
+  const state = sharedDependencyControlsState(styleElement("weightMode")?.value);
+  styleElement("sharedDependencySettings")?.classList.toggle("hidden", !active);
+  const count = styleElement("styleArtistCount");
+  if (count) count.disabled = state.countDisabled || styleState.pending;
+  const countStatus = styleElement("sharedDependencyCountStatus");
+  if (countStatus) {
+    countStatus.classList.toggle("hidden", !active);
+    countStatus.textContent = state.countLabel;
+  }
+  renderSharedDependencyRatioSummary();
+  renderSharedDependencyReferenceSummary();
+  ["sharedStyleArtistMin", "sharedStyleArtistMax"].forEach((id) => {
+    const input = styleElement(id);
+    if (input) input.disabled = active || styleState.pending;
+  });
+  return active;
+}
+
 function readStyleOptions() {
+  const mode = styleElement("weightMode")?.value || "balanced";
   const count = Number(styleElement("styleArtistCount")?.value);
   const minWeight = Number(styleElement("styleMinWeight")?.value);
   const maxWeight = Number(styleElement("styleMaxWeight")?.value);
   const sharedArtistMin = Number(styleElement("sharedStyleArtistMin")?.value || 0);
   const sharedArtistMax = Number(styleElement("sharedStyleArtistMax")?.value || 0);
-  if (!Number.isInteger(count) || count < 1) throw new Error("작가 수는 1 이상의 정수여야 합니다.");
+  if (mode !== "shared_dependency" && (!Number.isInteger(count) || count < 1)) throw new Error("작가 수는 1 이상의 정수여야 합니다.");
   if (![minWeight, maxWeight].every(Number.isFinite) || minWeight <= 0 || minWeight > maxWeight) {
     throw new Error("전체 가중치 범위를 확인하세요.");
   }
@@ -1614,27 +2072,38 @@ function readStyleOptions() {
   ) {
     throw new Error("공유 그림체 작가 인원은 0부터 50 사이의 정수여야 합니다.");
   }
-  if (sharedArtistMin > sharedArtistMax) {
+  if (sharedArtistMin > sharedArtistMax && mode !== "shared_dependency") {
     throw new Error("공유 그림체 작가 최소 인원은 최대 인원보다 클 수 없습니다.");
   }
-  if (sharedArtistMin > count) {
+  if (sharedArtistMin > count && mode !== "shared_dependency") {
     throw new Error("공유 그림체 작가 최소 인원은 전체 작가 수보다 클 수 없습니다.");
   }
   const fixedArtistCount = fixedStyleArtistEntries(styleState.artists).length;
-  if (fixedArtistCount > count) {
+  if (mode !== "shared_dependency" && fixedArtistCount > count) {
     throw new Error(`고정 작가 ${fixedArtistCount}명이 전체 작가 수 ${count}명보다 많습니다.`);
   }
-  if (sharedArtistMin > count - fixedArtistCount) {
+  if (sharedArtistMin > count - fixedArtistCount && mode !== "shared_dependency") {
     throw new Error("공유 그림체 작가 최소 인원은 고정 작가를 제외한 남은 자리보다 클 수 없습니다.");
   }
   const ratingTagRules = validateRatingTagRules(styleState.ratingTagRules);
   const ratingExcludeTags = validateRatingExcludeTags(styleState.ratingExcludeTags);
   const taggedArtistCount = ratingTagRuleCount(ratingTagRules);
-  if (fixedArtistCount + sharedArtistMin + taggedArtistCount > count) {
+  if (fixedArtistCount + sharedArtistMin + taggedArtistCount > count && mode !== "shared_dependency") {
     throw new Error("고정 작가, 태그 지정 인원, 공유 작가 최소 인원의 합이 전체 작가 수를 넘습니다.");
   }
 
-  const mode = styleElement("weightMode")?.value || "balanced";
+  const dependencyRatios = {
+    fixed: Number(styleElement("sharedDependencyFixedRatio")?.value || 0),
+    reference: Number(styleElement("sharedDependencyReferenceRatio")?.value || 0),
+    rated: Number(styleElement("sharedDependencyRatedRatio")?.value || 0),
+    other_shared: Number(styleElement("sharedDependencyOtherRatio")?.value || 0),
+  };
+  const dependencyArtistPolicy = normalizeSharedDependencyArtistPolicy(
+    styleElement("sharedDependencyArtistPolicy")?.value || styleState.sharedDependencyArtistPolicy,
+  );
+  if (mode === "shared_dependency") {
+    normalizeSharedDependencyRatios(dependencyRatios);
+  }
   return {
     count,
     scores: normalizeSelectedScores(styleState.allowedScores),
@@ -1646,6 +2115,8 @@ function readStyleOptions() {
     weight_profile: mode === "profile" ? styleState.weightProfile : undefined,
     shared_artist_min: sharedArtistMin,
     shared_artist_max: sharedArtistMax,
+    shared_dependency_source_ratios: dependencyRatios,
+    shared_dependency_artist_policy: dependencyArtistPolicy,
     rating_tag_rules: ratingTagRules,
     rating_exclude_tags: ratingExcludeTags,
   };
@@ -1656,6 +2127,13 @@ async function loadStyleArtists(reroll = "all") {
   try {
     showStyleStatus("그림체를 구성하는 중입니다...");
     payload = buildStyleRequestPayload(readStyleOptions(), styleState.artists, reroll);
+    payload = applySharedDependencyReference(
+      payload,
+      reroll,
+      styleElement("weightMode")?.value,
+      styleState.sharedDependencyReferenceId,
+      styleState.sharedDependencyReferenceMode,
+    );
   } catch (error) {
     showStyleError(error.message);
     showStyleStatus(error.message, "error");
@@ -1668,7 +2146,21 @@ async function loadStyleArtists(reroll = "all") {
     }), {
       onPending: setStyleRequestPending,
       onSuccess: (data) => {
-        const preserveOrder = styleElement("weightMode")?.value === "profile";
+        if (data.shared_dependency_reference_id !== undefined) {
+          styleState.sharedDependencyReferenceId = data.shared_dependency_reference_id;
+          styleState.sharedDependencyReference = data.shared_dependency_reference || null;
+          if (data.shared_dependency_reference_mode === "fixed" || data.shared_dependency_reference_mode === "random") {
+            styleState.sharedDependencyReferenceMode = data.shared_dependency_reference_mode;
+          }
+          styleState.sharedDependencyArtistPolicy = normalizeSharedDependencyArtistPolicy(
+            data.shared_dependency_artist_policy,
+          );
+          const artistPolicy = styleElement("sharedDependencyArtistPolicy");
+          if (artistPolicy) artistPolicy.value = styleState.sharedDependencyArtistPolicy;
+          styleState.sharedDependencyScale = data.shared_dependency_scale ?? data.shared_dependency_reference?.scale ?? null;
+          styleState.sharedDependencyCfgRescale = data.shared_dependency_cfg_rescale ?? data.shared_dependency_reference?.cfg_rescale ?? null;
+        }
+        const preserveOrder = ["profile", "shared_dependency"].includes(styleElement("weightMode")?.value);
         styleState.artists = applyStyleRerollResult(styleState.artists, data.artists || [], reroll, preserveOrder);
         renderWeightGraph();
         showStyleStatus(`${styleState.artists.length}명의 작가를 불러왔습니다.`, "ok");
@@ -1680,13 +2172,22 @@ async function loadStyleArtists(reroll = "all") {
     });
 }
 
-function updateArtistPrompt() {
+function renderArtistPromptPreview(prompt) {
+  const normalized = typeof prompt === "string" ? prompt.trim() : "";
   const preview = styleElement("artistPromptPreview");
-  const prompt = chooseArtistsForPrompt(styleState.artists)
+  if (preview) preview.value = normalized;
+  renderPromptTokens(styleElement("artistPromptTokens"), normalized, "artist");
+  return normalized;
+}
+
+function updateArtistPrompt() {
+  const promptOptions = styleElement("weightMode")?.value === "profile"
+    ? { profile: styleState.weightProfile }
+    : {};
+  const prompt = chooseArtistsForPrompt(styleState.artists, Math.random, promptOptions)
     .map((item) => `${formatStyleWeight(item.weight)}::artist:${formatArtistPromptTag(item.artist)}::`)
     .join(", ");
-  if (preview) preview.value = prompt;
-  renderPromptTokens(styleElement("artistPromptTokens"), prompt, "artist");
+  return renderArtistPromptPreview(prompt);
 }
 
 function renderWeightProfilePreview() {
@@ -1717,8 +2218,6 @@ function renderWeightProfilePreview() {
 }
 
 function openWeightGraphModal() {
-  const mode = styleElement("weightMode");
-  if (mode) mode.value = "profile";
   styleElement("weightGraphModal")?.classList.remove("hidden");
   renderWeightGraph();
 }
@@ -2236,7 +2735,10 @@ function renderWeightGraphFixedArtistOverlays(graph) {
 function renderWeightGraph() {
   const graph = styleElement("weightGraph");
   renderStyleArtistList();
-  if (!graph) return;
+  if (!graph) {
+    saveFixedStyleArtists(styleState.artists);
+    return;
+  }
   graph.replaceChildren();
   const profileMode = styleElement("weightMode")?.value === "profile";
   graph.classList.toggle("profile-mode", profileMode);
@@ -2246,6 +2748,7 @@ function renderWeightGraph() {
     renderWeightProfilePreview();
     updateArtistPrompt();
     refreshPromptPresetsForArtists();
+    saveFixedStyleArtists(styleState.artists);
     return;
   }
   const min = styleNumber("styleMinWeight", 0.1);
@@ -2287,6 +2790,7 @@ function renderWeightGraph() {
       slider.value = String(item.weight);
       number.value = Number(item.weight).toFixed(2);
       updateArtistPrompt();
+      saveFixedStyleArtists(styleState.artists);
     };
     slider.addEventListener("input", () => syncWeight(slider.value));
     number.addEventListener("change", () => syncWeight(number.value));
@@ -2351,6 +2855,7 @@ function renderWeightGraph() {
   renderWeightGraphFixedArtistOverlays(graph);
   updateArtistPrompt();
   refreshPromptPresetsForArtists();
+  saveFixedStyleArtists(styleState.artists);
 }
 
 function currentStyleArtistFragment(value) {
@@ -2722,6 +3227,12 @@ function generationNumber(id, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function sharedDependencyParameterValue(value, minimum, maximum) {
+  if (value === null || value === undefined || (typeof value === "string" && value.trim() === "")) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= minimum && numeric <= maximum ? numeric : null;
+}
+
 function readCharacterPrompts() {
   if (typeof document === "undefined") return [];
   return [...document.querySelectorAll("#characterPromptList .character-prompt-row")]
@@ -2739,8 +3250,13 @@ function buildGenerationRequest(requestId = createRequestId()) {
   const width = generationNumber("generationWidth", 832);
   const height = generationNumber("generationHeight", 1216);
   const steps = generationNumber("generationSteps", 28);
-  const scale = generationNumber("generationScale", 5);
-  const cfgRescale = generationNumber("generationCfgRescale", 0);
+  const inputScale = generationNumber("generationScale", 5);
+  const inputCfgRescale = generationNumber("generationCfgRescale", 0);
+  const sharedDependencyMode = styleElement("weightMode")?.value === "shared_dependency";
+  const referenceScale = sharedDependencyParameterValue(styleState.sharedDependencyScale, 0, 10);
+  const referenceCfgRescale = sharedDependencyParameterValue(styleState.sharedDependencyCfgRescale, 0, 1);
+  const scale = sharedDependencyMode && referenceScale !== null ? referenceScale : inputScale;
+  const cfgRescale = sharedDependencyMode && referenceCfgRescale !== null ? referenceCfgRescale : inputCfgRescale;
   if (![width, height].every((value) => Number.isInteger(value) && value > 0 && value % 64 === 0)) {
     throw new Error("너비와 높이는 64 단위의 양수여야 합니다.");
   }
@@ -2756,7 +3272,21 @@ function buildGenerationRequest(requestId = createRequestId()) {
     .filter(Boolean);
   const payload = {
     request_id: requestId,
-    artists: chooseArtistsForPrompt(styleState.artists)
+    weight_mode: styleElement("weightMode")?.value || "balanced",
+    ...(sharedDependencyMode && styleState.sharedDependencyReferenceId
+      ? {
+          shared_dependency_reference_id: styleState.sharedDependencyReferenceId,
+          shared_dependency_reference_mode: styleState.sharedDependencyReferenceMode,
+          shared_dependency_artist_policy: normalizeSharedDependencyArtistPolicy(
+            styleElement("sharedDependencyArtistPolicy")?.value || styleState.sharedDependencyArtistPolicy,
+          ),
+        }
+      : {}),
+    artists: chooseArtistsForPrompt(
+      styleState.artists,
+      Math.random,
+      styleElement("weightMode")?.value === "profile" ? { profile: styleState.weightProfile } : {},
+    )
       .map(({ artist, score, weight }) => ({ artist, score, weight })),
     base_prompt: combinePromptSections(qualityPrompt, fixedPrompt),
     quality_prompt: qualityPrompt,
@@ -2854,6 +3384,7 @@ function setGenerationBusy(busy) {
     const button = styleElement(id);
     if (button) button.disabled = busy || styleState.running;
   });
+  syncGenerationRemote();
 }
 
 function renderGenerationResult(result) {
@@ -2867,6 +3398,275 @@ function renderGenerationResult(result) {
   meta.className = "latest-result-meta";
   meta.textContent = `그림체 #${result.style_id} · ${result.width}×${result.height} · ${result.sampler} / ${result.noise_schedule} · ${result.steps} steps · Scale ${result.scale} · CFG Rescale ${result.cfg_rescale} · Seed ${result.seed}`;
   target.append(image, meta);
+}
+
+function normalizeStyleHistoryItem(item) {
+  const value = item && typeof item === "object" ? item : {};
+  let artists = Array.isArray(value.artists) ? value.artists : [];
+  if (!artists.length && value.artist_prompt) artists = parseStyleArtistEntries(value.artist_prompt);
+  artists = artists.map((entry) => {
+    const artist = String(entry?.artist || "").trim();
+    const weight = Number(entry?.weight);
+    if (!artist) return null;
+    return {
+      ...entry,
+      artist,
+      weight: Number.isFinite(weight) && weight > 0 ? Number(weight.toFixed(2)) : 1,
+      ...(entry?.fixed === true ? { fixed: true } : {}),
+      ...(entry?.random_weight === true ? { random_weight: true } : {}),
+    };
+  }).filter(Boolean);
+  const generation = value.generation_settings && typeof value.generation_settings === "object"
+    ? { ...value.generation_settings }
+    : {};
+  const hasValue = (source, key) => source?.[key] !== undefined && source?.[key] !== null && source?.[key] !== "";
+  ["width", "height", "steps", "scale", "cfg_rescale", "sampler", "variety_plus", "model", "seed"]
+    .forEach((key) => {
+      if (!hasValue(generation, key) && hasValue(value, key)) generation[key] = value[key];
+    });
+  if (!hasValue(generation, "scheduler")) {
+    const scheduler = hasValue(generation, "noise_schedule")
+      ? generation.noise_schedule
+      : value.noise_schedule;
+    if (scheduler !== undefined && scheduler !== null && scheduler !== "") generation.scheduler = scheduler;
+  }
+  if (!hasValue(generation, "resolution_preset") && hasValue(generation, "width") && hasValue(generation, "height")) {
+    const resolution = `${generation.width}x${generation.height}`;
+    generation.resolution_preset = ["832x1216", "1216x832", "1024x1024"].includes(resolution)
+      ? resolution
+      : "custom";
+  }
+  const qualityPrompt = String(value.quality_prompt || "").trim()
+    ? value.quality_prompt
+    : (value.base_prompt || "");
+  return {
+    ...value,
+    id: Number(value.id),
+    image_url: value.image_url || value.thumbnail_url || "",
+    artists,
+    base_prompt: qualityPrompt,
+    fixed_prompt: value.fixed_prompt || "",
+    negative_prompt: value.negative_prompt || "",
+    character_prompts: Array.isArray(value.character_prompts)
+      ? value.character_prompts.map((entry) => typeof entry === "string" ? entry : entry?.prompt || "").filter(Boolean)
+      : [],
+    generation_settings: generation,
+  };
+}
+
+function styleHistoryPreviewMeta(item) {
+  const normalized = normalizeStyleHistoryItem(item);
+  const settings = normalized.generation_settings || {};
+  const scheduler = settings.scheduler || settings.noise_schedule || "native";
+  return `생성 #${normalized.id} · 작가 ${normalized.artists.length}명 · ${managerKnown(settings.width)}×${managerKnown(settings.height)} · ${managerKnown(settings.sampler)} / ${managerKnown(scheduler)} · ${managerKnown(settings.steps)} steps · CFG ${managerKnown(settings.scale)} · Rescale ${managerKnown(settings.cfg_rescale)} · Seed ${managerKnown(settings.seed)}`;
+}
+
+function styleHistoryArtistPrompt(item) {
+  const value = item && typeof item === "object" ? item : {};
+  const stored = typeof value.artist_prompt === "string" ? value.artist_prompt.trim() : "";
+  if (stored) return stored;
+  return (Array.isArray(value.artists) ? value.artists : [])
+    .map((artist) => `${formatStyleWeight(artist.weight)}::artist:${formatArtistPromptTag(artist.artist)}::`)
+    .join(", ");
+}
+
+function renderStyleHistorySelection(item) {
+  const normalized = item ? normalizeStyleHistoryItem(item) : null;
+  renderArtistPromptPreview(styleHistoryArtistPrompt(normalized));
+  const target = styleElement("latestStyleResult");
+  if (!target) return;
+  target.replaceChildren();
+  if (!item) {
+    const placeholder = document.createElement("div");
+    placeholder.className = "latest-result-placeholder";
+    placeholder.textContent = "최근 생성 결과가 여기에 표시됩니다.";
+    target.append(placeholder);
+    return;
+  }
+  if (normalized.image_url) {
+    const image = document.createElement("img");
+    image.src = normalized.image_url;
+    image.alt = `그림체 제작 히스토리 #${normalized.id}`;
+    target.append(image);
+  }
+  const meta = document.createElement("div");
+  meta.className = "latest-result-meta";
+  meta.textContent = styleHistoryPreviewMeta(normalized);
+  target.append(meta);
+}
+
+function renderStyleHistoryDetail(item) {
+  const target = styleElement("styleHistoryDetail");
+  if (!target) return;
+  target.replaceChildren();
+  if (!item) {
+    const placeholder = document.createElement("div");
+    placeholder.className = "latest-result-placeholder";
+    placeholder.textContent = "생성 기록을 선택하면 자세히 볼 수 있습니다.";
+    target.append(placeholder);
+    return;
+  }
+  const normalized = normalizeStyleHistoryItem(item);
+  const heading = document.createElement("h3");
+  heading.textContent = `생성 #${normalized.id}`;
+  const meta = document.createElement("p");
+  meta.textContent = styleHistoryPreviewMeta(normalized);
+  const actions = document.createElement("div");
+  actions.className = "style-history-detail-actions";
+  const load = document.createElement("button");
+  load.type = "button";
+  load.className = "primary";
+  load.textContent = "설정 반영";
+  load.title = "선택한 히스토리의 설정을 현재 그림체 제작에 반영";
+  load.setAttribute("aria-label", "선택한 히스토리 설정 반영");
+  load.addEventListener("click", () => applyStyleHistoryItem(normalized));
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.textContent = "확정 그림체로";
+  confirm.title = "선택한 히스토리를 확정 그림체로 저장";
+  confirm.setAttribute("aria-label", "선택한 히스토리를 확정 그림체로 저장");
+  confirm.addEventListener("click", () => openConfirmedStyleModal(normalized, false, "generated"));
+  actions.append(load, confirm);
+  target.append(heading, meta, actions);
+}
+
+function renderStyleHistoryList() {
+  const list = styleElement("styleHistoryList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!styleState.historyItems.length) {
+    const empty = document.createElement("p");
+    empty.className = "latest-result-placeholder";
+    empty.textContent = "아직 생성한 그림체가 없습니다.";
+    list.append(empty);
+    renderStyleHistoryDetail(null);
+    renderStyleHistorySelection(null);
+    return;
+  }
+  styleState.historyItems.forEach((item) => {
+    const card = document.createElement("article");
+    card.className = "style-history-card";
+    card.classList.toggle("selected", Number(item.id) === Number(styleState.historySelectedId));
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "style-history-card-select";
+    select.classList.toggle("selected", Number(item.id) === Number(styleState.historySelectedId));
+    select.setAttribute("aria-pressed", String(Number(item.id) === Number(styleState.historySelectedId)));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "style-history-card-delete";
+    remove.setAttribute("aria-label", `생성 #${item.id} 삭제`);
+    remove.title = `생성 #${item.id} 삭제`;
+    remove.textContent = "×";
+    const deleteFromCard = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      deleteStyleHistoryItem(item);
+    };
+    remove.addEventListener("click", deleteFromCard);
+    if (item.image_url) {
+      const image = document.createElement("img");
+      image.src = item.thumbnail_url || item.image_url;
+      image.alt = `생성 #${item.id}`;
+      image.loading = "lazy";
+      select.append(image);
+    }
+    const title = document.createElement("strong");
+    title.textContent = `#${item.id}`;
+    const info = document.createElement("small");
+    info.textContent = `${Array.isArray(item.artists) ? item.artists.length : 0}명${item.confirmed ? " · 확정됨" : ""}`;
+    select.append(title, info);
+    select.addEventListener("click", () => {
+      styleState.historySelectedId = item.id;
+      renderStyleHistorySelection(item);
+      renderStyleHistoryList();
+      renderStyleHistoryDetail(item);
+    });
+    card.append(select, remove);
+    list.append(card);
+  });
+  const selected = styleState.historyItems.find((item) => Number(item.id) === Number(styleState.historySelectedId))
+    || styleState.historyItems[0];
+  if (selected && Number(styleState.historySelectedId) !== Number(selected.id)) {
+    styleState.historySelectedId = selected.id;
+    renderStyleHistorySelection(selected);
+    renderStyleHistoryDetail(selected);
+  }
+  if (selected && Number(styleState.historySelectedId) === Number(selected.id)) renderStyleHistorySelection(selected);
+}
+
+async function loadStyleHistory({ force = false } = {}) {
+  if (!force && !styleState.historyDirty) return;
+  const token = ++styleState.historyRequestToken;
+  const status = styleElement("styleHistoryStatus");
+  if (status) status.textContent = "히스토리를 불러오는 중...";
+  try {
+    const items = await apiFetch("/api/style-manager/generated");
+    if (token !== styleState.historyRequestToken) return;
+    styleState.historyItems = Array.isArray(items) ? items : [];
+    styleState.historyDirty = false;
+    if (!styleState.historyItems.some((item) => Number(item.id) === Number(styleState.historySelectedId))) {
+      styleState.historySelectedId = styleState.historyItems[0]?.id ?? null;
+    }
+    renderStyleHistoryList();
+    const selected = styleState.historyItems.find((item) => Number(item.id) === Number(styleState.historySelectedId));
+    renderStyleHistoryDetail(selected);
+    renderStyleHistorySelection(selected);
+    if (status) status.textContent = `${styleState.historyItems.length}개 기록`;
+  } catch (error) {
+    if (token !== styleState.historyRequestToken) return;
+    if (status) status.textContent = error.message;
+  }
+}
+
+function applyStyleHistoryItem(item) {
+  const normalized = normalizeStyleHistoryItem(item);
+  if (!normalized.artists.length) {
+    showStyleStatus("불러올 작가 정보가 없는 기록입니다.", "error");
+    return false;
+  }
+  styleState.artists = normalized.artists.map((artist) => ({ ...artist }));
+  styleState.promptGroups = [];
+  const characterList = styleElement("characterPromptList");
+  characterList?.replaceChildren();
+  styleElement("basePrompt").value = normalized.base_prompt;
+  styleElement("fixedPrompt").value = normalized.fixed_prompt;
+  styleElement("negativePrompt").value = normalized.negative_prompt;
+  normalized.character_prompts.forEach((prompt, index) => addCharacterPrompt(prompt, `history-${normalized.id}-${index + 1}`));
+  if (!normalized.character_prompts.length) addCharacterPrompt();
+  applyGenerationSettings(normalized.generation_settings);
+  renderStyleArtistList();
+  renderWeightGraph();
+  updateArtistPrompt();
+  persistAndRenderPromptControls();
+  showStyleStatus(`생성 #${normalized.id}을 현재 그림체로 불러왔습니다.`, "ok");
+  return true;
+}
+
+async function deleteStyleHistoryItem(item) {
+  if (!item || !await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: "generated",
+    title: "생성 기록 삭제",
+    message: `생성 #${item.id}와 저장된 이미지를 삭제할까요?`,
+    details: ["삭제한 기록은 복구할 수 없습니다."],
+    confirmLabel: "바로 삭제",
+    tone: "danger",
+  })) return false;
+  try {
+    await apiFetch("/api/style-manager/generated/delete-batch", {
+      method: "POST",
+      body: JSON.stringify({ image_ids: [Number(item.id)] }),
+    });
+    styleState.historySelectedId = null;
+    styleState.historyDirty = true;
+    await loadStyleHistory({ force: true });
+    return true;
+  } catch (error) {
+    const status = styleElement("styleHistoryStatus");
+    if (status) status.textContent = error.message;
+    return false;
+  }
 }
 
 async function generateCurrentStyle() {
@@ -2884,6 +3684,8 @@ async function generateCurrentStyle() {
     const result = await apiFetch("/api/style-maker/generate", { method: "POST", body: JSON.stringify(payload) });
     renderGenerationResult(result);
     styleState.managerDirty = true;
+    styleState.historyDirty = true;
+    if (!styleElement("styleMakerHistory")?.classList.contains("history-collapsed")) loadStyleHistory({ force: true });
     showStyleStatus("이미지를 생성하고 자동 저장했습니다.", "ok");
     return result;
   } catch (error) {
@@ -2917,6 +3719,7 @@ function renderQueueState() {
   if (stop) stop.disabled = !styleState.running;
   const start = styleElement("startContinuous");
   if (start) start.disabled = styleState.running || styleState.generating;
+  syncGenerationRemote();
 }
 
 async function randomizePromptTargets(targets) {
@@ -3002,11 +3805,32 @@ async function runContinuousGeneration() {
   }
 }
 
+// The API keeps the legacy `skip_delete_confirmation` key. The settings UI
+// uses the clearer positive meaning: checked means the delete confirmation is on.
+function deleteConfirmationEnabledFromSkip(skipValue) {
+  return skipValue !== true;
+}
+
+function skipDeleteConfirmationFromEnabled(enabledValue) {
+  return enabledValue !== true;
+}
+
 async function openSettingsModal() {
   styleElement("settingsModal")?.classList.remove("hidden");
   const status = styleElement("novelAiSettingsStatus");
+  const checkboxes = () => [...document.querySelectorAll("[data-delete-confirmation-category]")];
   try {
-    const data = await apiFetch("/api/settings/novelai");
+    const [data, preferences] = await Promise.all([
+      apiFetch("/api/settings/novelai"),
+      apiFetch("/api/settings/preferences"),
+    ]);
+    const values = preferences.skip_delete_confirmation || {};
+    checkboxes().forEach((checkbox) => {
+      checkbox.checked = deleteConfirmationEnabledFromSkip(
+        values[checkbox.dataset.deleteConfirmationCategory],
+      );
+    });
+    globalThis.appDialog.setPreferences?.(preferences);
     if (status) status.textContent = data.configured ? "저장된 키가 있습니다." : "저장된 키가 없습니다.";
   } catch (error) {
     if (status) status.textContent = error.message;
@@ -3017,6 +3841,27 @@ function closeSettingsModal() {
   styleElement("settingsModal")?.classList.add("hidden");
   const input = styleElement("novelAiAppKey");
   if (input) input.value = "";
+}
+
+async function saveAppPreferences() {
+  const status = styleElement("novelAiSettingsStatus");
+  const values = Object.fromEntries([...document.querySelectorAll("[data-delete-confirmation-category]")]
+    .map((checkbox) => [
+      checkbox.dataset.deleteConfirmationCategory,
+      skipDeleteConfirmationFromEnabled(checkbox.checked),
+    ]));
+  try {
+    const preferences = await apiFetch("/api/settings/preferences", {
+      method: "PUT",
+      body: JSON.stringify({ skip_delete_confirmation: values }),
+    });
+    globalThis.appDialog.setPreferences?.(preferences);
+    if (status) status.textContent = "삭제 확인 설정을 저장했습니다.";
+    return true;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    return false;
+  }
 }
 
 async function saveNovelAiKey() {
@@ -3043,6 +3888,8 @@ async function testNovelAiKey() {
 
 async function deleteNovelAiKey() {
   if (!await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: "novelai_key",
     title: "NovelAI App Key 삭제",
     message: "저장된 App Key를 이 프로그램에서 삭제할까요?",
     confirmLabel: "키 삭제",
@@ -3193,9 +4040,13 @@ function renderStyleManagerList(styles) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "style-manager-item";
+    button.dataset.styleManagerId = String(style.id);
     button.classList.add(`manager-${styleState.managerMode}-item`);
     button.classList.toggle("selection-mode", styleState.managerSelectionMode && styleState.managerMode !== "shared");
     button.classList.toggle("selected", styleState.selectedStyleIds.has(style.id));
+    const detailActive = styleState.managerDetail && String(styleState.managerDetail.id) === String(style.id);
+    button.classList.toggle("detail-active", Boolean(detailActive));
+    if (detailActive) button.setAttribute("aria-current", "true");
     button.setAttribute("aria-pressed", String(styleState.selectedStyleIds.has(style.id)));
     const selectionMark = document.createElement("span");
     selectionMark.className = "style-manager-selection-mark";
@@ -3253,6 +4104,16 @@ function renderStyleManagerList(styles) {
     list.append(button);
   });
   updateStyleManagerListStatus(styleState.managerTotal);
+}
+
+function syncStyleManagerDetailSelection() {
+  const detailId = styleState.managerDetail?.id;
+  document.querySelectorAll("#styleManagerList .style-manager-item").forEach((button) => {
+    const active = detailId !== undefined && String(button.dataset.styleManagerId) === String(detailId);
+    button.classList.toggle("detail-active", active);
+    if (active) button.setAttribute("aria-current", "true");
+    else button.removeAttribute("aria-current");
+  });
 }
 
 function toggleSelectedStyleId(selectedIds, styleId) {
@@ -3420,11 +4281,14 @@ function resetStyleManagerDetail() {
   styleState.managerImageIndex = 0;
   styleState.managerDetail = null;
   styleState.managerNegativeExpanded = false;
+  syncStyleManagerDetailSelection();
   closeGeneratedImage();
 }
 
 async function deleteManagedStyle(styleId) {
   if (!await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: "style",
     title: "그림체 삭제",
     message: "이 그림체와 함께 저장된 생성 이미지를 모두 삭제할까요?",
     details: ["생성 이미지도 함께 삭제됩니다.", "삭제한 그림체와 생성 이미지는 복구할 수 없습니다."],
@@ -3446,6 +4310,8 @@ async function deleteSelectedManagedStyles() {
   const styleIds = [...styleState.selectedStyleIds].sort((left, right) => left - right);
   if (!styleIds.length) return;
   if (!await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: styleState.managerMode === "confirmed" ? "style" : "generated",
     title: `${styleIds.length}개 삭제`,
     message: styleState.managerMode === "confirmed"
       ? "선택한 확정 그림체를 삭제할까요? 원본 제작 기록과 공유 그림체는 유지됩니다."
@@ -3465,6 +4331,7 @@ async function deleteSelectedManagedStyles() {
       body: JSON.stringify({ [key]: styleIds }),
     });
     const deletedIds = new Set(result.deleted_ids || []);
+    styleState.historyDirty = true;
     if (styleState.managerDetail && deletedIds.has(styleState.managerDetail.id)) {
       resetStyleManagerDetail();
     }
@@ -3597,6 +4464,45 @@ function managerKnown(value, suffix = "") {
   return value === null || value === undefined || value === "" ? "알 수 없음" : `${value}${suffix}`;
 }
 
+function safeManagerExternalUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
+  try {
+    const parsed = new URL(value.trim(), document.baseURI || "http://localhost/");
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+  } catch {
+    return "";
+  }
+}
+
+function appendSharedDependencyBlock(parent, item) {
+  if (styleState.managerMode !== "generated") return;
+  const referenceId = item?.shared_dependency_reference_id;
+  if (!Number.isInteger(referenceId) || referenceId < 1) return;
+  const section = document.createElement("section");
+  section.className = "manager-prompt-block manager-shared-dependency";
+  const heading = document.createElement("h3");
+  heading.textContent = "의존 공유 그림체";
+  const content = document.createElement("div");
+  content.className = "manager-info-content";
+  const title = item.shared_dependency_reference_title || `공유 이미지 #${referenceId}`;
+  const titleText = document.createElement("span");
+  titleText.textContent = `${title} (#${referenceId})`;
+  content.append(titleText);
+  const sourceUrl = safeManagerExternalUrl(item.shared_dependency_reference_source_url);
+  if (sourceUrl) {
+    const link = document.createElement("a");
+    link.className = "button-link";
+    link.href = sourceUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "원문 열기";
+    link.addEventListener("click", (event) => event.stopPropagation());
+    content.append(" ", link);
+  }
+  section.append(heading, content);
+  parent.append(section);
+}
+
 function managerGenerationText(item) {
   const variety = item.variety_plus === null || item.variety_plus === undefined
     ? "Variety+ 알 수 없음"
@@ -3681,6 +4587,13 @@ function renderStyleManagerDetail(item) {
       headActions.append(deleteButton);
     }
   }
+  const closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.className = "ghost style-manager-detail-close";
+  closeButton.textContent = "상세 닫기";
+  closeButton.setAttribute("aria-label", "상세보기 닫기");
+  closeButton.addEventListener("click", resetStyleManagerDetail);
+  headActions.append(closeButton);
   head.append(heading, headActions);
   const detailGrid = document.createElement("div");
   detailGrid.className = "style-manager-detail-grid";
@@ -3719,6 +4632,7 @@ function renderStyleManagerDetail(item) {
   const prompts = managerPromptParts(item);
   appendManagerPromptBlock(inspector, "작가 · 퀄리티", prompts.primary || "없음", "manager-primary-prompt");
   appendManagerPromptBlock(inspector, "캐릭터", managerCharacterText(item));
+  appendSharedDependencyBlock(inspector, item);
   const negativeToggle = document.createElement("button");
   negativeToggle.type = "button";
   negativeToggle.className = "manager-negative-toggle";
@@ -3741,10 +4655,13 @@ function renderStyleManagerDetail(item) {
   inspector.append(generation);
   detailGrid.append(imageStage, inspector);
   target.append(head, detailGrid);
+  syncStyleManagerDetailSelection();
 }
 
 async function deleteSingleManagerItem(item) {
   if (!await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: styleState.managerMode === "confirmed" ? "style" : "generated",
     title: "항목 삭제",
     message: styleState.managerMode === "confirmed"
       ? `이 확정 그림체와 같은 묶음의 이미지 ${item.image_count || 1}장을 모두 삭제할까요? 원본은 유지됩니다.`
@@ -3760,6 +4677,7 @@ async function deleteSingleManagerItem(item) {
     : { method: "POST", body: JSON.stringify({ image_ids: [item.id] }) };
   try {
     await apiFetch(endpoint, options);
+    styleState.historyDirty = true;
     resetStyleManagerDetail();
     await loadStyleManager();
   } catch (error) {
@@ -4144,15 +5062,15 @@ function confirmedGeneratedSourceValues(item) {
   };
 }
 
-function confirmedSourceValues(item) {
+function confirmedSourceValues(item, sourceMode = styleState.managerMode) {
   if (!item) return {};
-  return styleState.managerMode === "generated" ? confirmedGeneratedSourceValues(item) : item;
+  return sourceMode === "generated" ? confirmedGeneratedSourceValues(item) : item;
 }
 
-function openConfirmedStyleModal(item = null, editing = false) {
-  const source = confirmedSourceValues(item);
+function openConfirmedStyleModal(item = null, editing = false, sourceMode = styleState.managerMode) {
+  const source = confirmedSourceValues(item, sourceMode);
   styleState.confirmedModalSource = !editing && item
-    ? { source_type: styleState.managerMode === "shared" ? "shared" : "generated", source_id: item.id }
+    ? { source_type: sourceMode === "shared" ? "shared" : "generated", source_id: item.id }
     : null;
   styleState.confirmedModalEditId = editing ? item.id : null;
   styleState.confirmedModalPreviewData = source;
@@ -4476,6 +5394,8 @@ function comparisonStyleById(styleId) {
 
 async function deleteComparisonGroup(group) {
   if (!group || !await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: "comparison_group",
     title: "비교군 삭제",
     message: `${group.name}과 생성된 비교 이미지를 모두 삭제할까요?`,
     confirmLabel: "삭제",
@@ -4593,7 +5513,7 @@ function renderComparisonResultDetail(group, item) {
     remove.className = "danger-button";
     remove.textContent = "그림 삭제";
     remove.addEventListener("click", async () => {
-      if (!await globalThis.appDialog.confirm({ title: "비교 그림 삭제", message: "이 그림을 삭제할까요? 나중에 다시 생성할 수 있습니다.", confirmLabel: "삭제", tone: "danger" })) return;
+      if (!await globalThis.appDialog.confirm({ delete: true, delete_category: "comparison_result", title: "비교 그림 삭제", message: "이 그림을 삭제할까요? 나중에 다시 생성할 수 있습니다.", confirmLabel: "삭제", tone: "danger" })) return;
       await apiFetch(`/api/comparison-results/${item.result.id}`, { method: "DELETE" });
       comparisonFocusedResultStyleId = item.styleId;
       await loadComparisons({ openGroupId: group.id });
@@ -5114,6 +6034,154 @@ function toggleStyleSettings() {
   button.setAttribute("aria-label", button.title);
 }
 
+function syncGenerationRemote() {
+  const status = styleElement("generationRemoteStatus");
+  const sourceStatus = styleElement("generationStatus");
+  if (status) status.textContent = sourceStatus?.textContent || (styleState.generating ? "1장 생성 중..." : "대기 중");
+  const one = styleElement("remoteGenerateOne");
+  const start = styleElement("remoteStartContinuous");
+  const pause = styleElement("remotePauseContinuous");
+  const stop = styleElement("remoteStopContinuous");
+  if (one) one.disabled = styleState.generating || styleState.running;
+  if (start) start.disabled = styleState.generating || styleState.running;
+  if (pause) {
+    pause.disabled = !styleState.running;
+    pause.textContent = styleState.paused ? "계속" : "일시정지";
+  }
+  if (stop) stop.disabled = !styleState.running;
+}
+
+function clampGenerationRemotePosition() {
+  const remote = styleElement("generationRemote");
+  if (!remote || remote.classList.contains("hidden")) return;
+  const rect = remote.getBoundingClientRect();
+  const margin = 8;
+  const left = Math.min(Math.max(margin, rect.left), Math.max(margin, window.innerWidth - rect.width - margin));
+  const top = Math.min(Math.max(margin, rect.top), Math.max(margin, window.innerHeight - rect.height - margin));
+  remote.style.left = `${left}px`;
+  remote.style.top = `${top}px`;
+  remote.style.right = "auto";
+  remote.style.bottom = "auto";
+  try { localStorage.setItem(GENERATION_REMOTE_POSITION_KEY, JSON.stringify({ left, top })); } catch (_) { /* Storage can be disabled. */ }
+}
+
+function restoreGenerationRemotePosition() {
+  const remote = styleElement("generationRemote");
+  if (!remote || typeof localStorage === "undefined") return;
+  try {
+    const position = JSON.parse(localStorage.getItem(GENERATION_REMOTE_POSITION_KEY) || "null");
+    if (Number.isFinite(Number(position?.left)) && Number.isFinite(Number(position?.top))) {
+      remote.style.left = `${Number(position.left)}px`;
+      remote.style.top = `${Number(position.top)}px`;
+      remote.style.right = "auto";
+      remote.style.bottom = "auto";
+    }
+  } catch (_) { /* Storage can be disabled. */ }
+}
+
+function setGenerationPanelCollapsed(collapsed) {
+  const layout = styleElement("styleMakerLayout");
+  const panel = styleElement("styleMakerGeneration");
+  const button = styleElement("toggleGenerationPanel");
+  const remote = styleElement("generationRemote");
+  const value = Boolean(collapsed);
+  if (value) styleState.generationRemoteClosed = false;
+  layout?.classList.toggle("generation-collapsed", value);
+  panel?.classList.toggle("is-collapsed", value);
+  if (button) {
+    button.setAttribute("aria-expanded", String(!value));
+    button.setAttribute("aria-label", value ? "프롬프트와 생성 펼치기" : "프롬프트와 생성 접기");
+    button.title = button.getAttribute("aria-label");
+    button.textContent = value ? "‹" : "›";
+  }
+  if (remote) {
+    remote.classList.toggle("hidden", !value || styleState.generationRemoteClosed);
+    if (value) {
+      restoreGenerationRemotePosition();
+      syncGenerationRemote();
+      requestAnimationFrame(clampGenerationRemotePosition);
+    }
+  }
+}
+
+function toggleStyleHistory(open) {
+  const panel = styleElement("styleMakerHistory");
+  const layout = styleElement("styleMakerLayout");
+  const button = styleElement("toggleStyleHistory");
+  const shouldOpen = open === undefined ? panel?.classList.contains("history-collapsed") : Boolean(open);
+  panel?.classList.toggle("history-collapsed", !shouldOpen);
+  layout?.classList.toggle("history-open", shouldOpen);
+  if (button) {
+    button.setAttribute("aria-expanded", String(shouldOpen));
+    button.setAttribute("aria-label", shouldOpen ? "히스토리 닫기" : "히스토리 열기");
+    button.title = button.getAttribute("aria-label");
+  }
+  if (shouldOpen) loadStyleHistory();
+}
+
+function setupGenerationRemoteDrag() {
+  const remote = styleElement("generationRemote");
+  const handle = styleElement("generationRemoteHandle");
+  if (!remote || !handle || handle.dataset.bound === "true") return;
+  handle.dataset.bound = "true";
+  let startX = 0;
+  let startY = 0;
+  let originLeft = 0;
+  let originTop = 0;
+  const finish = () => {
+    styleState.generationRemoteDragging = false;
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", finish);
+    clampGenerationRemotePosition();
+  };
+  const move = (event) => {
+    if (!styleState.generationRemoteDragging) return;
+    remote.style.left = `${originLeft + event.clientX - startX}px`;
+    remote.style.top = `${originTop + event.clientY - startY}px`;
+    remote.style.right = "auto";
+    remote.style.bottom = "auto";
+  };
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || event.target.closest("button")) return;
+    const rect = remote.getBoundingClientRect();
+    startX = event.clientX;
+    startY = event.clientY;
+    originLeft = rect.left;
+    originTop = rect.top;
+    styleState.generationRemoteDragging = true;
+    handle.setPointerCapture?.(event.pointerId);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish, { once: true });
+    event.preventDefault();
+  });
+  handle.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+    const rect = remote.getBoundingClientRect();
+    const delta = event.shiftKey ? 40 : 10;
+    const x = rect.left + (event.key === "ArrowLeft" ? -delta : event.key === "ArrowRight" ? delta : 0);
+    const y = rect.top + (event.key === "ArrowUp" ? -delta : event.key === "ArrowDown" ? delta : 0);
+    remote.style.left = `${x}px`;
+    remote.style.top = `${y}px`;
+    remote.style.right = "auto";
+    remote.style.bottom = "auto";
+    clampGenerationRemotePosition();
+    event.preventDefault();
+  });
+}
+
+function toggleGenerationRemote() {
+  const remote = styleElement("generationRemote");
+  const button = styleElement("toggleGenerationRemote");
+  if (!remote || !button) return;
+  styleState.generationRemoteCollapsed = !styleState.generationRemoteCollapsed;
+  remote.classList.toggle("is-collapsed", styleState.generationRemoteCollapsed);
+  button.setAttribute("aria-expanded", String(!styleState.generationRemoteCollapsed));
+  button.setAttribute("aria-label", styleState.generationRemoteCollapsed ? "리모콘 펼치기" : "리모콘 접기");
+  button.title = button.getAttribute("aria-label");
+  button.textContent = styleState.generationRemoteCollapsed ? "+" : "−";
+  requestAnimationFrame(clampGenerationRemotePosition);
+}
+
 function syncScoreControls() {
   document.querySelectorAll("#styleScoreButtons [data-score]").forEach((button) => {
     const selected = styleState.allowedScores.has(Number(button.dataset.score));
@@ -5144,10 +6212,42 @@ function initializeStyleMaker() {
     syncScoreControls();
   });
   styleElement("weightMode")?.addEventListener("change", (event) => {
+    if (event.target.value !== "shared_dependency") {
+      styleState.sharedDependencyReferenceId = null;
+      styleState.sharedDependencyReference = null;
+      styleState.sharedDependencyReferenceMode = "random";
+      styleState.sharedDependencyScale = null;
+      styleState.sharedDependencyCfgRescale = null;
+    }
     styleElement("customRangeSection")?.classList.toggle("hidden", event.target.value !== "custom");
+    syncSharedDependencyControls();
     renderWeightGraph();
     renderWeightProfilePreview();
   });
+  styleElement("openSharedDependencyReference")?.addEventListener("click", openSharedDependencyReferenceModal);
+  styleElement("randomizeSharedDependencyReference")?.addEventListener("click", randomizeSharedDependencyReference);
+  styleElement("clearSharedDependencyReference")?.addEventListener("click", clearSharedDependencyReference);
+  styleElement("closeSharedDependencyReference")?.addEventListener("click", closeSharedDependencyReferenceModal);
+  styleElement("chooseRandomSharedDependencyReference")?.addEventListener("click", () => {
+    void randomizeSharedDependencyReference();
+    styleState.sharedDependencyReferenceMode = "random";
+    renderSharedDependencyReferenceSummary();
+  });
+  styleElement("rerollSharedDependencyReference")?.addEventListener("click", () => void randomizeSharedDependencyReference());
+  styleElement("sharedDependencyReferenceSearch")?.addEventListener("input", () => {
+    clearTimeout(styleState.managerFilterTimer);
+    styleState.managerFilterTimer = setTimeout(() => {
+      styleState.sharedDependencyPickerPage = 1;
+      void loadSharedDependencyReferencePage(1);
+    }, 220);
+  });
+  styleElement("sharedDependencyReferencePrev")?.addEventListener("click", () => {
+    void loadSharedDependencyReferencePage(styleState.sharedDependencyPickerPage - 1);
+  });
+  styleElement("sharedDependencyReferenceNext")?.addEventListener("click", () => {
+    void loadSharedDependencyReferencePage(styleState.sharedDependencyPickerPage + 1);
+  });
+  document.querySelectorAll("[data-close-shared-dependency-reference]").forEach((item) => item.addEventListener("click", closeSharedDependencyReferenceModal));
   styleElement("addWeightRange")?.addEventListener("click", addWeightRange);
   styleElement("toggleStyleSettings")?.addEventListener("click", toggleStyleSettings);
   styleElement("rerollStyleArtists")?.addEventListener("click", () => loadStyleArtists("artists"));
@@ -5288,9 +6388,18 @@ function initializeStyleMaker() {
     "generationCount",
     "sharedStyleArtistMin",
     "sharedStyleArtistMax",
+    "sharedDependencyFixedRatio",
+    "sharedDependencyReferenceRatio",
+    "sharedDependencyRatedRatio",
+    "sharedDependencyOtherRatio",
+    "sharedDependencyArtistPolicy",
   ].forEach((id) => styleElement(id)?.addEventListener("change", () => {
     savePromptDraft();
     renderRatingTagRuleCountSummary();
+    if (id === "sharedDependencyArtistPolicy") {
+      styleState.sharedDependencyArtistPolicy = normalizeSharedDependencyArtistPolicy(styleElement(id)?.value);
+    }
+    if (id.startsWith("sharedDependency")) renderSharedDependencyRatioSummary();
   }));
   ["styleMinWeight", "styleMaxWeight"].forEach((id) => styleElement(id)?.addEventListener("change", renderWeightGraph));
   styleElement("styleArtistCount")?.addEventListener("change", () => {
@@ -5318,7 +6427,9 @@ function initializeStyleMaker() {
   syncScoreControls();
   renderWeightProfilePreview();
   loadRatedStyleArtists();
+  styleState.artists = loadFixedStyleArtists();
   loadStyleArtists();
+  renderQueueState();
 }
 
 if (typeof document !== "undefined") {
@@ -5336,6 +6447,13 @@ if (typeof document !== "undefined") {
   styleElement("closeSettings")?.addEventListener("click", closeSettingsModal);
   document.querySelectorAll("[data-close-settings]").forEach((item) => item.addEventListener("click", closeSettingsModal));
   styleElement("saveNovelAiKey")?.addEventListener("click", saveNovelAiKey);
+  styleElement("saveAppPreferences")?.addEventListener("click", saveAppPreferences);
+  styleElement("selectAllDeleteConfirmations")?.addEventListener("click", () => {
+    document.querySelectorAll("[data-delete-confirmation-category]").forEach((checkbox) => { checkbox.checked = true; });
+  });
+  styleElement("clearAllDeleteConfirmations")?.addEventListener("click", () => {
+    document.querySelectorAll("[data-delete-confirmation-category]").forEach((checkbox) => { checkbox.checked = false; });
+  });
   styleElement("testNovelAiKey")?.addEventListener("click", testNovelAiKey);
   styleElement("deleteNovelAiKey")?.addEventListener("click", deleteNovelAiKey);
   styleElement("refreshStyleManager")?.addEventListener("click", loadStyleManager);
@@ -5470,6 +6588,11 @@ if (typeof document !== "undefined") {
   styleElement("generatedImagePrev")?.addEventListener("click", () => moveGeneratedImage(-1));
   styleElement("generatedImageNext")?.addEventListener("click", () => moveGeneratedImage(1));
   document.addEventListener("keydown", (event) => {
+    const sharedDependencyModal = styleElement("sharedDependencyReferenceModal");
+    if (sharedDependencyModal && !sharedDependencyModal.classList.contains("hidden")) {
+      if (event.key === "Escape") closeSharedDependencyReferenceModal();
+      return;
+    }
     const promptPresetModal = styleElement("promptPresetModal");
     if (promptPresetModal && !promptPresetModal.classList.contains("hidden")) {
       if (event.key === "Escape") closePromptPresetModal();
@@ -5495,14 +6618,43 @@ if (typeof document !== "undefined") {
       return;
     }
   });
+  styleElement("toggleGenerationPanel")?.addEventListener("click", () => {
+    setGenerationPanelCollapsed(!styleElement("styleMakerGeneration")?.classList.contains("is-collapsed"));
+  });
+  styleElement("toggleStyleHistory")?.addEventListener("click", () => toggleStyleHistory());
+  styleElement("closeStyleHistory")?.addEventListener("click", () => toggleStyleHistory(false));
+  styleElement("refreshStyleHistory")?.addEventListener("click", () => loadStyleHistory({ force: true }));
+  styleElement("toggleGenerationRemote")?.addEventListener("click", toggleGenerationRemote);
+  styleElement("closeGenerationRemote")?.addEventListener("click", () => {
+    styleState.generationRemoteClosed = true;
+    styleElement("generationRemote")?.classList.add("hidden");
+  });
+  styleElement("remoteGenerateOne")?.addEventListener("click", () => generateOneRandomizedStyle().catch(() => {}));
+  styleElement("remoteStartContinuous")?.addEventListener("click", runContinuousGeneration);
+  styleElement("remotePauseContinuous")?.addEventListener("click", () => {
+    styleState.paused = !styleState.paused;
+    renderQueueState();
+  });
+  styleElement("remoteStopContinuous")?.addEventListener("click", () => {
+    styleState.stopRequested = true;
+    styleState.paused = false;
+    renderQueueState();
+  });
+  setupGenerationRemoteDrag();
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     STYLE_REQUEST_CONTROL_IDS,
     CUSTOM_RANGE_FIELDS,
+    STYLE_FIXED_ARTISTS_STORAGE_KEY,
+    normalizeSharedDependencyArtistPolicy,
     applyStyleRerollResult,
     buildStyleRequestPayload,
+    applySharedDependencyReference,
+    normalizeStoredFixedStyleArtists,
+    saveFixedStyleArtists,
+    loadFixedStyleArtists,
     normalizeRandomTargets,
     pickRandomPreset,
     normalizeSelectedScores,
@@ -5524,6 +6676,7 @@ if (typeof module !== "undefined" && module.exports) {
     chooseArtistsForPrompt,
     fixedArtistOverlayCoordinates,
     graphInsertionPositionFromRatio,
+    openWeightGraphModal,
     moveSelectedArtistsToPosition,
     hasProfileDragMoved,
     normalizeStoredPrompts,
@@ -5556,7 +6709,20 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeRatingExcludeTags,
     validateRatingExcludeTags,
     opusFreeGenerationIssues,
+    normalizeStyleHistoryItem,
+    styleHistoryArtistPrompt,
+    styleHistoryPreviewMeta,
+    deleteConfirmationEnabledFromSkip,
+    skipDeleteConfirmationFromEnabled,
     normalizeComparisonCharacterPrompts,
     normalizeNumericPromptClosers,
+    sharedDependencyParameterValue,
+    normalizeSharedDependencyRatios,
+    sharedDependencyControlsState,
+    normalizeSharedDependencyReferenceItem,
+    sharedDependencyReferenceQuery,
+    setSharedDependencyReference,
+    clearSharedDependencyReference,
+    setSharedDependencyReferenceFromArca,
   };
 }

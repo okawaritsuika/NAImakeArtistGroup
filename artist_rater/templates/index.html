@@ -10,7 +10,7 @@
     <header class="topbar">
       <div>
         <h1>Danbooru Artist Rater</h1>
-        <p>2025-01-31 이전 Danbooru 게시물만 사용합니다.</p>
+        <p>작가 뽑기 조건에서 선택한 기준일까지 Danbooru 게시물을 사용합니다.</p>
       </div>
       <nav class="tabs">
         <button class="tab active" data-tab="pick">작가 뽑기</button>
@@ -20,7 +20,7 @@
         <button class="tab" data-tab="comparison">비교군 관리</button>
         <button class="tab" data-tab="arca-style-collector">공유 그림체 수집</button>
         <button class="tab" data-tab="arca-style-statistics">작가·퀄리티 분석</button>
-        <button id="openSettings" class="icon-button" type="button" title="NovelAI 설정" aria-label="NovelAI 설정">⚙</button>
+      <button id="openSettings" class="icon-button" type="button" title="설정" aria-label="설정">⚙</button>
       </nav>
     </header>
 
@@ -38,21 +38,17 @@
               <div id="autocomplete" class="autocomplete hidden"></div>
             </label>
             <label class="field">
-              <span>제외할 태그/프롬프트</span>
+              <span class="field-label"><span>제외할 태그/프롬프트</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-exclude-query" aria-label="제외 조건 설명">i</button><span id="help-exclude-query" class="help-tooltip-content" role="tooltip">뽑힌 작가와 이 조건을 함께 검색해 결과가 있으면 해당 작가를 제외합니다.</span></span></span>
               <textarea id="excludeQueryText" placeholder="예: ai-generated, 3d"></textarea>
               <div id="excludeAutocomplete" class="autocomplete hidden"></div>
-              <small class="help-text">뽑힌 작가와 이 조건을 함께 검색해 결과가 있으면 해당 작가를 제외합니다.</small>
             </label>
             <div class="notice">
               <p>이미 평가한 작가는 자동으로 제외됩니다.</p>
               <p>이미지는 다음 작가를 볼 때만 가져옵니다.</p>
             </div>
             <label class="field">
-              <span>최소 전체 게시물 수</span>
+              <span class="field-label"><span>최소 전체 게시물 수</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-min-posts" aria-label="게시물 수 필터 설명">i</button><span id="help-min-posts" class="help-tooltip-content" role="tooltip">1000은 꽤 강한 필터입니다. 특정 소품·구도 태그에서는 100~300으로 낮추면 후보가 훨씬 늘어납니다.</span></span></span>
               <input id="minArtistPostCount" type="number" min="0" value="1000">
-              <small class="help-text">
-                1000은 꽤 강한 필터입니다. 특정 소품/구도 태그에서는 100~300으로 낮추면 후보가 훨씬 늘어납니다.
-              </small>
             </label>
             <label class="field">
               <span>태그 조건 내 최소 출현 수</span>
@@ -86,21 +82,26 @@
                 <option>16</option>
               </select>
             </label>
+            <label class="field">
+              <span>작가 뽑기 기준일</span>
+              <select id="candidateCutoffPreset">
+                <option value="2025-01-31" selected>2025-01-31</option>
+                <option value="2026-06-15">2026-06-15</option>
+                <option value="custom">직접 지정</option>
+              </select>
+              <input id="candidateCutoffDate" type="date" value="" aria-label="작가 뽑기 기준일 직접 지정" disabled hidden>
+            </label>
             <label class="candidate-option">
               <input id="latestSamples" type="checkbox">
               <span>최신 그림 우선 표시</span>
             </label>
             <label class="field">
-              <span>랜덤 방식</span>
+              <span class="field-label"><span>랜덤 방식</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-random-mode" aria-label="랜덤 방식 설명">i</button><span id="help-random-mode" class="help-tooltip-content" role="tooltip">uniform은 모든 후보를 같은 확률로 뽑고, weighted는 조건에 많이 맞는 작가를 강하게 우대합니다. soft_weighted는 그 중간입니다.</span></span></span>
               <select id="randomMode">
                 <option value="soft_weighted" selected>soft_weighted</option>
                 <option value="weighted">weighted</option>
                 <option value="uniform">uniform</option>
               </select>
-              <small class="help-text">
-                uniform은 모든 후보를 같은 확률로 뽑고, weighted는 조건에 많이 맞는 작가를 강하게 우대합니다.
-                soft_weighted는 그 중간으로, 많이 나온 작가를 조금 우대하되 한쪽으로 너무 쏠리지 않게 합니다.
-              </small>
             </label>
             <button id="candidateButton" class="primary">새 후보 검색</button>
           </aside>
@@ -238,6 +239,8 @@
                     <span>작가 수</span>
                     <input id="styleArtistCount" type="number" min="1" value="12">
                   </label>
+                  <p id="sharedDependencyCountStatus" class="help-text hidden">공유 그림체 의존에서는 기준 그림체의 고유 작가 수를 사용합니다.</p>
+                  <div class="field-label tooltip-section-label"><span>공유 작가 범위</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-shared-range" aria-label="공유 작가 범위 설명">i</button><span id="help-shared-range" class="help-tooltip-content" role="tooltip">기존 모드에서는 고정 작가를 제외한 자리에 공유 그림체 작가를 최소~최대 명 넣습니다. 공유 그림체 의존에서는 이 입력을 사용하지 않습니다.</span></span></div>
                   <div class="compact-fields">
                     <label class="field">
                       <span>공유 작가 최소</span>
@@ -248,28 +251,29 @@
                       <input id="sharedStyleArtistMax" type="number" min="0" max="50" value="0">
                     </label>
                   </div>
-                  <p class="help-text">고정 작가를 제외한 남은 자리에 공유 그림체 작가를 최소~최대 명 넣습니다. 둘을 같게 하면 고정 인원이며 0/0이면 남은 자리를 평가 작가에서 뽑습니다.</p>
                   <div class="field">
-                    <span>평가 작가 태그별 인원</span>
+                    <span class="field-label"><span>평가 작가 태그별 인원</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-rating-rules" aria-label="평가 태그 인원 설명">i</button><span id="help-rating-rules" class="help-tooltip-content" role="tooltip">여러 태그에 각각 몇 명을 넣을지 정할 수 있습니다. 지정한 인원을 제외한 남은 자리는 평가 작가에서 무작위로 뽑습니다.</span></span></span>
                     <button id="openRatingTagRules" type="button">태그별 인원 설정</button>
                     <div id="ratingTagRulesSummary" class="rating-tag-rules-summary">설정 없음 · 남은 자리는 전체 평가 작가에서 선택</div>
                   </div>
-                  <p class="help-text">여러 태그에 각각 몇 명을 넣을지 정할 수 있습니다. 지정한 인원을 제외한 남은 자리는 모든 평가 작가에서 무작위로 뽑습니다.</p>
                 </div>
               </details>
               <details class="style-settings-section" open>
                 <summary>허용 평점</summary>
-                <fieldset class="style-fieldset style-settings-section-body">
-                  <legend>점수 선택</legend>
-                  <div id="styleScoreButtons" class="segmented" aria-label="허용 평점 다중 선택">
-                    <button class="active" type="button" data-score="1" aria-pressed="true">1</button>
-                    <button class="active" type="button" data-score="2" aria-pressed="true">2</button>
-                    <button class="active" type="button" data-score="3" aria-pressed="true">3</button>
-                    <button class="active" type="button" data-score="4" aria-pressed="true">4</button>
-                    <button class="active" type="button" data-score="5" aria-pressed="true">5</button>
-                  </div>
-                  <label class="check-row"><input id="styleScoreAll" type="checkbox" checked> 전체 선택</label>
-                </fieldset>
+                <div class="style-settings-section-body">
+                  <label class="check-row"><input id="preferHighScores" type="checkbox"> 높은 평점 우선</label>
+                  <fieldset class="style-fieldset">
+                    <legend>점수 선택</legend>
+                    <div id="styleScoreButtons" class="segmented" aria-label="허용 평점 다중 선택">
+                      <button class="active" type="button" data-score="1" aria-pressed="true">1</button>
+                      <button class="active" type="button" data-score="2" aria-pressed="true">2</button>
+                      <button class="active" type="button" data-score="3" aria-pressed="true">3</button>
+                      <button class="active" type="button" data-score="4" aria-pressed="true">4</button>
+                      <button class="active" type="button" data-score="5" aria-pressed="true">5</button>
+                    </div>
+                    <label class="check-row"><input id="styleScoreAll" type="checkbox" checked> 전체 선택</label>
+                  </fieldset>
+                </div>
               </details>
               <details class="style-settings-section" open>
                 <summary>가중치 설정</summary>
@@ -280,8 +284,31 @@
                       <option value="random">랜덤</option>
                       <option value="balanced" selected>균형</option>
                       <option value="profile">사용자 그래프</option>
+                      <option value="shared_dependency">공유 그림체 의존</option>
                     </select>
                   </label>
+                  <div id="sharedDependencySettings" class="shared-dependency-settings hidden">
+                    <details id="sharedDependencyReferencePicker" class="shared-dependency-reference-picker" open>
+                      <summary id="sharedDependencyReferenceSummary" class="shared-dependency-reference-summary" aria-live="polite">랜덤 기준 그림체 · 아직 선택하지 않음</summary>
+                      <div class="shared-dependency-reference-picker-body">
+                        <div class="field-label">기준 그림체</div>
+                        <div class="shared-dependency-reference-actions">
+                          <button id="openSharedDependencyReference" type="button">기준 그림체 선택</button>
+                          <button id="randomizeSharedDependencyReference" class="ghost" type="button">다른 그림 랜덤</button>
+                          <button id="clearSharedDependencyReference" class="ghost" type="button" disabled>고정 해제 · 랜덤으로</button>
+                        </div>
+                      </div>
+                    </details>
+                    <label class="field"><span>기준 작가 선택</span><select id="sharedDependencyArtistPolicy"><option value="highest" selected>가중치 우선</option><option value="random">랜덤</option></select></label>
+                    <div class="field-label tooltip-section-label"><span>공급원 비율</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-shared-ratios" aria-label="공유 그림체 의존 비율 설명">i</button><span id="help-shared-ratios" class="help-tooltip-content" role="tooltip">기준 이미지의 고유 작가 수가 최종 작가 수입니다. 비율에 따라 소수점이 큰 항목부터 남은 인원을 배정합니다. 기준 작가 선택에서 가중치 우선 또는 랜덤을 고를 수 있습니다.</span></span></div>
+                    <div class="shared-dependency-ratio-grid">
+                      <label class="field"><span>고정 작가 %</span><input id="sharedDependencyFixedRatio" type="number" min="0" max="100" step="1" value="0"></label>
+                      <label class="field"><span>기준 그림체 %</span><input id="sharedDependencyReferenceRatio" type="number" min="0" max="100" step="1" value="100"></label>
+                      <label class="field"><span>평가 작가 %</span><input id="sharedDependencyRatedRatio" type="number" min="0" max="100" step="1" value="0"></label>
+                      <label class="field"><span>다른 공유 그림체 %</span><input id="sharedDependencyOtherRatio" type="number" min="0" max="100" step="1" value="0"></label>
+                    </div>
+                    <p id="sharedDependencyRatioSummary" class="help-text">합계 100% · 후보가 부족하면 0%가 아닌 공급원으로 재분배합니다.</p>
+                  </div>
                   <div class="compact-fields">
                     <label class="field">
                       <span>최소</span>
@@ -292,7 +319,6 @@
                       <input id="styleMaxWeight" type="number" min="0.1" max="2.3" step="0.1" value="2.3">
                     </label>
                   </div>
-                  <label class="check-row"><input id="preferHighScores" type="checkbox"> 높은 평점 우선</label>
                   <button id="openWeightGraph" class="weight-graph-preview-button" type="button" title="가중치 그래프 편집">
                     <span>자리별 가중치 그래프</span>
                     <svg id="weightGraphPreview" viewBox="0 0 240 100" aria-hidden="true"></svg>
@@ -303,7 +329,7 @@
                 <summary>가중치 표</summary>
                 <div class="style-settings-section-body">
                   <div class="style-subhead compact">
-                    <span>여기서도 바로 수정</span>
+                    <span class="field-label"><span>여기서도 바로 수정</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-weight-table" aria-label="가중치 표 설명">i</button><span id="help-weight-table" class="help-tooltip-content" role="tooltip">순서 0은 그림을 만들 때마다 랜덤 위치입니다. “랜덤”을 켠 가중치는 현재 최소~최대 범위에서 매번 다시 정합니다.</span></span></span>
                     <button id="openWeightTable" type="button">크게 보기</button>
                   </div>
                   <div class="style-artist-table-scroll">
@@ -316,7 +342,6 @@
                     </div>
                     <div id="styleArtistList" class="style-artist-list"></div>
                   </div>
-                  <p class="help-text">순서 0은 그림을 만들 때마다 랜덤 위치입니다. “랜덤”을 켠 가중치는 입력값 대신 현재 최소~최대 범위에서 매번 다시 정합니다.</p>
                 </div>
               </details>
               <div id="styleSettingsError" class="status" role="alert"></div>
@@ -363,7 +388,13 @@
           </section>
 
           <aside id="styleMakerGeneration" class="style-maker-pane style-maker-generation">
-            <div class="style-pane-head"><h2>프롬프트와 생성</h2></div>
+            <div class="style-pane-head">
+              <h2>프롬프트와 생성</h2>
+              <div class="style-pane-head-actions">
+                <button id="toggleGenerationPanel" class="icon-button ghost" type="button" title="프롬프트와 생성 접기" aria-label="프롬프트와 생성 접기" aria-expanded="true">›</button>
+                <button id="toggleStyleHistory" class="icon-button ghost" type="button" title="히스토리 열기" aria-label="히스토리 열기" aria-expanded="false">▤</button>
+              </div>
+            </div>
             <div class="generation-scroll">
               <div class="prompt-workspace">
                 <section class="artist-prompt-token-section" aria-labelledby="artistPromptTokenTitle">
@@ -400,10 +431,9 @@
                     <div id="basePromptTokens" class="prompt-token-surface" data-prompt-field="base" aria-label="기본 프롬프트 토큰"></div>
                   </label>
                   <label class="field fixed-prompt-editor">
-                    <span>고정 태그 · 퀄리티 프롬프트 다음에 항상 포함</span>
+                    <span class="field-label"><span>고정 태그 · 퀄리티 프롬프트 다음에 항상 포함</span><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-fixed-prompt" aria-label="고정 태그 설명">i</button><span id="help-fixed-prompt" class="help-tooltip-content" role="tooltip">수집 세트 적용이나 매 장 랜덤 변경의 영향을 받지 않습니다.</span></span></span>
                     <textarea id="fixedPrompt" autocomplete="off" placeholder="upper body, white sheet"></textarea>
                     <div id="fixedPromptAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div>
-                    <span class="help-text">수집 세트 적용이나 매 장 랜덤 변경의 영향을 받지 않습니다.</span>
                   </label>
                 </section>
                 <label id="negativePromptPanel" class="field prompt-editor negative hidden" role="tabpanel" aria-labelledby="negativePromptTab">
@@ -465,7 +495,42 @@
               <div id="generationStatus" class="status" role="status"></div>
             </div>
           </aside>
+
+          <aside id="styleMakerHistory" class="style-maker-pane style-maker-history history-collapsed" aria-label="그림체 제작 히스토리">
+            <div class="style-pane-head">
+              <h2>히스토리</h2>
+              <div class="style-pane-head-actions">
+                <button id="refreshStyleHistory" class="icon-button ghost" type="button" title="히스토리 새로고침" aria-label="히스토리 새로고침">↻</button>
+                <button id="closeStyleHistory" class="icon-button ghost" type="button" title="히스토리 닫기" aria-label="히스토리 닫기">×</button>
+              </div>
+            </div>
+            <div class="style-history-scroll">
+              <div id="styleHistoryStatus" class="status" role="status"></div>
+              <section id="styleHistoryDetail" class="style-history-detail" aria-live="polite">
+                <div class="latest-result-placeholder">생성 기록을 선택하면 자세히 볼 수 있습니다.</div>
+              </section>
+              <div id="styleHistoryList" class="style-history-list"></div>
+            </div>
+          </aside>
         </div>
+        <section id="generationRemote" class="generation-remote hidden" aria-label="생성 리모콘">
+          <div id="generationRemoteHandle" class="generation-remote-head" tabindex="0" role="button" aria-label="생성 리모콘 이동 핸들">
+            <strong>생성 리모콘</strong>
+            <div class="generation-remote-head-actions">
+              <button id="toggleGenerationRemote" class="icon-button ghost" type="button" title="리모콘 접기" aria-label="리모콘 접기" aria-expanded="true">−</button>
+              <button id="closeGenerationRemote" class="icon-button ghost" type="button" title="리모콘 닫기" aria-label="리모콘 닫기">×</button>
+            </div>
+          </div>
+          <div class="generation-remote-body">
+            <div id="generationRemoteStatus" class="generation-remote-status" role="status">대기 중</div>
+            <div class="generation-remote-actions">
+              <button id="remoteGenerateOne" class="primary" type="button">1장</button>
+              <button id="remoteStartContinuous" class="primary" type="button">연속</button>
+              <button id="remotePauseContinuous" type="button" disabled>일시정지</button>
+              <button id="remoteStopContinuous" class="ghost" type="button" disabled>중지</button>
+            </div>
+          </div>
+        </section>
       </section>
 
       <section id="style-manager-tab" class="view style-manager-view">
@@ -839,12 +904,31 @@
     <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
       <div class="modal-backdrop" data-close-settings></div>
       <section class="modal-dialog compact-modal">
-        <div class="modal-head"><h2 id="settingsTitle">NovelAI 설정</h2><button id="closeSettings" class="ghost" type="button">닫기</button></div>
+        <div class="modal-head"><h2 id="settingsTitle">설정</h2><button id="closeSettings" class="ghost" type="button">닫기</button></div>
         <label class="field"><span>App Key</span><input id="novelAiAppKey" type="password" autocomplete="off" placeholder="저장된 키는 다시 표시하지 않습니다"></label>
+        <fieldset class="delete-confirmation-settings">
+          <legend>삭제 전 확인</legend>
+          <p class="help-text">선택한 종류는 삭제 전에 확인합니다. 기본값은 모두 확인이며, 생성 후보 재수집·Anlas 사용 같은 일반 확인은 유지됩니다.</p>
+          <div class="delete-confirmation-grid">
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="rating_example"> 평가 예제 이미지</label>
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="rating"> 평가 기록</label>
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="generated"> 생성 기록·결과</label>
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="style"> 그림체</label>
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="arca_style"> 수집 그림체</label>
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="comparison_group"> 비교군</label>
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="comparison_result"> 비교 이미지</label>
+            <label class="check-row"><input type="checkbox" checked data-delete-confirmation-category="novelai_key"> NovelAI App Key</label>
+          </div>
+          <div class="delete-confirmation-shortcuts">
+            <button id="selectAllDeleteConfirmations" type="button">전체 확인</button>
+            <button id="clearAllDeleteConfirmations" type="button">전체 확인 안 함</button>
+          </div>
+        </fieldset>
         <div id="novelAiSettingsStatus" class="status" role="status"></div>
         <div class="modal-actions">
           <button id="testNovelAiKey" type="button">연결 테스트</button>
           <button id="deleteNovelAiKey" class="ghost" type="button">키 삭제</button>
+          <button id="saveAppPreferences" class="ghost" type="button">설정 저장</button>
           <button id="saveNovelAiKey" class="primary" type="button">저장</button>
         </div>
       </section>
@@ -861,8 +945,7 @@
         <div id="ratingTagRulesList" class="rating-tag-rules-list"></div>
         <button id="addRatingTagRule" type="button">+ 태그 조건 추가</button>
         <div class="rating-tag-exclusion-head">
-          <strong>수집 태그로 작가 제외</strong>
-          <span class="help-text">아래 태그로 평가·수집한 작가는 태그 지정 자리와 남은 전체 평가 작가 자리에서 모두 제외합니다.</span>
+          <span class="field-label"><strong>수집 태그로 작가 제외</strong><span class="help-tooltip-wrap"><button class="help-tooltip-button" type="button" aria-describedby="help-rating-exclusion" aria-label="평가 작가 제외 설명">i</button><span id="help-rating-exclusion" class="help-tooltip-content" role="tooltip">아래 태그로 평가·수집한 작가는 태그 지정 자리와 남은 전체 평가 작가 자리에서 모두 제외합니다.</span></span></span>
         </div>
         <div id="ratingTagExclusionsList" class="rating-tag-rules-list rating-tag-exclusions-list"></div>
         <button id="addRatingTagExclusion" type="button">+ 제외 태그 추가</button>
@@ -898,6 +981,31 @@
       </section>
     </div>
 
+    <div id="sharedDependencyReferenceModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="sharedDependencyReferenceTitle">
+      <div class="modal-backdrop" data-close-shared-dependency-reference></div>
+      <section class="modal-dialog shared-dependency-reference-dialog">
+        <div class="modal-head">
+          <div><h2 id="sharedDependencyReferenceTitle">기준 그림체 선택</h2><p>작가가 인식된 공유 그림체 이미지만 고정 기준으로 사용할 수 있습니다.</p></div>
+          <button id="closeSharedDependencyReference" class="ghost" type="button">닫기</button>
+        </div>
+        <div class="shared-dependency-reference-toolbar">
+          <label class="field"><span>검색</span><input id="sharedDependencyReferenceSearch" type="search" placeholder="제목, 작가, 프롬프트"></label>
+          <button id="chooseRandomSharedDependencyReference" type="button">랜덤 모드</button>
+          <button id="rerollSharedDependencyReference" class="ghost" type="button">다른 그림 랜덤</button>
+        </div>
+        <div id="sharedDependencyReferenceStatus" class="status" role="status"></div>
+        <div class="shared-dependency-reference-browser">
+          <div id="sharedDependencyReferenceList" class="shared-dependency-reference-list" aria-label="공유 그림체 이미지 목록"></div>
+          <section id="sharedDependencyReferenceDetail" class="shared-dependency-reference-detail" aria-live="polite"><p class="latest-result-placeholder">그림을 선택해 주세요.</p></section>
+        </div>
+        <nav class="shared-dependency-reference-pagination" aria-label="기준 그림체 목록 페이지">
+          <button id="sharedDependencyReferencePrev" type="button">이전</button>
+          <span id="sharedDependencyReferencePageSummary">1 / 1 페이지</span>
+          <button id="sharedDependencyReferenceNext" type="button">다음</button>
+        </nav>
+      </section>
+    </div>
+
     <div id="weightGraphModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="weightGraphTitle">
       <div class="modal-backdrop" data-close-weight-graph></div>
       <section class="modal-dialog weight-graph-dialog">
@@ -924,13 +1032,16 @@
 
     <div id="manualPreviewModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="manualPreviewTitle">
       <div class="modal-backdrop" data-close-manual-preview></div>
-      <section class="modal-dialog">
-        <div class="modal-head">
+      <section class="modal-dialog manual-preview-dialog">
+        <div class="modal-head manual-preview-head">
           <div>
             <h2 id="manualPreviewTitle">작가 그림 보기</h2>
             <p id="manualPreviewArtist" class="prompt"></p>
           </div>
-          <button id="manualPreviewClose" class="ghost" aria-label="닫기">닫기</button>
+          <div class="modal-head-actions manual-preview-actions">
+            <button id="manualPreviewLoadMore" class="primary" type="button">추가 예제 조회</button>
+            <button id="manualPreviewClose" class="ghost" type="button" aria-label="닫기">닫기</button>
+          </div>
         </div>
         <div id="manualPreviewStatus" class="status"></div>
         <div id="manualPreviewViewer" class="viewer hidden">
@@ -940,6 +1051,11 @@
             <div class="image-footer">
               <span id="manualPreviewCounter"></span>
               <a id="manualPreviewLink" href="#" target="_blank" rel="noreferrer">Danbooru post 열기</a>
+              <div class="manual-preview-example-actions">
+                <span id="manualPreviewRepresentativeBadge" class="manual-preview-representative-badge hidden">대표 썸네일</span>
+                <button id="manualPreviewSetThumbnail" class="secondary" type="button">대표 썸네일로 지정</button>
+                <button id="manualPreviewDeleteExample" class="ghost" type="button">이 예제 삭제</button>
+              </div>
             </div>
           </div>
           <button id="manualPreviewNext" class="arrow" aria-label="다음 이미지">›</button>

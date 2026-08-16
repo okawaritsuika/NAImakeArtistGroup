@@ -3,6 +3,7 @@ import copy
 import gzip
 import io
 import json
+import math
 import re
 import sqlite3
 import struct
@@ -2649,6 +2650,67 @@ def get_shared_style_artist_pool(db_path):
         {"artist": artist, "sample_count": count}
         for artist, count in sorted(counts.items(), key=lambda entry: (-entry[1], entry[0]))
     ]
+
+
+def get_shared_style_dependency_images(db_path):
+    """Return local shared images whose prompt contains parseable artist tags.
+
+    This intentionally uses the local shared-image board/source filters and
+    image-level metadata only. It never refreshes or downloads remote data.
+    """
+    candidates = []
+    # Image-level metadata is sufficient for parsing; an item prompt is not
+    # required when the collected image itself has valid PNG metadata.
+    clauses = [
+        "item.metadata_status = 'ok'",
+        "image.metadata_status = 'ok'",
+        "TRIM(COALESCE(NULLIF(image.base_prompt,''),image.prompt,'')) <> ''",
+        "item.board_tab IN ('NAI','R18_NAI')",
+        "((item.title LIKE '%그림체%' AND item.title LIKE '%공유%') OR EXISTS ("
+        "SELECT 1 FROM arca_collection_jobs direct_job "
+        "WHERE json_extract(direct_job.request_json,'$.source_url')=item.source_url))",
+    ]
+    sql = (
+        "SELECT image.id,image.item_id,image.image_url,image.image_path,image.scale,image.cfg_rescale,"
+        "item.title,item.source_url,COALESCE(NULLIF(image.base_prompt,''),image.prompt) AS base_prompt "
+        "FROM arca_style_images image JOIN arca_style_items item ON item.id=image.item_id "
+        "WHERE " + " AND ".join(clauses) + " ORDER BY image.id"
+    )
+    with closing(_connect(db_path)) as conn:
+        source_rows = conn.execute(sql).fetchall()
+    for row in source_rows:
+        artists = []
+        seen = set()
+        for parsed in parse_weighted_prompt_tags(row["base_prompt"]):
+            canonical = _canonical_artist_tag(parsed["tag"])
+            if not canonical:
+                continue
+            artist = canonical.split(":", 1)[1].strip().replace(" ", "_")
+            normalized = artist.casefold()
+            if not artist or normalized in seen:
+                continue
+            try:
+                weight = float(parsed.get("weight", 1.0))
+            except (TypeError, ValueError, OverflowError):
+                weight = 1.0
+            if not math.isfinite(weight) or weight <= 0:
+                weight = 1.0
+            artists.append({"artist": artist, "weight": round(weight, 6)})
+            seen.add(normalized)
+        if not artists:
+            continue
+        candidates.append({
+            "id": int(row["id"]),
+            "item_id": int(row["item_id"]),
+            "source_url": row["source_url"] or "",
+            "title": row["title"] or "",
+            "image_url": row["image_url"] or "",
+            "image_path": row["image_path"] or "",
+            "artists": artists,
+            "scale": row["scale"],
+            "cfg_rescale": row["cfg_rescale"],
+        })
+    return candidates
 
 
 def get_style_maker_prompt_presets(db_path, artists=None, limit=30):

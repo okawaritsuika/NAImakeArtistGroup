@@ -445,6 +445,23 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertLess(selection_branch, detail_load)
         self.assertNotIn('return;', self.script[selection_branch:detail_load])
 
+    def test_style_manager_detail_selection_is_distinct_and_closable(self):
+        for marker in (
+            'button.dataset.styleManagerId = String(style.id);',
+            'button.classList.toggle("detail-active", Boolean(detailActive));',
+            'button.setAttribute("aria-current", "true");',
+            'function syncStyleManagerDetailSelection()',
+            'button.removeAttribute("aria-current");',
+            'closeButton.className = "ghost style-manager-detail-close";',
+            'closeButton.textContent = "상세 닫기";',
+            'closeButton.addEventListener("click", resetStyleManagerDetail);',
+            'syncStyleManagerDetailSelection();',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script)
+        self.assertIn('.style-manager-item.detail-active', self.css)
+        self.assertIn('outline: 2px solid var(--accent-strong);', self.css)
+
     def test_confirmed_style_import_supports_multiple_images_folders_and_group_navigation(self):
         for marker in (
             'id="confirmedStyleFile" class="hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple',
@@ -590,6 +607,127 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn('await confirmGenerationAnlasRisk("single")', source)
         self.assertIn('await confirmGenerationAnlasRisk("continuous")', source)
 
+    def test_settings_modal_and_delete_confirmation_categories_match_each_action(self):
+        source = JS_PATH.read_text(encoding="utf-8")
+        arca_source = (ROOT / "static" / "arca_style_collector.js").read_text(encoding="utf-8")
+        self.assertIn('id="openSettings" class="icon-button" type="button" title="설정" aria-label="설정"', self.html)
+        self.assertIn('<h2 id="settingsTitle">설정</h2>', self.html)
+        self.assertIn("<legend>삭제 전 확인</legend>", self.html)
+        self.assertIn("기본값은 모두 확인", self.html)
+        self.assertIn("전체 확인 안 함", self.html)
+        self.assertIn("deleteConfirmationEnabledFromSkip", source)
+        self.assertIn("skipDeleteConfirmationFromEnabled", source)
+        for category in (
+            "rating_example", "rating", "generated", "style", "arca_style",
+            "comparison_group", "comparison_result", "novelai_key",
+        ):
+            self.assertIn(
+                f'<input type="checkbox" checked data-delete-confirmation-category="{category}">',
+                self.html,
+            )
+        style_delete = source[source.index("async function deleteManagedStyle"):source.index("async function deleteSelectedManagedStyles")]
+        self.assertIn('delete_category: "style"', style_delete)
+        for function_name in ("deleteSelectedManagedStyles", "deleteSingleManagerItem"):
+            start = source.index(f"async function {function_name}")
+            end = source.find("\nasync function ", start + 1)
+            section = source[start:] if end < 0 else source[start:end]
+            self.assertIn('delete_category: styleState.managerMode === "confirmed" ? "style" : "generated"', section)
+        self.assertIn('delete_category: "arca_style"', arca_source)
+        self.assertIn("grid-template-rows: repeat(5, auto)", self.css)
+        self.assertIn("max-height: min(720px, calc(100vh - 24px))", self.css)
+        self.assertIn("overflow-y: auto", self.css[self.css.index(".compact-modal {"):])
+
+    def test_style_history_and_collapsed_generation_remote_exist(self):
+        for marker in (
+            'id="styleMakerHistory"', 'id="toggleStyleHistory"', 'id="styleHistoryList"',
+            'id="styleHistoryDetail"', 'id="refreshStyleHistory"',
+            'id="toggleGenerationPanel"', 'id="generationRemote"',
+            'id="generationRemoteHandle"', 'id="remoteGenerateOne"',
+            'id="remoteStartContinuous"', 'id="remotePauseContinuous"', 'id="remoteStopContinuous"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        for marker in (
+            'apiFetch("/api/style-manager/generated")',
+            'apiFetch("/api/style-manager/generated/delete-batch"',
+            'function normalizeStyleHistoryItem(',
+            'function renderArtistPromptPreview(',
+            'function styleHistoryArtistPrompt(',
+            'function renderStyleHistorySelection(',
+            'styleHistoryPreviewMeta(',
+            'function applyStyleHistoryItem(',
+            'function setGenerationPanelCollapsed(',
+            'function setupGenerationRemoteDrag(',
+            'openConfirmedStyleModal(normalized, false, "generated")',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script)
+        for marker in (
+            '.style-maker-layout.history-open',
+            '.style-maker-layout.settings-collapsed.history-open',
+            '.style-maker-layout.settings-collapsed.generation-collapsed',
+            '.style-maker-layout.settings-collapsed.history-open.generation-collapsed',
+            '.style-maker-generation.is-collapsed',
+            '.style-history-card',
+            '.generation-remote',
+            'touch-action: none',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.css)
+        self.assertIn('class="style-maker-pane style-maker-history history-collapsed"', self.html)
+        self.assertLess(self.html.index('id="styleHistoryDetail"'), self.html.index('id="styleHistoryList"'))
+        self.assertIn('load.textContent = "설정 반영"', self.script)
+        self.assertIn('confirm.textContent = "확정 그림체로"', self.script)
+        self.assertIn('remove.textContent = "×"', self.script)
+        self.assertIn('renderStyleHistorySelection(item)', self.script)
+        self.assertIn('renderArtistPromptPreview(styleHistoryArtistPrompt(normalized))', self.script)
+        self.assertIn('latestStyleResult', self.script)
+        self.assertIn('className = "style-history-card-delete"', self.script)
+        self.assertIn('event.stopPropagation()', self.script)
+        delete_css_start = self.css.index('.style-history-card-delete {')
+        delete_css_end = self.css.index('.style-history-card-delete:hover', delete_css_start)
+        delete_css = self.css[delete_css_start:delete_css_end]
+        for marker in (
+            'display: grid;', 'place-items: center;', 'width: 28px;', 'height: 28px;',
+            'min-width: 28px;', 'padding: 0;', 'box-sizing: border-box;',
+            'font-size: 18px;', 'line-height: 1;', 'text-align: center;',
+        ):
+            with self.subTest(delete_css_marker=marker):
+                self.assertIn(marker, delete_css)
+        mobile_delete_css = self.css[self.css.index('@media (max-width: 1320px)'):]
+        mobile_delete_css_start = mobile_delete_css.index('.style-history-card-delete {')
+        mobile_delete_css = mobile_delete_css[mobile_delete_css_start:]
+        for marker in ('width: 34px;', 'height: 34px;', 'min-width: 34px;', 'padding: 0;'):
+            with self.subTest(mobile_delete_css_marker=marker):
+                self.assertIn(marker, mobile_delete_css)
+        history_start = self.script.index('function renderStyleHistoryList(')
+        history_end = self.script.index('async function loadStyleHistory(', history_start)
+        history_source = self.script[history_start:history_end]
+        self.assertIn('const card = document.createElement("article")', history_source)
+        self.assertIn('const select = document.createElement("button")', history_source)
+        self.assertIn('const remove = document.createElement("button")', history_source)
+        self.assertIn('card.append(select, remove)', history_source)
+        self.assertNotIn('remove.setAttribute("role"', history_source)
+        self.assertNotIn('remove.addEventListener("keydown"', history_source)
+        detail_start = self.script.index('function renderStyleHistoryDetail(')
+        detail_end = self.script.index('function renderStyleHistoryList(', detail_start)
+        self.assertNotIn('remove.textContent', self.script[detail_start:detail_end])
+
+    def test_style_maker_narrow_layout_keeps_panes_in_flow(self):
+        responsive = self.css[self.css.index("@media (max-width: 1320px)"):]
+        for marker in (
+            "body.style-maker-active main",
+            "overflow: auto",
+            "height: auto",
+            "overflow-x: hidden",
+            "overflow-y: visible",
+            ".style-maker-pane",
+            "overflow: hidden",
+            ".style-history-scroll",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, responsive)
+
     def test_single_generation_randomizes_enabled_targets_before_generation(self):
         start = self.script.index("async function generateOneRandomizedStyle()")
         end = self.script.index("async function runContinuousGeneration()", start)
@@ -692,6 +830,105 @@ class StyleFrontendContractTest(unittest.TestCase):
         ):
             self.assertIn(marker, self.script)
         self.assertIn(".style-manager-load-progress", self.css)
+
+    def test_shared_dependency_controls_and_payload_contract_exist(self):
+        for marker in (
+            'value="shared_dependency"',
+            'id="sharedDependencySettings"',
+            'id="sharedDependencyFixedRatio"',
+            'id="sharedDependencyReferenceRatio"',
+            'id="sharedDependencyRatedRatio"',
+            'id="sharedDependencyOtherRatio"',
+            'id="sharedDependencyCountStatus"',
+            'id="sharedDependencyRatioSummary"',
+        ):
+            self.assertIn(marker, self.html)
+        for marker in (
+            'styleElement("weightMode")?.value === "shared_dependency"',
+            "shared_dependency_source_ratios",
+            "sharedDependencyFixedRatio",
+            "normalizeSharedDependencyRatios",
+            "shared_dependency_reference_id",
+            "applySharedDependencyReference",
+            "sharedDependencyParameterValue",
+        ):
+            self.assertIn(marker, self.script)
+        for marker in ('sharedDependencyPercent', '기준 공유 그림체 작가 포함', '기준 그림체 남은 작가'):
+            self.assertNotIn(marker, self.html)
+        self.assertNotIn("shared_dependency_percent", self.script)
+
+    def test_shared_dependency_reference_picker_can_collapse_and_clear_fixed_state(self):
+        for marker in (
+            'id="sharedDependencyReferencePicker"',
+            'class="shared-dependency-reference-picker" open',
+            'id="sharedDependencyReferenceSummary"',
+            'id="clearSharedDependencyReference"',
+            "고정 해제 · 랜덤으로",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        for marker in (
+            "function clearSharedDependencyReference()",
+            "styleState.sharedDependencyReferenceMode = \"random\"",
+            "styleState.sharedDependencyReferenceId = null",
+            "styleState.sharedDependencyReference = null",
+            'styleElement("clearSharedDependencyReference")?.addEventListener',
+            ".shared-dependency-reference-picker > summary",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script if marker.startswith(("function", "styleState", "styleElement")) else self.css)
+
+    def test_generated_detail_shows_shared_dependency_snapshot_link(self):
+        for marker in (
+            "function appendSharedDependencyBlock(",
+            "shared_dependency_reference_id",
+            "shared_dependency_reference_title",
+            "shared_dependency_reference_source_url",
+            'textContent = "의존 공유 그림체"',
+            'target = "_blank"',
+            'rel = "noopener noreferrer"',
+            'event.stopPropagation()',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script)
+
+    def test_static_input_help_uses_keyboard_accessible_tooltips(self):
+        self.assertIn('class="help-tooltip-wrap"', self.html)
+        self.assertIn('class="help-tooltip-button"', self.html)
+        self.assertIn('role="tooltip"', self.html)
+        self.assertIn('aria-label="공유 그림체 의존 비율 설명"', self.html)
+        self.assertIn(".help-tooltip-button:focus-visible", self.css)
+        self.assertIn(".field-label", self.css)
+        self.assertIn(".field .help-tooltip-content", self.css)
+        self.assertIn('.check-row input[type="checkbox"]', self.css)
+        self.assertIn('class="field-label"><span>제외할 태그/프롬프트</span><span class="help-tooltip-wrap"', self.html)
+        self.assertEqual(self.html.count('id="help-exclude-query"'), 1)
+
+    def test_style_maker_tooltips_are_attached_to_labels_and_layered_above_ui(self):
+        for marker in (
+            'class="field-label tooltip-section-label"><span>공유 작가 범위</span><span class="help-tooltip-wrap"',
+            'class="field-label tooltip-section-label"><span>공급원 비율</span><span class="help-tooltip-wrap"',
+            'class="field-label"><span>여기서도 바로 수정</span><span class="help-tooltip-wrap"',
+            'class="field-label"><strong>수집 태그로 작가 제외</strong><span class="help-tooltip-wrap"',
+        ):
+            self.assertIn(marker, self.html)
+        for tooltip_id in (
+            "help-shared-range",
+            "help-shared-ratios",
+            "help-weight-table",
+            "help-rating-exclusion",
+        ):
+            self.assertEqual(self.html.count(f'id="{tooltip_id}"'), 1)
+        self.assertIn(".help-tooltip-wrap:focus-within", self.css)
+        self.assertIn("z-index: 1001", self.css)
+
+    def test_high_score_control_is_before_score_buttons(self):
+        section_start = self.html.index('<summary>허용 평점</summary>')
+        body_start = self.html.index('<div class="style-settings-section-body">', section_start)
+        prefer_index = self.html.index('id="preferHighScores"', section_start)
+        score_index = self.html.index('id="styleScoreButtons"', section_start)
+        self.assertLess(body_start, prefer_index)
+        self.assertLess(prefer_index, score_index)
 
 
 if __name__ == "__main__":

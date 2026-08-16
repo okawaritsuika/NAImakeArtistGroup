@@ -16,3 +16,5 @@ settings.json
 arca_login_profile/
 .env
 .env.*
+/AGENTS.md
+/.agents/

@@ -19,6 +19,10 @@ const state = {
   manualPreviewIndex: 0,
   manualPreviewArtist: "",
   manualPreviewQueryTags: [],
+  manualPreviewMode: "manual",
+  manualPreviewLoading: false,
+  manualPreviewRatingId: null,
+  manualPreviewRatingItem: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -39,6 +43,155 @@ function bindClick(id, handler) {
     element.addEventListener("click", handler);
   }
   return element;
+}
+
+function calculateTooltipPosition(buttonRect, tooltipRect, viewport, gap = 8, margin = 12) {
+  const viewportWidth = Math.max(0, Number(viewport?.width) || 0);
+  const viewportHeight = Math.max(0, Number(viewport?.height) || 0);
+  const tooltipWidth = Math.max(0, Number(tooltipRect?.width) || 0);
+  const tooltipHeight = Math.max(0, Number(tooltipRect?.height) || 0);
+  const anchorLeft = Number(buttonRect?.left) || 0;
+  const anchorTop = Number(buttonRect?.top) || 0;
+  const anchorBottom = Number(buttonRect?.bottom) || anchorTop;
+  const maxLeft = Math.max(margin, viewportWidth - tooltipWidth - margin);
+  const left = Math.min(Math.max(margin, anchorLeft), maxLeft);
+  let top = anchorTop - tooltipHeight - gap;
+  if (top < margin) top = anchorBottom + gap;
+  if (top + tooltipHeight > viewportHeight - margin) {
+    top = Math.max(margin, viewportHeight - tooltipHeight - margin);
+  }
+  return { left, top };
+}
+
+function initializeHelpTooltips() {
+  if (typeof document === "undefined" || typeof window === "undefined") return;
+  const buttons = Array.from(document.querySelectorAll(".help-tooltip-button"));
+  if (!buttons.length || !document.body) return;
+  let active = null;
+  let closeTimer = null;
+
+  const viewport = () => ({
+    width: window.innerWidth || document.documentElement?.clientWidth || 0,
+    height: window.innerHeight || document.documentElement?.clientHeight || 0,
+  });
+
+  const clearTooltipPosition = (content) => {
+    ["position", "left", "top", "right", "bottom", "transform", "z-index"].forEach((property) => {
+      content.style.removeProperty(property);
+    });
+  };
+
+  const positionTooltip = (entry) => {
+    if (!entry.open) return;
+    const buttonRect = entry.button.getBoundingClientRect();
+    const tooltipRect = entry.content.getBoundingClientRect();
+    const point = calculateTooltipPosition(buttonRect, tooltipRect, viewport());
+    entry.content.style.left = `${Math.round(point.left)}px`;
+    entry.content.style.top = `${Math.round(point.top)}px`;
+  };
+
+  const restoreTooltip = (entry) => {
+    if (!entry.moved) return;
+    if (entry.nextSibling && entry.nextSibling.parentNode === entry.originalParent) {
+      entry.originalParent.insertBefore(entry.content, entry.nextSibling);
+    } else {
+      entry.originalParent.appendChild(entry.content);
+    }
+    entry.moved = false;
+  };
+
+  const closeTooltip = (entry) => {
+    if (!entry?.open) return;
+    entry.open = false;
+    if (entry.usingPopover) {
+      try {
+        entry.content.hidePopover();
+      } catch {
+        // The browser may have closed the popover during navigation.
+      }
+      entry.content.removeAttribute("popover");
+      entry.usingPopover = false;
+    }
+    entry.content.classList.remove("is-open");
+    restoreTooltip(entry);
+    clearTooltipPosition(entry.content);
+    entry.button.setAttribute("aria-expanded", "false");
+    if (active === entry) active = null;
+  };
+
+  const scheduleClose = (entry) => {
+    clearTimeout(closeTimer);
+    if (document.activeElement === entry.button) return;
+    closeTimer = setTimeout(() => {
+      if (!entry.content.matches(":hover") && document.activeElement !== entry.button) closeTooltip(entry);
+    }, 140);
+  };
+
+  const openTooltip = (entry) => {
+    clearTimeout(closeTimer);
+    if (active && active !== entry) closeTooltip(active);
+    if (entry.open) {
+      positionTooltip(entry);
+      return;
+    }
+    entry.open = true;
+    active = entry;
+    entry.button.setAttribute("aria-expanded", "true");
+    entry.content.classList.add("is-open");
+    const supportsPopover = typeof entry.content.showPopover === "function" && typeof entry.content.hidePopover === "function";
+    if (supportsPopover) {
+      entry.content.setAttribute("popover", "manual");
+      try {
+        entry.content.showPopover();
+        entry.usingPopover = true;
+      } catch {
+        entry.content.removeAttribute("popover");
+      }
+    }
+    if (!entry.usingPopover) {
+      entry.originalParent = entry.content.parentNode;
+      entry.nextSibling = entry.content.nextSibling;
+      document.body.appendChild(entry.content);
+      entry.moved = true;
+    }
+    entry.content.style.position = "fixed";
+    entry.content.style.zIndex = "2147483647";
+    positionTooltip(entry);
+  };
+
+  buttons.forEach((button) => {
+    if (button.dataset.helpTooltipInitialized) return;
+    const wrap = button.closest(".help-tooltip-wrap");
+    const content = wrap?.querySelector(".help-tooltip-content");
+    if (!content) return;
+    const entry = {
+      button,
+      content,
+      originalParent: content.parentNode,
+      nextSibling: content.nextSibling,
+      moved: false,
+      usingPopover: false,
+      open: false,
+    };
+    button.dataset.helpTooltipInitialized = "true";
+    button.setAttribute("aria-expanded", "false");
+    button.addEventListener("mouseenter", () => openTooltip(entry));
+    button.addEventListener("mouseleave", () => scheduleClose(entry));
+    button.addEventListener("focus", () => openTooltip(entry));
+    button.addEventListener("blur", () => scheduleClose(entry));
+    content.addEventListener("mouseenter", () => clearTimeout(closeTimer));
+    content.addEventListener("mouseleave", () => scheduleClose(entry));
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    if (!active) return;
+    if (!active.button.contains(event.target) && !active.content.contains(event.target)) closeTooltip(active);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeTooltip(active);
+  });
+  window.addEventListener("resize", () => active && positionTooltip(active));
+  window.addEventListener("scroll", () => active && positionTooltip(active), true);
 }
 
 function showStatus(target, message, type = "") {
@@ -80,6 +233,24 @@ function normalizeTags(text) {
     .filter((tag, index, tags) => tag && tags.indexOf(tag) === index);
 }
 
+function selectedCandidateCutoffDate() {
+  const preset = valueOf("candidateCutoffPreset", "2025-01-31");
+  if (preset !== "custom") return preset;
+  const custom = valueOf("candidateCutoffDate").trim();
+  if (!custom) throw new Error("직접 지정 기준일을 입력하세요.");
+  return custom;
+}
+
+function syncCandidateCutoffDateControl() {
+  const preset = $("candidateCutoffPreset");
+  const custom = $("candidateCutoffDate");
+  const active = preset?.value === "custom";
+  if (custom) {
+    custom.hidden = !active;
+    custom.disabled = !active;
+  }
+}
+
 function requestPayload() {
   return {
     query_text: valueOf("queryText"),
@@ -91,6 +262,7 @@ function requestPayload() {
     random_mode: valueOf("randomMode", "soft_weighted"),
     exclude_query_text: valueOf("excludeQueryText"),
     latest_samples: Boolean($("latestSamples")?.checked),
+    cutoff_date: selectedCandidateCutoffDate(),
     exclude_artist_tags: Array.from(state.seenArtists),
   };
 }
@@ -318,6 +490,9 @@ async function addManualRating() {
     state.manualPreviewIndex = 0;
     state.manualPreviewArtist = "";
     state.manualPreviewQueryTags = [];
+    state.manualPreviewMode = "manual";
+    state.manualPreviewRatingId = null;
+    state.manualPreviewRatingItem = null;
     showStatus($("ratingsStatus"), `${artist} 작가를 추가했습니다.`, "ok");
     await loadRatings();
   } catch (error) {
@@ -326,6 +501,39 @@ async function addManualRating() {
 }
 
 let appDialogResolve = null;
+const DELETE_CONFIRMATION_CATEGORIES = [
+  "rating_example",
+  "rating",
+  "generated",
+  "style",
+  "arca_style",
+  "comparison_group",
+  "comparison_result",
+  "novelai_key",
+];
+const defaultDeleteConfirmationPreferences = () => Object.fromEntries(
+  DELETE_CONFIRMATION_CATEGORIES.map((category) => [category, false]),
+);
+let appPreferences = { skip_delete_confirmation: defaultDeleteConfirmationPreferences() };
+
+function normalizeDeleteConfirmationPreferences(value) {
+  if (typeof value === "boolean") {
+    return Object.fromEntries(DELETE_CONFIRMATION_CATEGORIES.map((category) => [category, value]));
+  }
+  if (!value || typeof value !== "object") return defaultDeleteConfirmationPreferences();
+  return Object.fromEntries(DELETE_CONFIRMATION_CATEGORIES.map((category) => [
+    category,
+    value[category] === true,
+  ]));
+}
+
+function setAppPreferences(preferences = {}) {
+  appPreferences = {
+    ...appPreferences,
+    skip_delete_confirmation: normalizeDeleteConfirmationPreferences(preferences.skip_delete_confirmation),
+  };
+  return { ...appPreferences };
+}
 
 function closeAppDialog(value) {
   const modal = $("appDialog");
@@ -376,6 +584,12 @@ function openAppDialog(options = {}) {
 
 function appConfirm(options) {
   const normalized = typeof options === "string" ? { message: options } : options;
+  const category = normalized?.delete_category;
+  if (
+    normalized?.delete === true
+    && DELETE_CONFIRMATION_CATEGORIES.includes(category)
+    && appPreferences.skip_delete_confirmation[category] === true
+  ) return Promise.resolve(true);
   return openAppDialog(normalized).then(Boolean);
 }
 
@@ -384,7 +598,22 @@ function appPrompt(options) {
   return openAppDialog({ ...normalized, input: true });
 }
 
-globalThis.appDialog = { confirm: appConfirm, prompt: appPrompt };
+globalThis.appDialog = {
+  confirm: appConfirm,
+  prompt: appPrompt,
+  setPreferences: setAppPreferences,
+  getPreferences: () => ({ ...appPreferences }),
+};
+
+async function loadAppPreferences() {
+  if (typeof fetch !== "function") return appPreferences;
+  try {
+    const response = await apiFetch("/api/settings/preferences");
+    return setAppPreferences(response);
+  } catch (_) {
+    return appPreferences;
+  }
+}
 
 
 function manualPreviewRatingFields(artist, queryTags, preview) {
@@ -393,9 +622,80 @@ function manualPreviewRatingFields(artist, queryTags, preview) {
   if (!sameArtist || !sameTags || !preview?.sample) return {};
   return {
     representative_post_id: preview.sample.id,
-    representative_preview_url: preview.sample.preview_url || preview.sample.large_url || "",
+    representative_preview_url: preview.sample.large_url || preview.sample.preview_url || "",
     sample_post_ids: preview.sampleIds || [],
   };
+}
+
+function sampleKey(sample) {
+  if (sample?.id !== undefined && sample?.id !== null) return `id:${sample.id}`;
+  return `url:${sample?.large_url || sample?.preview_url || ""}`;
+}
+
+function normalizePreviewSample(sample) {
+  if (!sample || typeof sample !== "object") return null;
+  const imageUrl = validatedImageUrl(sample.large_url) || validatedImageUrl(sample.preview_url);
+  if (!imageUrl) return null;
+  return {
+    ...sample,
+    large_url: imageUrl,
+    preview_url: validatedImageUrl(sample.preview_url) || imageUrl,
+    post_url: validatedImageUrl(sample.post_url),
+  };
+}
+
+function mergePreviewSamples(existing, incoming) {
+  const merged = Array.isArray(existing) ? [...existing] : [];
+  const seen = new Set(merged.map(sampleKey));
+  for (const sample of Array.isArray(incoming) ? incoming : []) {
+    const safeSample = normalizePreviewSample(sample);
+    if (!safeSample) continue;
+    const key = sampleKey(safeSample);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(safeSample);
+  }
+  return merged;
+}
+
+function normalizeStoredRatingExample(example) {
+  if (!example || typeof example !== "object") return null;
+  const sample = normalizePreviewSample({
+    ...example,
+    id: example.post_id ?? example.id,
+    example_id: example.example_id ?? example.id,
+    large_url: example.image_url,
+    preview_url: example.image_url,
+    post_url: example.post_url,
+  });
+  if (!sample) return null;
+  sample.example_id = example.example_id ?? example.id;
+  sample.post_id = example.post_id ?? example.id;
+  sample.source_url = validatedImageUrl(example.source_url);
+  sample.is_thumbnail = example.is_thumbnail === true;
+  sample.is_stored_example = true;
+  return sample;
+}
+
+function combineRatingSamples(representative, storedExamples) {
+  const stored = (Array.isArray(storedExamples) ? storedExamples : [])
+    .map(normalizeStoredRatingExample)
+    .filter(Boolean);
+  const representativeKey = representative ? sampleKey(representative) : "";
+  const storedRepresentative = stored.find((sample) => (
+    sample.is_thumbnail || (representativeKey && sampleKey(sample) === representativeKey)
+  ));
+  const first = storedRepresentative || representative;
+  if (first) first.is_representative = true;
+  const seen = new Set(first ? [sampleKey(first)] : []);
+  const samples = first ? [first] : [];
+  for (const sample of stored) {
+    const key = sampleKey(sample);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    samples.push(sample);
+  }
+  return samples;
 }
 
 function renderManualPreviewSample() {
@@ -403,8 +703,29 @@ function renderManualPreviewSample() {
   if (!sample) return;
   const image = $("manualPreviewImage");
   const link = $("manualPreviewLink");
-  if (image) image.src = sample.large_url || sample.preview_url;
-  if (link) link.href = sample.post_url || "#";
+  const setThumbnail = $("manualPreviewSetThumbnail");
+  const deleteExample = $("manualPreviewDeleteExample");
+  const representativeBadge = $("manualPreviewRepresentativeBadge");
+  const imageUrl = validatedImageUrl(sample.large_url) || validatedImageUrl(sample.preview_url);
+  const postUrl = validatedImageUrl(sample.post_url);
+  if (image) {
+    image.src = imageUrl;
+    image.hidden = !imageUrl;
+  }
+  if (link) {
+    link.href = postUrl || "#";
+    link.hidden = !postUrl;
+  }
+  const isRepresentative = sample.is_representative === true || sample.is_thumbnail === true;
+  if (representativeBadge) representativeBadge.hidden = !isRepresentative;
+  if (setThumbnail) {
+    setThumbnail.hidden = state.manualPreviewMode !== "rating" || !sample.example_id;
+    setThumbnail.disabled = isRepresentative || !sample.example_id;
+  }
+  if (deleteExample) {
+    deleteExample.hidden = state.manualPreviewMode !== "rating" || !sample.example_id;
+    deleteExample.disabled = state.manualPreviewMode !== "rating" || !sample.example_id;
+  }
   setText("manualPreviewCounter", `${state.manualPreviewIndex + 1} / ${state.manualPreviewSamples.length}`);
 }
 
@@ -420,6 +741,198 @@ function closeManualPreview() {
   $("manualPreviewModal")?.classList.add("hidden");
 }
 
+async function loadManualPreviewSamples({ append = false } = {}) {
+  const artist = state.manualPreviewArtist;
+  if (!artist || state.manualPreviewLoading) return false;
+  state.manualPreviewLoading = true;
+  const loadMore = $("manualPreviewLoadMore");
+  if (loadMore) loadMore.disabled = true;
+  showStatus($("manualPreviewStatus"), append ? "추가 예제 그림을 가져오는 중입니다..." : "샘플 이미지 10장을 가져오는 중입니다...");
+  try {
+    const data = await apiFetch("/api/artist_samples", {
+      method: "POST",
+      body: JSON.stringify({
+        artist_tag: artist,
+        query_tags: state.manualPreviewQueryTags,
+        sample_limit: 10,
+        mode: state.manualPreviewMode === "rating" ? "rating_preview" : "manual_preview",
+      }),
+    });
+    const nextSamples = data.ok === false
+      ? []
+      : mergePreviewSamples(state.manualPreviewSamples, data.samples);
+    if (!nextSamples.length) {
+      showStatus($("manualPreviewStatus"), data.reason || "표시할 그림이 없습니다.", "error");
+      return false;
+    }
+    const previousCount = state.manualPreviewSamples.length;
+    state.manualPreviewSamples = nextSamples;
+    state.manualPreviewIndex = append && nextSamples.length > previousCount
+      ? previousCount
+      : Math.min(state.manualPreviewIndex, nextSamples.length - 1);
+    $("manualPreviewViewer")?.classList.remove("hidden");
+    showStatus(
+      $("manualPreviewStatus"),
+      append && nextSamples.length === previousCount
+        ? "새로 추가된 예제가 없습니다."
+        : `${nextSamples.length}장을 확인할 수 있습니다.`,
+      "ok",
+    );
+    renderManualPreviewSample();
+    return true;
+  } catch (error) {
+    showStatus($("manualPreviewStatus"), error.message, "error");
+    return false;
+  } finally {
+    state.manualPreviewLoading = false;
+    if (loadMore) loadMore.disabled = false;
+  }
+}
+
+async function loadStoredRatingExamples(preserveKey = "") {
+  const ratingId = state.manualPreviewRatingId;
+  if (!ratingId) return false;
+  try {
+    const data = await apiFetch(`/api/ratings/${ratingId}/examples`);
+    const rating = data.rating || {};
+    state.manualPreviewRatingItem = { ...(state.manualPreviewRatingItem || {}), ...rating };
+    const representative = buildRatingRepresentativeSample(state.manualPreviewRatingItem);
+    const samples = combineRatingSamples(representative, data.examples);
+    state.manualPreviewSamples = samples;
+    const nextIndex = preserveKey
+      ? samples.findIndex((sample) => sampleKey(sample) === preserveKey)
+      : -1;
+    state.manualPreviewIndex = nextIndex >= 0
+      ? nextIndex
+      : Math.min(state.manualPreviewIndex, Math.max(0, samples.length - 1));
+    $("manualPreviewViewer")?.classList.toggle("hidden", !samples.length);
+    renderManualPreviewSample();
+    showStatus($("manualPreviewStatus"), `저장된 예제 ${data.examples?.length || 0}장`, "ok");
+    return true;
+  } catch (error) {
+    showStatus($("manualPreviewStatus"), error.message, "error");
+    return false;
+  }
+}
+
+async function collectRatingExamples() {
+  if (state.manualPreviewMode !== "rating" || !state.manualPreviewRatingId || state.manualPreviewLoading) return false;
+  const current = state.manualPreviewSamples[state.manualPreviewIndex];
+  const loadMore = $("manualPreviewLoadMore");
+  state.manualPreviewLoading = true;
+  if (loadMore) loadMore.disabled = true;
+  showStatus($("manualPreviewStatus"), "추가 예제를 수집하는 중입니다...");
+  try {
+    const data = await apiFetch(`/api/ratings/${state.manualPreviewRatingId}/examples/collect`, {
+      method: "POST",
+      body: JSON.stringify({ sample_limit: 10 }),
+    });
+    await loadStoredRatingExamples(current ? sampleKey(current) : "");
+    await loadRatings();
+    showStatus($("manualPreviewStatus"), `추가 예제 ${data.saved_count || 0}장을 저장했습니다.`, "ok");
+    return true;
+  } catch (error) {
+    showStatus($("manualPreviewStatus"), error.message, "error");
+    return false;
+  } finally {
+    state.manualPreviewLoading = false;
+    if (loadMore) loadMore.disabled = false;
+    renderManualPreviewSample();
+  }
+}
+
+async function setRatingExampleThumbnail() {
+  const sample = state.manualPreviewSamples[state.manualPreviewIndex];
+  if (state.manualPreviewMode !== "rating" || !state.manualPreviewRatingId || !sample?.example_id) return false;
+  const currentKey = sampleKey(sample);
+  showStatus($("manualPreviewStatus"), "대표 썸네일을 지정하는 중입니다...");
+  try {
+    await apiFetch(`/api/ratings/${state.manualPreviewRatingId}/examples/${sample.example_id}/thumbnail`, { method: "POST" });
+    await loadStoredRatingExamples(currentKey);
+    await loadRatings();
+    showStatus($("manualPreviewStatus"), "대표 썸네일로 지정했습니다.", "ok");
+    return true;
+  } catch (error) {
+    showStatus($("manualPreviewStatus"), error.message, "error");
+    return false;
+  }
+}
+
+async function deleteRatingExample() {
+  const sample = state.manualPreviewSamples[state.manualPreviewIndex];
+  if (state.manualPreviewMode !== "rating" || !state.manualPreviewRatingId || !sample?.example_id) return false;
+  if (!await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: "rating_example",
+    title: "예제 그림 삭제",
+    message: "현재 예제 그림을 삭제할까요? 대표 썸네일이면 대표 지정도 해제됩니다.",
+    confirmLabel: "삭제",
+    tone: "danger",
+  })) return false;
+  const currentKey = sampleKey(sample);
+  showStatus($("manualPreviewStatus"), "예제를 삭제하는 중입니다...");
+  try {
+    await apiFetch(`/api/ratings/${state.manualPreviewRatingId}/examples/${sample.example_id}`, { method: "DELETE" });
+    await loadStoredRatingExamples(currentKey);
+    await loadRatings();
+    showStatus($("manualPreviewStatus"), "예제를 삭제했습니다.", "ok");
+    return true;
+  } catch (error) {
+    showStatus($("manualPreviewStatus"), error.message, "error");
+    return false;
+  }
+}
+
+function loadMoreManualPreviewSamples() {
+  if (state.manualPreviewMode === "rating") return collectRatingExamples();
+  return loadManualPreviewSamples({ append: true });
+}
+
+function buildRatingRepresentativeSample(item) {
+  const representativeUrl = validatedImageUrl(item.representative_preview_url) || validatedImageUrl(item.thumbnail_url);
+  return normalizePreviewSample({
+    id: item.representative_post_id,
+    preview_url: representativeUrl,
+    large_url: representativeUrl,
+    post_url: buildDanbooruPostUrl(item.representative_post_id) || item.representative_post_url,
+  });
+}
+
+async function openRatingSampleViewer(item) {
+  const modal = $("manualPreviewModal");
+  const viewer = $("manualPreviewViewer");
+  const representative = buildRatingRepresentativeSample(item);
+  state.manualPreviewMode = "rating";
+  state.manualPreviewRatingId = item.id;
+  state.manualPreviewRatingItem = { ...item };
+  state.manualPreviewArtist = String(item.artist_tag || "").trim();
+  state.manualPreviewQueryTags = Array.isArray(item.query_tags) ? item.query_tags : [];
+  state.manualPreviewSamples = representative ? [representative] : [];
+  state.manualPreviewIndex = 0;
+  modal?.classList.remove("hidden");
+  viewer?.classList.toggle("hidden", !state.manualPreviewSamples.length);
+  setText("manualPreviewLoadMore", "추가 예제 수집");
+  setText("manualPreviewTitle", "평가 작가 예제 그림");
+  setText("manualPreviewArtist", state.manualPreviewArtist);
+  showStatus(
+    $("manualPreviewStatus"),
+    representative ? "저장된 대표 썸네일입니다. 추가 예제를 조회할 수 있습니다." : "저장된 썸네일이 없습니다. 추가 예제를 조회하세요.",
+    representative ? "ok" : "",
+  );
+  renderManualPreviewSample();
+  await loadStoredRatingExamples();
+}
+
+function resetManualPreviewState() {
+  state.manualPreviewSamples = [];
+  state.manualPreviewIndex = 0;
+  state.manualPreviewArtist = "";
+  state.manualPreviewQueryTags = [];
+  state.manualPreviewMode = "manual";
+  state.manualPreviewRatingId = null;
+  state.manualPreviewRatingItem = null;
+}
+
 async function openManualPreview() {
   const artist = valueOf("manualArtist").trim();
   const queryTags = normalizeTags(valueOf("manualTags"));
@@ -429,38 +942,15 @@ async function openManualPreview() {
   }
   const modal = $("manualPreviewModal");
   const viewer = $("manualPreviewViewer");
-  state.manualPreviewSamples = [];
-  state.manualPreviewIndex = 0;
-  state.manualPreviewArtist = "";
-  state.manualPreviewQueryTags = [];
+  resetManualPreviewState();
+  state.manualPreviewArtist = artist;
+  state.manualPreviewQueryTags = queryTags;
   modal?.classList.remove("hidden");
   viewer?.classList.add("hidden");
+  setText("manualPreviewTitle", "작가 그림 보기");
   setText("manualPreviewArtist", artist);
-  showStatus($("manualPreviewStatus"), "샘플 이미지 10장을 가져오는 중입니다...");
-  try {
-    const data = await apiFetch("/api/artist_samples", {
-      method: "POST",
-      body: JSON.stringify({
-        artist_tag: artist,
-        query_tags: queryTags,
-        sample_limit: 10,
-        mode: "manual_preview",
-      }),
-    });
-    if (!data.ok || !data.samples?.length) {
-      showStatus($("manualPreviewStatus"), data.reason || "표시할 그림이 없습니다.", "error");
-      return;
-    }
-    state.manualPreviewSamples = data.samples;
-    state.manualPreviewIndex = 0;
-    state.manualPreviewArtist = artist;
-    state.manualPreviewQueryTags = queryTags;
-    viewer?.classList.remove("hidden");
-    showStatus($("manualPreviewStatus"), `${data.samples.length}장을 가져왔습니다.`, "ok");
-    renderManualPreviewSample();
-  } catch (error) {
-    showStatus($("manualPreviewStatus"), error.message, "error");
-  }
+  setText("manualPreviewLoadMore", "추가 예제 조회");
+  await loadManualPreviewSamples();
 }
 
 async function loadCandidatePool(force = false) {
@@ -486,6 +976,7 @@ async function loadCandidatePool(force = false) {
     state.candidateMeta = {
       mode: data.mode,
       query_tags: data.query_tags || [],
+      cutoff_date: data.cutoff_date || "2025-01-31",
       candidate_count: data.candidate_count || state.candidatePool.length,
       requested_count: Number(valueOf("candidateLimit", 12) || 12),
       latest_samples: data.latest_samples === true,
@@ -540,6 +1031,7 @@ async function showNextArtist() {
         query_tags: state.candidateMeta.query_tags,
         sample_limit: Number(valueOf("sampleLimit", 10) || 10),
         latest_samples: state.candidateMeta.latest_samples === true,
+        cutoff_date: state.candidateMeta.cutoff_date || "2025-01-31",
       }),
     });
     if (!data.ok) {
@@ -629,7 +1121,7 @@ async function saveRating(nextAfter, scoreOverride = null) {
         matched_post_count: state.currentPick.matched_post_count,
         artist_post_count: state.currentPick.artist_post_count,
         representative_post_id: sample?.id,
-        representative_preview_url: sample?.preview_url || sample?.large_url || "",
+        representative_preview_url: sample?.large_url || sample?.preview_url || "",
         sample_post_ids: state.currentPick.samples.map((item) => item.id),
         prompt_text: state.currentPick.prompt_text,
       }),
@@ -677,17 +1169,42 @@ function validatedImageUrl(value) {
   }
 }
 
+function buildDanbooruSearchUrl(artistTag, queryTags = []) {
+  const tags = [
+    String(artistTag || "").trim(),
+    ...(Array.isArray(queryTags) ? queryTags : []),
+  ]
+    .map((tag) => String(tag || "").trim())
+    .filter(Boolean);
+  const params = new URLSearchParams();
+  params.set("tags", tags.join(" "));
+  return `https://danbooru.donmai.us/posts?${params.toString()}`;
+}
+
+function buildDanbooruPostUrl(postId) {
+  const normalized = String(postId ?? "").trim();
+  return /^\d+$/.test(normalized)
+    ? `https://danbooru.donmai.us/posts/${normalized}`
+    : "";
+}
+
 function renderRatingCard(item) {
   const card = document.createElement("article");
   card.className = "card";
-  const thumb = validatedImageUrl(item.thumbnail_url || item.representative_preview_url || "");
+  const thumb = validatedImageUrl(item.thumbnail_url) || validatedImageUrl(item.representative_preview_url);
   if (thumb) {
+    const thumbButton = document.createElement("button");
+    thumbButton.type = "button";
+    thumbButton.className = "thumb-button";
+    thumbButton.dataset.action = "open-samples";
+    thumbButton.setAttribute("aria-label", `${String(item.artist_tag || "작가")} 예제 그림 크게 보기`);
     const image = document.createElement("img");
     image.className = "thumb";
     image.src = thumb;
     image.alt = String(item.artist_tag || "");
     image.loading = "lazy";
-    card.append(image);
+    thumbButton.append(image);
+    card.append(thumbButton);
   } else {
     const empty = document.createElement("div");
     empty.className = "thumb thumb-empty";
@@ -720,6 +1237,22 @@ function renderRatingCard(item) {
 
   const actions = document.createElement("div");
   actions.className = "card-actions";
+  const searchLink = document.createElement("a");
+  searchLink.className = "card-link";
+  searchLink.dataset.action = "danbooru-search";
+  searchLink.textContent = "Danbooru 검색";
+  searchLink.href = buildDanbooruSearchUrl(item.artist_tag, item.query_tags);
+  searchLink.setAttribute("href", searchLink.href);
+  searchLink.target = "_blank";
+  searchLink.rel = "noreferrer";
+  searchLink.setAttribute("target", "_blank");
+  searchLink.setAttribute("rel", "noreferrer");
+  actions.append(searchLink);
+  const viewSamples = document.createElement("button");
+  viewSamples.type = "button";
+  viewSamples.dataset.action = "view-samples";
+  viewSamples.textContent = thumb ? "예제 그림 보기" : "예제 그림 조회";
+  actions.append(viewSamples);
   [["copy", "프롬프트 복사"], ["edit", "수정"], ["delete", "삭제"]].forEach(([action, label]) => {
     const button = document.createElement("button");
     button.type = "button";
@@ -727,13 +1260,11 @@ function renderRatingCard(item) {
     button.textContent = label;
     actions.append(button);
   });
-  if (!thumb) {
-    const findThumbnail = document.createElement("button");
-    findThumbnail.type = "button";
-    findThumbnail.dataset.action = "find-thumbnail";
-    findThumbnail.textContent = "썸네일 찾기";
-    actions.append(findThumbnail);
-  }
+  const findThumbnail = document.createElement("button");
+  findThumbnail.type = "button";
+  findThumbnail.dataset.action = "find-thumbnail";
+  findThumbnail.textContent = thumb ? "WebP 썸네일 갱신" : "WebP 썸네일 받기";
+  actions.append(findThumbnail);
 
   const editor = document.createElement("div");
   editor.className = "inline-edit hidden";
@@ -765,6 +1296,8 @@ function renderRatingCard(item) {
   body.append(heading, score, memoPreview, meta, actions, editor);
   card.append(body);
 
+  card.querySelector('[data-action="open-samples"]')?.addEventListener("click", () => openRatingSampleViewer(item));
+  card.querySelector('[data-action="view-samples"]')?.addEventListener("click", () => openRatingSampleViewer(item));
   card.querySelector('[data-action="copy"]').addEventListener("click", () => copyText(item.prompt_text));
   card.querySelector('[data-action="edit"]').addEventListener("click", () => card.querySelector(".inline-edit").classList.toggle("hidden"));
   card.querySelector('[data-action="delete"]').addEventListener("click", () => deleteRating(item.id));
@@ -780,7 +1313,7 @@ function renderRatingCard(item) {
 }
 
 async function findRatingThumbnail(id) {
-  showStatus($("ratingsStatus"), "Danbooru에서 썸네일을 찾는 중입니다...");
+  showStatus($("ratingsStatus"), "고화질 WebP 썸네일을 준비하는 중입니다...");
   try {
     await apiFetch(`/api/ratings/${id}/thumbnail`, { method: "POST" });
     await loadRatings();
@@ -813,6 +1346,8 @@ async function patchRating(id, payload) {
 
 async function deleteRating(id) {
   if (!await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: "rating",
     title: "평가 기록 삭제",
     message: "선택한 작가의 평가 기록을 삭제할까요?",
     confirmLabel: "삭제",
@@ -827,6 +1362,8 @@ async function deleteRating(id) {
 }
 
 if (typeof document !== "undefined" && !(typeof module !== "undefined" && module.exports)) {
+void loadAppPreferences();
+initializeHelpTooltips();
 bindClick("appDialogCancel", () => closeAppDialog(null));
 bindClick("appDialogConfirm", () => {
   const inputVisible = !$("appDialogInputField")?.classList.contains("hidden");
@@ -887,6 +1424,8 @@ if (excludeQueryText) {
   });
   excludeQueryText.addEventListener("keydown", (event) => handleAutocompleteKeydown(event, "exclude"));
 }
+syncCandidateCutoffDateControl();
+$("candidateCutoffPreset")?.addEventListener("change", syncCandidateCutoffDateControl);
 bindClick("candidateButton", async () => {
   const loaded = await loadCandidatePool(true);
   if (loaded) await showNextArtist();
@@ -923,6 +1462,9 @@ bindClick("manualAddButton", addManualRating);
 bindClick("manualPreviewButton", openManualPreview);
 bindClick("manualPreviewPrev", () => moveManualPreview(-1));
 bindClick("manualPreviewNext", () => moveManualPreview(1));
+bindClick("manualPreviewLoadMore", loadMoreManualPreviewSamples);
+bindClick("manualPreviewSetThumbnail", setRatingExampleThumbnail);
+bindClick("manualPreviewDeleteExample", deleteRatingExample);
 bindClick("manualPreviewClose", closeManualPreview);
 document.querySelectorAll("[data-close-manual-preview]").forEach((element) => {
   element.addEventListener("click", closeManualPreview);
@@ -948,5 +1490,19 @@ loadRatings();
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { renderRatingCard, validatedImageUrl, manualPreviewRatingFields };
+  module.exports = {
+    renderRatingCard,
+    validatedImageUrl,
+    manualPreviewRatingFields,
+    calculateTooltipPosition,
+    buildDanbooruSearchUrl,
+    buildDanbooruPostUrl,
+    buildRatingRepresentativeSample,
+    openRatingSampleViewer,
+    loadMoreManualPreviewSamples,
+    normalizeStoredRatingExample,
+    combineRatingSamples,
+    normalizePreviewSample,
+    mergePreviewSamples,
+  };
 }

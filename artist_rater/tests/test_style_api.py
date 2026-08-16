@@ -178,6 +178,34 @@ class SettingsStoreTest(unittest.TestCase):
         style_store.delete_app_key(self.settings_path, self.trusted_root)
         self.assertFalse(self.settings_path.exists())
 
+    def test_skip_delete_confirmation_round_trip_preserves_other_settings(self):
+        self.trusted_root.mkdir()
+        self.settings_path.write_text(
+            json.dumps({"theme": "dark", "novelai_app_key": SECRET_KEY}),
+            encoding="utf-8",
+        )
+        defaults = style_store.default_delete_confirmation_preferences()
+        self.assertEqual(
+            style_store.load_skip_delete_confirmation(self.settings_path, self.trusted_root), defaults
+        )
+        preferences = style_store.default_delete_confirmation_preferences(True)
+        style_store.save_skip_delete_confirmation(
+            self.settings_path, preferences, self.trusted_root
+        )
+        self.assertEqual(style_store.load_skip_delete_confirmation(self.settings_path, self.trusted_root), preferences)
+        self.assertEqual(
+            json.loads(self.settings_path.read_text(encoding="utf-8")),
+            {"theme": "dark", "novelai_app_key": SECRET_KEY, "skip_delete_confirmation": preferences},
+        )
+
+    def test_legacy_boolean_migrates_to_all_categories(self):
+        self.trusted_root.mkdir()
+        self.settings_path.write_text(json.dumps({"skip_delete_confirmation": True}), encoding="utf-8")
+        self.assertEqual(
+            style_store.load_skip_delete_confirmation(self.settings_path, self.trusted_root),
+            style_store.default_delete_confirmation_preferences(True),
+        )
+
 
 class StyleApiTest(unittest.TestCase):
     def setUp(self):
@@ -229,6 +257,28 @@ class StyleApiTest(unittest.TestCase):
         response = self.client.get("/api/settings/novelai")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {"configured": False})
+
+    def test_delete_confirmation_preference_round_trip_and_validation(self):
+        defaults = style_store.default_delete_confirmation_preferences()
+        self.assertEqual(
+            self.client.get("/api/settings/preferences").get_json(),
+            {"skip_delete_confirmation": defaults},
+        )
+        preferences = {**defaults, "rating": True, "novelai_key": True}
+        saved = self.client.put(
+            "/api/settings/preferences", json={"skip_delete_confirmation": preferences}
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.get_json(), {"skip_delete_confirmation": preferences})
+        self.assertEqual(
+            self.client.get("/api/settings/preferences").get_json(),
+            {"skip_delete_confirmation": preferences},
+        )
+        invalid = self.client.put(
+            "/api/settings/preferences", json={"skip_delete_confirmation": {"rating": True}}
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(self.client.get("/api/settings/preferences").get_json()["skip_delete_confirmation"], preferences)
 
     @patch("app.get_style_maker_prompt_presets")
     def test_style_maker_prompt_presets_use_selected_artists(self, get_presets):
@@ -1105,6 +1155,44 @@ class GenerationApiTest(StyleApiTest):
                 self.assertEqual(response.status_code, 404)
 
 
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_shared_dependency_snapshot_is_returned_for_generation_and_history(self, generate):
+        self.save_key()
+        dependency = {
+            "id": 11,
+            "item_id": 1,
+            "title": "기준 공유 그림체",
+            "source_url": "https://arca.live/b/aiart/11",
+            "artists": [{"artist": "reference", "weight": 1.0}],
+            "scale": 5.0,
+            "cfg_rescale": 0.2,
+        }
+        payload = self.request_payload(
+            request_id="shared-dependency-generation",
+            weight_mode="shared_dependency",
+            shared_dependency_reference_id=11,
+        )
+        with patch.object(app, "get_shared_style_dependency_images", return_value=[dependency]):
+            first = self.client.post("/api/style-maker/generate", json=payload)
+            second = self.client.post("/api/style-maker/generate", json=payload)
+        self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
+        self.assertEqual(first.get_json()["shared_dependency_reference_id"], 11)
+        self.assertEqual(first.get_json()["shared_dependency_reference_title"], "기준 공유 그림체")
+        self.assertEqual(first.get_json()["shared_dependency_reference_source_url"], dependency["source_url"])
+        for key in (
+            "shared_dependency_reference_id",
+            "shared_dependency_reference_title",
+            "shared_dependency_reference_source_url",
+        ):
+            self.assertEqual(second.get_json()[key], first.get_json()[key])
+        history = self.client.get("/api/style-manager/generated").get_json()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["shared_dependency_reference_id"], 11)
+        self.assertEqual(history[0]["shared_dependency_reference_title"], "기준 공유 그림체")
+        self.assertEqual(history[0]["shared_dependency_reference_source_url"], dependency["source_url"])
+        generate.assert_called_once()
+
+
 class NovelAISubscriptionTest(unittest.TestCase):
     def response(self, payload):
         response = Mock()
@@ -1265,7 +1353,6 @@ class NovelAISubscriptionTest(unittest.TestCase):
                     )
                 self.assertEqual(raised.exception.status, 502)
                 self.assertNotIn(SECRET_KEY, str(raised.exception))
-
 
 class ConfirmedStyleApiTest(unittest.TestCase):
     def setUp(self):

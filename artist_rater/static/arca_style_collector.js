@@ -1,5 +1,5 @@
 const arcaState = {
-  loaded: false, collecting: false, selectedId: null, timer: null, pollTimer: null,
+  loaded: false, collecting: false, selectedId: null, selectedItem: null, timer: null, pollTimer: null,
   loginPollTimer: null, activeJobId: null, browserConnected: false,
   pendingCollectionPayload: null, loginImporting: false, browserSessionLoadPromise: null,
   imageRestoreEstimate: null,
@@ -410,6 +410,11 @@ function imagePromptFields(image) {
     negative: image?.negative_prompt || "",
     character: (image?.character_prompts || []).map((entry) => entry.prompt).filter(Boolean).join("\n\n"),
   };
+}
+
+function hasArcaDependencyArtists(image) {
+  const prompt = String(image?.base_prompt || image?.prompt || "");
+  return /(?:^|,)\s*(?:[0-9]+(?:\.[0-9]+)?::\s*)?(?:artist|artists)\s*:/i.test(prompt);
 }
 
 function arcaPayload() {
@@ -1429,6 +1434,11 @@ function renderArcaStyleGroups(groups) {
         button.classList.toggle("selected", selected);
         button.setAttribute("aria-pressed", selected ? "true" : "false");
       });
+      referenceAction.dataset.selectedIndex = String(selectedIndex);
+      referenceAction.disabled = !hasArcaDependencyArtists(image);
+      referenceHint.textContent = referenceAction.disabled
+        ? "작가 프롬프트를 인식할 수 없어 기준으로 확정할 수 없습니다."
+        : "이 이미지의 인식된 작가와 설정을 그림체 제작에 적용합니다.";
     };
     (group.images || []).forEach((image, imageIndex) => {
       const button = document.createElement("button");
@@ -1443,7 +1453,28 @@ function renderArcaStyleGroups(groups) {
       buttons.push(button);
       thumbnails.append(button);
     });
-    selectedLayout.append(previewFrame, fields);
+    const referenceAction = document.createElement("button");
+    referenceAction.type = "button";
+    referenceAction.className = "primary arca-set-reference-button";
+    referenceAction.textContent = "이 이미지를 기준 그림체로 확정";
+    referenceAction.disabled = true;
+    referenceAction.addEventListener("click", () => {
+      const image = group.images?.[Number(referenceAction.dataset.selectedIndex)];
+      if (!image || !hasArcaDependencyArtists(image)) return;
+      const setter = globalThis.setSharedDependencyReferenceFromArca;
+      if (typeof setter !== "function") {
+        arcaSetStatus("arcaStyleDialogStatus", "그림체 제작 탭을 준비하지 못했습니다.", "error");
+        return;
+      }
+      setter(image, arcaState.selectedItem || {});
+    });
+    const referenceHint = document.createElement("p");
+    referenceHint.className = "arca-reference-hint";
+    referenceHint.textContent = "작가 프롬프트를 인식할 수 있는 이미지만 확정할 수 있습니다.";
+    const referenceActions = document.createElement("div");
+    referenceActions.className = "arca-reference-actions";
+    referenceActions.append(referenceAction, referenceHint);
+    selectedLayout.append(previewFrame, fields, referenceActions);
     section.append(heading, thumbnails, selectedLayout);
     root.append(section);
     if ((group.images || []).length) selectImage(group.images[0], 0);
@@ -1592,6 +1623,7 @@ async function openArcaStyle(id) {
   try {
     const item = await arcaFetch(`/api/arca-styles/${id}`);
     arcaState.selectedId = id;
+    arcaState.selectedItem = item;
     arcaEl("arcaStyleDialogTitle").textContent = item.title || "수집 그림체";
     arcaEl("arcaStyleSourceLink").href = item.source_url;
     arcaEl("arcaEditPrompt").value = item.prompt || "";
@@ -1621,6 +1653,8 @@ async function saveArcaStyle() {
 
 async function deleteArcaStyle(id = arcaState.selectedId) {
   if (!id || !await globalThis.appDialog.confirm({
+    delete: true,
+    delete_category: "arca_style",
     title: "수집 그림체 삭제",
     message: "선택한 수집 그림체를 삭제할까요?",
     details: ["날짜 정보가 있는 항목은 다음 수집 때 다시 검색될 수 있습니다."],
@@ -1632,6 +1666,7 @@ async function deleteArcaStyle(id = arcaState.selectedId) {
     if (arcaState.selectedId === id) {
       arcaEl("arcaStyleDialog").classList.add("hidden");
       arcaState.selectedId = null;
+      arcaState.selectedItem = null;
     }
     const message = result.recollect_date
       ? `삭제했습니다. ${result.recollect_date}은 다음 수집 때 다시 검색됩니다.`
@@ -1751,5 +1786,5 @@ if (typeof module !== "undefined") module.exports = {
   normalizeArcaStatisticRows, arcaStatisticsSummary, arcaStatisticEntryText,
   formatArcaWeight, filterArcaStatisticRows, filterAndSortArcaStatisticRows, paginateArcaStatisticRows,
   arcaTagDetailQuery, arcaSequenceDetailQuery, arcaStatisticsQuery, arcaRecommendationPreset,
-  randomArcaStatisticsSamples, formatArcaRecommendation,
+  randomArcaStatisticsSamples, formatArcaRecommendation, hasArcaDependencyArtists,
 };

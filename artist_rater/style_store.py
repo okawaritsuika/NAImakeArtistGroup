@@ -17,6 +17,35 @@ MAX_APP_KEY_LENGTH = 8192
 MAX_PROMPT_PRESET_LENGTH = 16384
 ORPHAN_CLEANUP_AGE_SECONDS = 60 * 60
 
+DELETE_CONFIRMATION_CATEGORIES = (
+    "rating_example",
+    "rating",
+    "generated",
+    "style",
+    "arca_style",
+    "comparison_group",
+    "comparison_result",
+    "novelai_key",
+)
+
+
+def default_delete_confirmation_preferences(value=False):
+    return {category: bool(value) for category in DELETE_CONFIRMATION_CATEGORIES}
+
+
+def normalize_delete_confirmation_preferences(value):
+    if isinstance(value, bool):
+        return default_delete_confirmation_preferences(value)
+    if not isinstance(value, dict):
+        raise ValueError("skip_delete_confirmation must be an object.")
+    if set(value) != set(DELETE_CONFIRMATION_CATEGORIES) or any(
+        type(value[category]) is not bool for category in DELETE_CONFIRMATION_CATEGORIES
+    ):
+        raise ValueError(
+            "skip_delete_confirmation must contain exactly the supported categories with boolean values."
+        )
+    return {category: value[category] for category in DELETE_CONFIRMATION_CATEGORIES}
+
 
 class SettingsError(Exception):
     pass
@@ -132,6 +161,31 @@ def delete_app_key(settings_path, trusted_root):
             raise SettingsError("Settings file could not be deleted.") from exc
 
 
+def load_skip_delete_confirmation(settings_path, trusted_root):
+    """Return category-specific destructive-action preferences.
+
+    A legacy boolean is intentionally read as an all-categories preference so
+    existing settings files keep their prior behavior without being rewritten.
+    """
+    value = _load_trusted_settings(settings_path, trusted_root).get("skip_delete_confirmation")
+    if type(value) is bool:
+        return default_delete_confirmation_preferences(value)
+    if isinstance(value, dict):
+        try:
+            return normalize_delete_confirmation_preferences(value)
+        except ValueError:
+            pass
+    return default_delete_confirmation_preferences()
+
+
+def save_skip_delete_confirmation(settings_path, skip_delete_confirmation, trusted_root):
+    normalized = normalize_delete_confirmation_preferences(skip_delete_confirmation)
+    settings = _load_trusted_settings(settings_path, trusted_root)
+    settings["skip_delete_confirmation"] = normalized
+    _write_trusted_settings(settings_path, settings, trusted_root)
+    return normalized
+
+
 def load_prompt_preset_overrides(settings_path, trusted_root):
     stored = _load_trusted_settings(settings_path, trusted_root).get("prompt_preset_overrides")
     if not isinstance(stored, dict):
@@ -205,6 +259,10 @@ def _stored_result(row):
         "steps": row["steps"],
         "scale": row["scale"],
         "cfg_rescale": row["cfg_rescale"],
+        "shared_dependency_reference_id": row["shared_dependency_reference_id"],
+        "shared_dependency_reference_title": row["shared_dependency_reference_title"],
+        "shared_dependency_reference_source_url": row["shared_dependency_reference_source_url"],
+        "shared_dependency_artist_policy": row["shared_dependency_artist_policy"],
         "variety_plus": bool(row["variety_plus"]) if row["variety_plus"] is not None else None,
         "skip_cfg_above_sigma": row["skip_cfg_above_sigma"],
         "model": row["model"],
@@ -222,6 +280,10 @@ def _find_request(conn, request_id):
                generated_images.steps, generated_images.scale,
                generated_images.cfg_rescale, generated_images.variety_plus,
                generated_images.skip_cfg_above_sigma, generated_images.model,
+               generated_images.shared_dependency_reference_id,
+               generated_images.shared_dependency_reference_title,
+               generated_images.shared_dependency_reference_source_url,
+               generated_images.shared_dependency_artist_policy,
                art_styles.style_hash
         FROM generated_images
         JOIN art_styles ON art_styles.id = generated_images.style_id
@@ -274,6 +336,10 @@ def reserve_generation_request(db_path, request_id, payload_hash):
                        generated_images.steps, generated_images.scale,
                        generated_images.cfg_rescale, generated_images.variety_plus,
                        generated_images.skip_cfg_above_sigma, generated_images.model,
+                       generated_images.shared_dependency_reference_id,
+                       generated_images.shared_dependency_reference_title,
+                       generated_images.shared_dependency_reference_source_url,
+                       generated_images.shared_dependency_artist_policy,
                        art_styles.style_hash
                 FROM generated_images
                 JOIN art_styles ON art_styles.id = generated_images.style_id
@@ -378,6 +444,8 @@ def save_generated_result(
     variety_plus=False,
     skip_cfg_above_sigma=None,
     model="",
+    shared_dependency_reference=None,
+    shared_dependency_artist_policy=None,
 ):
     request_id = str(request_id or "")
     if not request_id.strip():
@@ -398,6 +466,22 @@ def save_generated_result(
     )
     identity_hash = style_hash(normalized_artists)
     artist_prompt = build_artist_prompt(normalized_artists)
+    dependency_reference = shared_dependency_reference if isinstance(shared_dependency_reference, dict) else {}
+    dependency_reference_id = dependency_reference.get("id")
+    if type(dependency_reference_id) is not int or dependency_reference_id < 1:
+        dependency_reference_id = None
+    dependency_reference_title = dependency_reference.get("title")
+    if not isinstance(dependency_reference_title, str) or not dependency_reference_title.strip():
+        dependency_reference_title = None
+    else:
+        dependency_reference_title = dependency_reference_title.strip()
+    dependency_reference_source_url = dependency_reference.get("source_url")
+    if not isinstance(dependency_reference_source_url, str) or not dependency_reference_source_url.strip():
+        dependency_reference_source_url = None
+    else:
+        dependency_reference_source_url = dependency_reference_source_url.strip()
+    if shared_dependency_artist_policy not in {None, "highest", "random"}:
+        raise ValueError("shared_dependency_artist_policy must be highest or random.")
     timestamp = datetime.now(timezone.utc).isoformat()
     generated_root = Path(generated_dir).resolve()
     generated_root.mkdir(parents=True, exist_ok=True)
@@ -452,8 +536,15 @@ def save_generated_result(
                     original_quality_prompt, excluded_quality_tags_json, fixed_prompt, negative_prompt,
                     character_prompts_json, combined_prompt, artist_prompt,
                     artists_json, seed, width, height, sampler, noise_schedule, steps, scale,
-                    cfg_rescale, variety_plus, skip_cfg_above_sigma, model, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cfg_rescale, variety_plus, skip_cfg_above_sigma, model,
+                    shared_dependency_reference_id, shared_dependency_reference_title,
+                    shared_dependency_reference_source_url, shared_dependency_artist_policy,
+                    created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     request_id,
@@ -480,6 +571,10 @@ def save_generated_result(
                     1 if variety_plus else 0,
                     skip_cfg_above_sigma,
                     model,
+                    dependency_reference_id,
+                    dependency_reference_title,
+                    dependency_reference_source_url,
+                    shared_dependency_artist_policy,
                     timestamp,
                 ),
             )
@@ -526,6 +621,10 @@ def save_generated_result(
             "steps": int(steps),
             "scale": float(scale),
             "cfg_rescale": float(cfg_rescale),
+            "shared_dependency_reference_id": dependency_reference_id,
+            "shared_dependency_reference_title": dependency_reference_title,
+            "shared_dependency_reference_source_url": dependency_reference_source_url,
+            "shared_dependency_artist_policy": shared_dependency_artist_policy,
             "variety_plus": bool(variety_plus),
             "skip_cfg_above_sigma": skip_cfg_above_sigma,
             "model": model,

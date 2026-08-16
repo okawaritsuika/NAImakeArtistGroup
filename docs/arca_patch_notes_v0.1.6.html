@@ -1,0 +1,45 @@
+<div style="max-width:920px;margin:0 auto;padding:22px;color:#e8edf5;background:#171b22;border:1px solid #343c49;border-radius:14px;line-height:1.7;word-break:keep-all;">
+  <h1 style="margin:0 0 8px;font-size:28px;color:#7de0d6;">NovelAI 그림체 도구 v0.1.6 패치노트</h1>
+  <p style="margin:0 0 18px;color:#aeb8c7;">작가 예제 그림을 관리하고, 공유 그림체를 기준으로 작가를 구성하는 기능을 추가했으며, 그림체 제작 화면과 삭제 설정을 다듬은 업데이트입니다.</p>
+
+  <div style="margin:16px 0;padding:14px 16px;background:#202732;border:1px solid #3c4858;border-radius:10px;">
+    <strong style="color:#ffffff;">기존 사용자 업데이트</strong>
+    <p style="margin:6px 0 0;">v0.1.1 이상은 리모콘에서 <strong style="color:#7de0d6;">업데이트 확인 → 업데이트 받기</strong>를 누르면 됩니다. 기존 평가, 확정 그림체, 생성 기록, App Key와 로컬 이미지는 유지됩니다.</p>
+  </div>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">1. 작가 뽑기와 평가 예제</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">작가 뽑기에서 게시물 기준일을 기본값·제공된 기준일·직접 지정 중에서 선택할 수 있습니다. 선택한 날짜는 후보 수집과 제외 조건 검색에 함께 적용됩니다.</li>
+    <li style="margin:7px 0;">평가 작가 카드에서 Danbooru 작가 검색으로 바로 이동하고, 대표 썸네일을 고화질 WebP로 받거나 갱신할 수 있습니다.</li>
+    <li style="margin:7px 0;">작가별 예제 그림을 추가로 수집해 갤러리에서 확인하고, 대표 썸네일 지정이나 개별 삭제를 할 수 있습니다.</li>
+    <li style="margin:7px 0;">이미 저장한 게시물은 다시 수집해도 중복 저장하지 않습니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">2. 공유 그림체 의존 생성</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">공유 그림체 이미지의 작가 구성을 기준으로 최종 작가 수를 정하는 <strong style="color:#ffffff;">공유 그림체 의존</strong> 모드를 추가했습니다.</li>
+    <li style="margin:7px 0;">기준 그림체를 목록에서 고정하거나 랜덤으로 선택하고, 기준 작가를 가중치 우선 또는 랜덤으로 고를 수 있습니다.</li>
+    <li style="margin:7px 0;">고정 작가·기준 그림체·평가 작가·다른 공유 그림체의 공급원 비율을 정할 수 있으며, 후보가 부족하면 남은 공급원으로 자동 재분배합니다.</li>
+    <li style="margin:7px 0;">기준 그림체의 생성 설정과 출처를 결과와 제작 기록에 남겨 어떤 그림을 기준으로 했는지 다시 확인할 수 있습니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">3. 그림체 제작 히스토리와 생성 리모콘</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">제작 기록 히스토리를 별도 패널에서 열어 프롬프트·작가·생성 설정·결과를 확인하고 다시 적용하거나 삭제할 수 있습니다.</li>
+    <li style="margin:7px 0;">프롬프트·생성 영역을 접고 펼칠 수 있습니다.</li>
+    <li style="margin:7px 0;">화면 위에 고정되는 생성 리모콘에서 1장 생성·연속 생성·일시정지·중지를 조작할 수 있습니다.</li>
+    <li style="margin:7px 0;">고정 작가·랜덤 작가·가중치 표의 최종 프롬프트 순서와 값을 맞추고, 숫자로 끝나는 태그의 구분자를 더 안정적으로 보정합니다.</li>
+  </ul>
+
+  <h2 style="margin:26px 0 8px;font-size:21px;color:#9ed0ff;">4. 삭제 확인과 도움말</h2>
+  <ul style="margin:8px 0;padding-left:24px;">
+    <li style="margin:7px 0;">설정에서 평가 예제·평가 기록·생성 기록·그림체·수집 그림체·비교군·비교 이미지·NovelAI App Key의 삭제 전 확인 여부를 종류별로 정할 수 있습니다.</li>
+    <li style="margin:7px 0;">기존 설정의 단일 삭제 확인값도 새 종류별 설정으로 호환됩니다.</li>
+    <li style="margin:7px 0;">입력 조건 설명을 키보드로도 열 수 있는 도움말을 추가하고, 화면 가장자리나 모달에 가려지지 않도록 표시 위치를 조정합니다.</li>
+  </ul>
+
+  <div style="margin-top:26px;padding:14px 16px;background:#202732;border-left:4px solid #7de0d6;border-radius:8px;">
+    <strong style="color:#ffffff;">안전한 업데이트</strong>
+    <p style="margin:6px 0 0;">배포 파일에는 개인 평가, NovelAI App Key, 로그인 정보와 사용자가 만든 이미지가 포함되지 않습니다. EXE SHA-256: <strong style="color:#7de0d6;">67f61f8cb8b3952dbd28411ad766ba8eea312d43e215bd5e3123f3847dcf933f</strong> · 크기: 84,179,635 bytes (80.28 MiB)</p>
+  </div>
+</div>

@@ -6,22 +6,42 @@ import re
 
 
 SCORE_SELECTION_WEIGHT = {1: 0.08, 2: 0.2, 3: 0.55, 4: 1.0, 5: 1.6}
-_WEIGHTED_PROMPT_GROUP = re.compile(r"([+-]?\d+(?:\.\d+)?)::([\s\S]*?)::")
-_UNWEIGHTED_ARTIST_CLOSER = re.compile(r"(artist\s*:[^,\n]*?\d)\s*::", re.I)
+_WEIGHTED_PROMPT_GROUP = re.compile(r"([+-]?[0-9]+(?:\.[0-9]+)?)\s*::([\s\S]*?)::")
+_NUMERIC_PROMPT_MARKER = re.compile(r"(?<![0-9.])([+-]?[0-9]+(?:\.[0-9]+)?)\s*::")
+_MISSING_PROMPT_SEPARATOR = re.compile(r"::\s*(?=[+-]?[0-9]+(?:\.[0-9]+)?\s*::)")
 
 
 def normalize_numeric_prompt_closers(prompt):
-    """Keep numeric weight openers intact and space numeric tag endings before ``::``."""
+    """Normalize weighted prompt markers and numeric tag endings before ``::``."""
     text = str(prompt or "")
 
     def normalize_group(match):
+        prefix = text[: match.start()].rstrip()
+        if prefix and not prefix.endswith((",", "::")):
+            return match.group(0)
         body = match.group(2).rstrip()
-        if body[-1:].isdigit():
+        if body[-1:] in "0123456789":
             body += " "
         return f"{match.group(1)}::{body}::"
 
     text = _WEIGHTED_PROMPT_GROUP.sub(normalize_group, text)
-    return _UNWEIGHTED_ARTIST_CLOSER.sub(lambda match: f"{match.group(1)} ::", text)
+    weighted_spans = [
+        match.span()
+        for match in _WEIGHTED_PROMPT_GROUP.finditer(text)
+        if not text[: match.start()].rstrip()
+        or text[: match.start()].rstrip().endswith((",", "::"))
+    ]
+
+    def normalize_marker(match):
+        if any(start <= match.start() < end for start, end in weighted_spans):
+            return match.group(0)
+        prefix = text[: match.start()].rstrip()
+        if not prefix or prefix.endswith((",", "::")):
+            return f"{match.group(1)}::"
+        return f"{match.group(1)} ::"
+
+    text = _NUMERIC_PROMPT_MARKER.sub(normalize_marker, text)
+    return _MISSING_PROMPT_SEPARATOR.sub("::, ", text)
 
 
 def _integer_value(value, error_message):
