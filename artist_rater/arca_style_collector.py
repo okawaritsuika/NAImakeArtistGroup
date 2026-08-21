@@ -27,6 +27,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from style_logic import normalize_numeric_prompt_closers
+from novelai_metadata import (
+    classify_model,
+    extract_complexity,
+    extract_prompt_parts as extract_structured_prompt_parts,
+    model_filter_sql,
+)
 
 
 ARCA_BASE_URL = "https://arca.live"
@@ -234,6 +240,8 @@ def init_arca_style_tables(db_path):
             negative_prompt TEXT DEFAULT '', seed TEXT DEFAULT '', sampler TEXT DEFAULT '',
             steps INTEGER, scale REAL, cfg_rescale REAL, noise_schedule TEXT DEFAULT '',
             model TEXT DEFAULT '', width INTEGER, height INTEGER,
+            model_id TEXT DEFAULT '', model_family TEXT DEFAULT 'unknown', model_generation TEXT DEFAULT 'unknown', model_variant TEXT DEFAULT 'unknown', complexity TEXT DEFAULT '',
+            quality_toggle INTEGER, uc_preset INTEGER,
             raw_metadata_json TEXT DEFAULT '{}', body_prompt_text TEXT DEFAULT '', memo TEXT DEFAULT '',
             recommendation_count INTEGER, view_count INTEGER
         );
@@ -244,6 +252,8 @@ def init_arca_style_tables(db_path):
             negative_prompt TEXT DEFAULT '', seed TEXT DEFAULT '', sampler TEXT DEFAULT '',
             steps INTEGER, scale REAL, cfg_rescale REAL, noise_schedule TEXT DEFAULT '',
             model TEXT DEFAULT '', width INTEGER, height INTEGER,
+            model_id TEXT DEFAULT '', model_family TEXT DEFAULT 'unknown', model_generation TEXT DEFAULT 'unknown', model_variant TEXT DEFAULT 'unknown', complexity TEXT DEFAULT '',
+            quality_toggle INTEGER, uc_preset INTEGER,
             raw_metadata_json TEXT DEFAULT '{}', created_at TEXT NOT NULL,
             UNIQUE(item_id, image_url), FOREIGN KEY(item_id) REFERENCES arca_style_items(id) ON DELETE CASCADE
         );
@@ -307,8 +317,54 @@ def init_arca_style_tables(db_path):
         _ensure_column(conn, "arca_collection_jobs", "estimated_bytes", "INTEGER")
         _ensure_column(conn, "arca_style_images", "base_prompt", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "arca_style_images", "character_prompts_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "arca_style_images", "model_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "arca_style_images", "model_family", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "arca_style_images", "model_generation", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "arca_style_images", "model_variant", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "arca_style_images", "complexity", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "arca_style_images", "quality_toggle", "INTEGER")
+        _ensure_column(conn, "arca_style_images", "uc_preset", "INTEGER")
+        _ensure_column(conn, "arca_style_items", "model_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "arca_style_items", "model_family", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "arca_style_items", "model_generation", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "arca_style_items", "model_variant", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "arca_style_items", "complexity", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "arca_style_items", "quality_toggle", "INTEGER")
+        _ensure_column(conn, "arca_style_items", "uc_preset", "INTEGER")
         _ensure_column(conn, "arca_style_items", "recommendation_count", "INTEGER")
         _ensure_column(conn, "arca_style_items", "view_count", "INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_arca_items_model_family ON arca_style_items(model_family)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_arca_images_model_family ON arca_style_images(model_family)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_arca_images_model_id ON arca_style_images(model_id)")
+        _backfill_model_columns(conn)
+
+
+def _backfill_model_columns(conn):
+    """Idempotently index model values in old databases without deleting data."""
+    for table in ("arca_style_images", "arca_style_items"):
+        rows = conn.execute(f"SELECT id,model,raw_metadata_json,metadata_status FROM {table}").fetchall()
+        for row in rows:
+            if str(row[3] or "").casefold() != "ok":
+                conn.execute(
+                    f"UPDATE {table} SET model_id='',model_family='unknown',model_generation='unknown',model_variant='unknown',complexity='',quality_toggle=NULL,uc_preset=NULL WHERE id=?",
+                    (row[0],),
+                )
+                continue
+            raw_model = row[1] or ""
+            try:
+                raw = json.loads(row[2] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raw = {}
+            if isinstance(raw, dict) and raw.get("model") not in (None, ""):
+                raw_model = raw.get("model")
+            fields = classify_model(raw_model)
+            base_prompt, _, _ = _extract_prompt_parts(raw) if isinstance(raw, dict) else ("", "", [])
+            complexity = extract_complexity(base_prompt, fields["model_family"])
+            quality_toggle, uc_preset = _extract_quality_options(raw)
+            conn.execute(
+                f"UPDATE {table} SET model_id=?,model_family=?,model_generation=?,model_variant=?,complexity=?,quality_toggle=?,uc_preset=? WHERE id=?",
+                (fields["model_id"], fields["model_family"], fields["model_generation"], fields["model_variant"], complexity, quality_toggle, uc_preset, row[0]),
+            )
 
 
 def _init_danbooru_seed_tables(conn):
@@ -359,8 +415,16 @@ def export_arca_style_seed(source_db, seed_db):
         }
         item_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_items)")]
         image_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_images)")]
-        item_select = ["''" if name == "representative_image_path" else name for name in item_columns]
-        image_select = ["''" if name == "image_path" else name for name in image_columns]
+        source_item_columns = {row[1] for row in conn.execute("PRAGMA source.table_info(arca_style_items)")}
+        source_image_columns = {row[1] for row in conn.execute("PRAGMA source.table_info(arca_style_images)")}
+        item_select = [
+            "''" if name == "representative_image_path" or name not in source_item_columns and name not in {"quality_toggle", "uc_preset"} else ("NULL" if name in {"quality_toggle", "uc_preset"} and name not in source_item_columns else name)
+            for name in item_columns
+        ]
+        image_select = [
+            "''" if name == "image_path" or name not in source_image_columns and name not in {"quality_toggle", "uc_preset"} else ("NULL" if name in {"quality_toggle", "uc_preset"} and name not in source_image_columns else name)
+            for name in image_columns
+        ]
         conn.execute(
             f"INSERT INTO arca_style_items ({','.join(item_columns)}) "
             f"SELECT {','.join(item_select)} FROM source.arca_style_items"
@@ -369,6 +433,7 @@ def export_arca_style_seed(source_db, seed_db):
             f"INSERT INTO arca_style_images ({','.join(image_columns)}) "
             f"SELECT {','.join(image_select)} FROM source.arca_style_images"
         )
+        _backfill_model_columns(conn)
         run_columns = [
             row[1] for row in conn.execute("PRAGMA main.table_info(arca_collection_runs)")
             if row[1] != "job_id"
@@ -433,17 +498,27 @@ def import_arca_style_seed(db_path, seed_db):
         if "artist_cache" in seed_tables:
             conn.execute("INSERT OR IGNORE INTO artist_cache SELECT * FROM seed.artist_cache")
         item_columns = [row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_items)") if row[1] != "id"]
+        seed_item_columns = {row[1] for row in conn.execute("PRAGMA seed.table_info(arca_style_items)")}
+        item_select = [
+            name if name in seed_item_columns else ("'unknown'" if name in {"model_family", "model_generation", "model_variant"} else ("NULL" if name in {"quality_toggle", "uc_preset"} else "''"))
+            for name in item_columns
+        ]
         conn.execute(
             f"INSERT OR IGNORE INTO arca_style_items ({','.join(item_columns)}) "
-            f"SELECT {','.join(item_columns)} FROM seed.arca_style_items"
+            f"SELECT {','.join(item_select)} FROM seed.arca_style_items"
         )
         image_columns = [
             row[1] for row in conn.execute("PRAGMA main.table_info(arca_style_images)")
             if row[1] not in {"id", "item_id"}
         ]
+        seed_image_columns = {row[1] for row in conn.execute("PRAGMA seed.table_info(arca_style_images)")}
+        image_select = [
+            f"image.{name}" if name in seed_image_columns else ("'unknown'" if name in {"model_family", "model_generation", "model_variant"} else ("NULL" if name in {"quality_toggle", "uc_preset"} else "''"))
+            for name in image_columns
+        ]
         conn.execute(
             f"INSERT OR IGNORE INTO arca_style_images (item_id,{','.join(image_columns)}) "
-            f"SELECT target.id,{','.join(f'image.{name}' for name in image_columns)} "
+            f"SELECT target.id,{','.join(image_select)} "
             "FROM seed.arca_style_images image "
             "JOIN seed.arca_style_items source ON source.id=image.item_id "
             "JOIN arca_style_items target ON target.source_url=source.source_url"
@@ -472,6 +547,7 @@ def import_arca_style_seed(db_path, seed_db):
             "INSERT OR IGNORE INTO arca_collection_invalidations "
             "SELECT * FROM seed.arca_collection_invalidations"
         )
+        _backfill_model_columns(conn)
         conn.execute(
             "INSERT INTO arca_seed_imports(seed_hash,imported_at) VALUES(?,?)",
             (seed_hash, datetime.now().isoformat(timespec="seconds")),
@@ -1489,7 +1565,7 @@ def _merge_raw_metadata(values, raw, allow_plain_prompt=True):
                 parsed.setdefault("prompt", description)
             if source:
                 parsed.setdefault("source", source)
-                if source.casefold().startswith("novelai diffusion"):
+                if source.casefold().startswith("novelai diffusion") or classify_model(source)["model_family"] != "unknown":
                     parsed.setdefault("model", source)
             if software:
                 parsed.setdefault("software", software)
@@ -1577,6 +1653,10 @@ def _is_novelai_metadata(values):
         return False
     if isinstance(values.get("v4_prompt"), dict):
         return True
+    if classify_model(values.get("model"))["model_family"] != "unknown" and (
+        values.get("prompt") or values.get("base_prompt") or values.get("v4_prompt")
+    ):
+        return True
     software = str(values.get("software") or "").casefold()
     source = str(values.get("source") or "").casefold()
     if values.get("prompt") and (software.startswith("novelai") or source.startswith("novelai diffusion")):
@@ -1585,24 +1665,39 @@ def _is_novelai_metadata(values):
 
 
 def _extract_prompt_parts(values):
-    v4_prompt = values.get("v4_prompt") if isinstance(values.get("v4_prompt"), dict) else {}
-    caption = v4_prompt.get("caption") if isinstance(v4_prompt.get("caption"), dict) else {}
-    base_prompt = normalize_numeric_prompt_closers(caption.get("base_caption") or values.get("prompt") or values.get("prompts") or "")
-    characters = []
-    for entry in caption.get("char_captions", []) if isinstance(caption.get("char_captions"), list) else []:
-        if isinstance(entry, dict) and entry.get("char_caption"):
-            characters.append({
-                "prompt": normalize_numeric_prompt_closers(entry["char_caption"]),
-                "centers": entry.get("centers") if isinstance(entry.get("centers"), list) else [],
-            })
-    v4_negative = values.get("v4_negative_prompt") if isinstance(values.get("v4_negative_prompt"), dict) else {}
-    negative_caption = v4_negative.get("caption") if isinstance(v4_negative.get("caption"), dict) else {}
-    negative_prompt = normalize_numeric_prompt_closers(negative_caption.get("base_caption") or values.get("uc") or values.get("negative_prompt") or values.get("undesired_content") or "")
-    return base_prompt, negative_prompt, characters
+    base_prompt, negative_prompt, characters = extract_structured_prompt_parts(values)
+    for entry in characters:
+        entry["prompt"] = normalize_numeric_prompt_closers(entry.get("prompt") or "")
+    return (
+        normalize_numeric_prompt_closers(base_prompt),
+        normalize_numeric_prompt_closers(negative_prompt),
+        characters,
+    )
+
+
+def _extract_quality_options(values):
+    """Read only NovelAI's wire keys, with strict scalar types.
+
+    ``qualityToggle`` and ``ucPreset`` are shared by the V4.5/V5 metadata
+    payloads.  They are optional, so malformed or absent values stay ``None``
+    instead of being inferred from prompt text or silently defaulted.
+    """
+    if not isinstance(values, dict):
+        return None, None
+    quality_value = values.get("qualityToggle") if "qualityToggle" in values else None
+    if isinstance(quality_value, bool):
+        quality_toggle = quality_value
+    elif type(quality_value) is int and quality_value in (0, 1):
+        quality_toggle = bool(quality_value)
+    else:
+        quality_toggle = None
+    uc_value = values.get("ucPreset") if "ucPreset" in values else None
+    uc_preset = uc_value if type(uc_value) is int and 0 <= uc_value <= 4 else None
+    return quality_toggle, uc_preset
 
 
 def extract_novelai_metadata(image_bytes, content_type=""):
-    base = {"metadata_status": "no_metadata", "prompt": "", "base_prompt": "", "negative_prompt": "", "character_prompts": [], "seed": "", "sampler": "", "steps": None, "scale": None, "cfg_rescale": None, "noise_schedule": "", "model": "", "width": None, "height": None, "variety_plus": None, "skip_cfg_above_sigma": None, "raw_metadata_json": "{}"}
+    base = {"metadata_status": "no_metadata", "prompt": "", "base_prompt": "", "negative_prompt": "", "character_prompts": [], "seed": "", "sampler": "", "steps": None, "scale": None, "cfg_rescale": None, "noise_schedule": "", "model": "", "model_id": "", "model_family": "unknown", "model_generation": "unknown", "model_variant": "unknown", "complexity": "", "quality_toggle": None, "uc_preset": None, "width": None, "height": None, "variety_plus": None, "skip_cfg_above_sigma": None, "raw_metadata_json": "{}"}
     content_type = content_type.lower()
     is_png = image_bytes.startswith(b"\x89PNG") or "png" in content_type
     is_webp = (
@@ -1625,7 +1720,7 @@ def extract_novelai_metadata(image_bytes, content_type=""):
                 source = str(raw or "").strip()
                 if source:
                     values.setdefault("source", source)
-                    if source.casefold().startswith("novelai diffusion"):
+                    if source.casefold().startswith("novelai diffusion") or classify_model(source)["model_family"] != "unknown":
                         values.setdefault("model", source)
             else:
                 _merge_raw_metadata(
@@ -1641,10 +1736,14 @@ def extract_novelai_metadata(image_bytes, content_type=""):
     def pick(*names):
         return next((values[name] for name in names if values.get(name) not in (None, "")), "")
     prompt, negative, characters = _extract_prompt_parts(values)
-    if not prompt and not negative: return base
+    if not prompt and not negative and not characters: return base
     has_variety = "skip_cfg_above_sigma" in values
     skip_cfg = values.get("skip_cfg_above_sigma") if has_variety else None
-    base.update({"metadata_status": "ok", "prompt": str(prompt), "base_prompt": str(prompt), "negative_prompt": str(negative), "character_prompts": characters, "seed": str(pick("seed")), "sampler": str(pick("sampler")), "steps": pick("steps") or None, "scale": pick("scale") or None, "cfg_rescale": pick("cfg_rescale") or None, "noise_schedule": str(pick("noise_schedule")), "model": str(pick("model")), "width": pick("width") or None, "height": pick("height") or None, "variety_plus": bool(skip_cfg) if has_variety else None, "skip_cfg_above_sigma": skip_cfg, "raw_metadata_json": json.dumps(values, ensure_ascii=False)})
+    raw_model = str(pick("model"))
+    model_fields = classify_model(raw_model)
+    complexity = extract_complexity(prompt, model_fields["model_family"])
+    quality_toggle, uc_preset = _extract_quality_options(values)
+    base.update({"metadata_status": "ok", "prompt": str(prompt), "base_prompt": str(prompt), "negative_prompt": str(negative), "character_prompts": characters, "seed": str(pick("seed")), "sampler": str(pick("sampler")), "steps": pick("steps") or None, "scale": pick("scale") or None, "cfg_rescale": pick("cfg_rescale") or None, "noise_schedule": str(pick("noise_schedule")), "model": raw_model, "model_id": model_fields["model_id"], "model_family": model_fields["model_family"], "model_generation": model_fields["model_generation"], "model_variant": model_fields["model_variant"], "complexity": complexity, "quality_toggle": quality_toggle, "uc_preset": uc_preset, "width": pick("width") or None, "height": pick("height") or None, "variety_plus": bool(skip_cfg) if has_variety else None, "skip_cfg_above_sigma": skip_cfg, "raw_metadata_json": json.dumps(values, ensure_ascii=False)})
     return base
 
 
@@ -1658,21 +1757,24 @@ def revalidate_stored_metadata(db_path):
                 except (json.JSONDecodeError, TypeError):
                     values = {}
                 if not _is_novelai_metadata(values):
-                    assignments = "metadata_status='no_metadata',prompt='',negative_prompt=''"
+                    assignments = "metadata_status='no_metadata',prompt='',negative_prompt='',model_id='',model_family='unknown',model_generation='unknown',model_variant='unknown',complexity='',quality_toggle=NULL,uc_preset=NULL"
                     if table == "arca_style_images":
                         assignments += ",base_prompt='',character_prompts_json='[]'"
                     conn.execute(f"UPDATE {table} SET {assignments} WHERE id=?", (row["id"],))
                     continue
                 prompt, negative, characters = _extract_prompt_parts(values)
+                model_fields = classify_model(values.get("model"))
+                complexity = extract_complexity(prompt, model_fields["model_family"])
+                quality_toggle, uc_preset = _extract_quality_options(values)
                 if table == "arca_style_images":
                     conn.execute(
-                        "UPDATE arca_style_images SET prompt=?,base_prompt=?,negative_prompt=?,character_prompts_json=? WHERE id=?",
-                        (prompt, prompt, negative, json.dumps(characters, ensure_ascii=False), row["id"]),
+                        "UPDATE arca_style_images SET prompt=?,base_prompt=?,negative_prompt=?,character_prompts_json=?,model_id=?,model_family=?,model_generation=?,model_variant=?,complexity=?,quality_toggle=?,uc_preset=? WHERE id=?",
+                        (prompt, prompt, negative, json.dumps(characters, ensure_ascii=False), model_fields["model_id"], model_fields["model_family"], model_fields["model_generation"], model_fields["model_variant"], complexity, quality_toggle, uc_preset, row["id"]),
                     )
                 else:
                     conn.execute(
-                        "UPDATE arca_style_items SET prompt=?,negative_prompt=? WHERE id=?",
-                        (prompt, negative, row["id"]),
+                        "UPDATE arca_style_items SET prompt=?,negative_prompt=?,model_id=?,model_family=?,model_generation=?,model_variant=?,complexity=?,quality_toggle=?,uc_preset=? WHERE id=?",
+                        (prompt, negative, model_fields["model_id"], model_fields["model_family"], model_fields["model_generation"], model_fields["model_variant"], complexity, quality_toggle, uc_preset, row["id"]),
                     )
 
 
@@ -2230,6 +2332,89 @@ def count_style_groups_for_item(db_path, item_id):
     return len(build_style_groups(rows))
 
 
+def _image_model_where(filters, alias="image"):
+    try:
+        clause, _ = model_filter_sql(
+            (filters or {}).get("model", (filters or {}).get("model_filter", (filters or {}).get("model_family", "all"))), alias
+        )
+    except ValueError as exc:
+        raise ArcaCollectorError(str(exc)) from None
+    return " AND " + clause if clause else ""
+
+
+def _image_model_args(filters):
+    try:
+        _, args = model_filter_sql(
+            (filters or {}).get("model", (filters or {}).get("model_filter", (filters or {}).get("model_family", "all"))), "image"
+        )
+    except ValueError as exc:
+        raise ArcaCollectorError(str(exc)) from None
+    return args
+
+
+def _requested_model_filter(filters):
+    filters = filters or {}
+    return filters.get("model", filters.get("model_filter", filters.get("model_family", "all")))
+
+
+def _model_filter_state(filters, alias="image"):
+    try:
+        clause, args = model_filter_sql(_requested_model_filter(filters), alias)
+    except ValueError as exc:
+        raise ArcaCollectorError(str(exc)) from None
+    return bool(clause), clause, args
+
+
+def _override_item_with_filtered_images(item, images):
+    """Make a model-filtered card describe its filtered image subset."""
+    item["image_count"] = len(images)
+    if not images:
+        for key, value in {
+            "representative_image_url": "", "representative_image_path": "",
+            "prompt": "", "base_prompt": "", "negative_prompt": "",
+            "model": "", "model_id": "", "model_family": "unknown",
+            "model_generation": "unknown", "model_variant": "unknown",
+            "complexity": "", "quality_toggle": None, "uc_preset": None,
+            "metadata_status": "no_metadata", "raw_metadata_json": "{}",
+        }.items():
+            item[key] = value
+        return item
+    representative = next(
+        (
+            image for image in images
+            if image.get("metadata_status") == "ok"
+            and (image.get("base_prompt") or image.get("prompt") or "").strip()
+        ),
+        images[0],
+    )
+    item.update({
+        "representative_image_url": representative.get("image_url") or "",
+        "representative_image_path": representative.get("image_path") or "",
+        "metadata_status": representative.get("metadata_status") or "no_metadata",
+        "prompt": representative.get("prompt") or "",
+        "base_prompt": representative.get("base_prompt") or representative.get("prompt") or "",
+        "negative_prompt": representative.get("negative_prompt") or "",
+        "seed": representative.get("seed") or "",
+        "sampler": representative.get("sampler") or "",
+        "steps": representative.get("steps"),
+        "scale": representative.get("scale"),
+        "cfg_rescale": representative.get("cfg_rescale"),
+        "noise_schedule": representative.get("noise_schedule") or "",
+        "model": representative.get("model") or "",
+        "model_id": representative.get("model_id") or "",
+        "model_family": representative.get("model_family") or "unknown",
+        "model_generation": representative.get("model_generation") or "unknown",
+        "model_variant": representative.get("model_variant") or "unknown",
+        "complexity": representative.get("complexity") or "",
+        "quality_toggle": representative.get("quality_toggle"),
+        "uc_preset": representative.get("uc_preset"),
+        "width": representative.get("width"),
+        "height": representative.get("height"),
+        "raw_metadata_json": representative.get("raw_metadata_json") or "{}",
+    })
+    return item
+
+
 def _arca_style_list_query(filters):
     filters = filters or {}; clauses, args = [
         "TRIM(prompt) <> ''",
@@ -2245,6 +2430,19 @@ def _arca_style_list_query(filters):
         "SELECT 1 FROM arca_collection_jobs direct_job "
         "WHERE json_extract(direct_job.request_json,'$.source_url')=arca_style_items.source_url))"
     )
+    model_active, model_clause, model_args = _model_filter_state(filters, "model_image")
+    if model_clause:
+        # A mixed post may have an empty/no-metadata representative while a
+        # secondary image is a valid match.  With an active model filter the
+        # usability predicates must be evaluated on that filtered image.
+        del clauses[:2]
+        clauses.append(
+            "EXISTS (SELECT 1 FROM arca_style_images model_image "
+            "WHERE model_image.item_id=arca_style_items.id AND " + model_clause + " "
+            "AND model_image.metadata_status='ok' "
+            "AND TRIM(COALESCE(NULLIF(model_image.base_prompt,''),model_image.prompt,''))<>'' )"
+        )
+        args.extend(model_args)
     if filters.get("q"): clauses.append("(title LIKE ? OR prompt LIKE ? OR source_url LIKE ?)"); args += [f"%{filters['q']}%"] * 3
     if filters.get("tab") and filters["tab"] != "all": clauses.append("board_tab=?"); args.append(filters["tab"])
     if filters.get("metadata") and filters["metadata"] != "all": clauses.append("metadata_status=?"); args.append(filters["metadata"])
@@ -2272,6 +2470,7 @@ def _arca_style_list_query(filters):
 
 def list_arca_styles(db_path, filters=None):
     filters = filters or {}
+    model_active, _, _ = _model_filter_state(filters)
     where_sql, args, order_sql = _arca_style_list_query(filters)
     try:
         limit = min(max(int(filters.get("limit", 200)), 1), 500)
@@ -2284,10 +2483,12 @@ def list_arca_styles(db_path, filters=None):
         grouped_images = {item["id"]: [] for item in items}
         if items:
             placeholders = ",".join("?" for _ in items)
+            image_prompt_clause = "" if model_active else " AND TRIM(COALESCE(base_prompt,prompt,''))<>''"
             rows = conn.execute(
-                f"SELECT item_id,id,prompt,base_prompt,negative_prompt,character_prompts_json FROM arca_style_images "
-                f"WHERE item_id IN ({placeholders}) AND TRIM(COALESCE(base_prompt,prompt,''))<>'' ORDER BY item_id,id",
-                tuple(item["id"] for item in items),
+                f"SELECT item_id,id,image_url,image_path,content_type,metadata_status,prompt,base_prompt,negative_prompt,character_prompts_json,seed,sampler,steps,scale,cfg_rescale,noise_schedule,model,model_id,model_family,model_generation,model_variant,complexity,quality_toggle,uc_preset,width,height,raw_metadata_json FROM arca_style_images "
+                f"WHERE item_id IN ({placeholders}){image_prompt_clause}"
+                + _image_model_where(filters, "arca_style_images") + " ORDER BY item_id,id",
+                tuple(item["id"] for item in items) + tuple(_image_model_args(filters)),
             ).fetchall()
             for row in rows:
                 image = _row(row)
@@ -2298,7 +2499,13 @@ def list_arca_styles(db_path, filters=None):
                 image["character_prompts"] = characters if isinstance(characters, list) else []
                 grouped_images[image["item_id"]].append(image)
     for item in items:
-        item["style_group_count"] = len(build_style_groups(grouped_images[item["id"]]))
+        filtered_images = grouped_images[item["id"]]
+        if model_active:
+            _override_item_with_filtered_images(item, filtered_images)
+            groupable = [image for image in filtered_images if (image.get("base_prompt") or image.get("prompt") or "").strip()]
+        else:
+            groupable = filtered_images
+        item["style_group_count"] = len(build_style_groups(groupable))
     return items
 
 
@@ -2348,6 +2555,15 @@ def get_arca_image_gallery_page(db_path, offset=0, limit=60, image_dir=None, fil
     if metadata != "all":
         clauses.append("image.metadata_status=?")
         args.append(metadata)
+    try:
+        model_clause, model_args = model_filter_sql(
+            filters.get("model", filters.get("model_filter", filters.get("model_family", "all"))), "image"
+        )
+    except ValueError as exc:
+        raise ArcaCollectorError(str(exc)) from None
+    if model_clause:
+        clauses.append(model_clause)
+        args.extend(model_args)
     recommendation_min = filters.get("recommendation_min")
     if recommendation_min not in (None, ""):
         try:
@@ -2496,6 +2712,15 @@ def _statistics_image_rows(db_path, filters=None):
     if filters.get("tab") and filters["tab"] != "all":
         clauses.append("item.board_tab=?")
         args.append(filters["tab"])
+    try:
+        model_clause, model_args = model_filter_sql(
+            filters.get("model", filters.get("model_filter", filters.get("model_family", "all"))), "image"
+        )
+    except ValueError as exc:
+        raise ArcaCollectorError(str(exc)) from None
+    if model_clause:
+        clauses.append(model_clause)
+        args.extend(model_args)
     recommendation_min = filters.get("recommendation_min")
     recommendation_max = filters.get("recommendation_max")
     try:
@@ -2516,7 +2741,8 @@ def _statistics_image_rows(db_path, filters=None):
     sql = (
         "SELECT image.id,image.item_id,image.image_url,image.image_path,item.title,item.source_url,item.posted_at,item.board_tab,item.recommendation_count,"
         "COALESCE(NULLIF(image.base_prompt,''),image.prompt) AS base_prompt,"
-        "COALESCE(NULLIF(image.negative_prompt,''),item.negative_prompt) AS negative_prompt "
+        "COALESCE(NULLIF(image.negative_prompt,''),item.negative_prompt) AS negative_prompt,"
+        "image.model,image.model_id,image.model_family,image.model_generation,image.model_variant "
         "FROM arca_style_images image JOIN arca_style_items item ON item.id=image.item_id "
         "WHERE " + " AND ".join(clauses)
     )
@@ -2982,11 +3208,18 @@ def get_arca_quality_sequence_statistics(db_path, tags, image_limit=40, filters=
     return {"tags": canonical_tags, "image_count": len(images), "images": images[:image_limit]}
 
 
-def get_arca_style_detail(db_path, item_id):
+def get_arca_style_detail(db_path, item_id, filters=None):
+    model_active, model_clause, model_args = _model_filter_state(filters)
     with closing(_connect(db_path)) as conn:
         item = _row(conn.execute("SELECT * FROM arca_style_items WHERE id=?", (item_id,)).fetchone())
         if item:
-            item["images"] = [_row(row) for row in conn.execute("SELECT * FROM arca_style_images WHERE item_id=? ORDER BY id", (item_id,))]
+            image_sql = "SELECT image.* FROM arca_style_images image WHERE image.item_id=?"
+            image_args = [item_id]
+            if model_clause:
+                image_sql += " AND " + model_clause
+                image_args.extend(model_args)
+            image_sql += " ORDER BY id"
+            item["images"] = [_row(row) for row in conn.execute(image_sql, tuple(image_args))]
             for image in item["images"]:
                 image["base_prompt"] = image.get("base_prompt") or image.get("prompt") or ""
                 try:
@@ -2994,6 +3227,8 @@ def get_arca_style_detail(db_path, item_id):
                 except json.JSONDecodeError:
                     characters = []
                 image["character_prompts"] = characters if isinstance(characters, list) else []
+            if model_active:
+                _override_item_with_filtered_images(item, item["images"])
             item["prompts"] = [
                 {"image_id": image["id"], "image_url": image["image_url"], "image_path": image["image_path"], "prompt": image["prompt"], "base_prompt": image["base_prompt"], "negative_prompt": image["negative_prompt"], "character_prompts": image["character_prompts"]}
                 for image in item["images"] if (image.get("prompt") or "").strip()
@@ -3232,7 +3467,10 @@ def _save_article(db_path, image_dir, session, article, summary, run_id=None):
             "seed": stored.get("seed") or "", "sampler": stored.get("sampler") or "",
             "steps": stored.get("steps"), "scale": stored.get("scale"),
             "cfg_rescale": stored.get("cfg_rescale"), "noise_schedule": stored.get("noise_schedule") or "",
-            "model": stored.get("model") or "", "width": stored.get("width"), "height": stored.get("height"),
+            "model": stored.get("model") or "", "model_id": stored.get("model_id") or "",
+            "model_family": stored.get("model_family") or "unknown", "model_generation": stored.get("model_generation") or "unknown", "model_variant": stored.get("model_variant") or "unknown",
+            "complexity": stored.get("complexity") or "", "quality_toggle": stored.get("quality_toggle"), "uc_preset": stored.get("uc_preset"),
+            "width": stored.get("width"), "height": stored.get("height"),
             "raw_metadata_json": stored.get("raw_metadata_json") or "{}",
         }
         return stored["image_url"], stored.get("image_path") or "", stored.get("content_type") or "image/png", meta
@@ -3305,17 +3543,17 @@ def _save_article(db_path, image_dir, session, article, summary, run_id=None):
     now = datetime.now().isoformat(timespec="seconds")
     with closing(_connect(db_path)) as conn, conn:
         exists = conn.execute("SELECT id FROM arca_style_items WHERE source_url=?", (article["source_url"],)).fetchone()
-        fields = (article["article_id"], article["board_tab"], article["title"], article["author"], article["posted_at"], now, representative[0] if representative else "", representative[1] if representative else "", len(downloaded), meta["metadata_status"], meta["prompt"], meta["negative_prompt"], meta["seed"], meta["sampler"], meta["steps"], meta["scale"], meta["cfg_rescale"], meta["noise_schedule"], meta["model"], meta["width"], meta["height"], meta["raw_metadata_json"], article["body_text"], article.get("recommendation_count"), article.get("view_count"), article["source_url"])
+        fields = (article["article_id"], article["board_tab"], article["title"], article["author"], article["posted_at"], now, representative[0] if representative else "", representative[1] if representative else "", len(downloaded), meta["metadata_status"], meta["prompt"], meta["negative_prompt"], meta["seed"], meta["sampler"], meta["steps"], meta["scale"], meta["cfg_rescale"], meta["noise_schedule"], meta["model"], meta["width"], meta["height"], meta.get("model_id", ""), meta.get("model_family", "unknown"), meta.get("model_generation", "unknown"), meta.get("model_variant", "unknown"), meta.get("complexity", ""), meta.get("quality_toggle"), meta.get("uc_preset"), meta["raw_metadata_json"], article["body_text"], article.get("recommendation_count"), article.get("view_count"), article["source_url"])
         if exists:
-            item_id = exists[0]; conn.execute("UPDATE arca_style_items SET article_id=?,board_tab=?,title=?,author=?,posted_at=?,updated_at=?,representative_image_url=?,representative_image_path=?,image_count=?,metadata_status=?,prompt=?,negative_prompt=?,seed=?,sampler=?,steps=?,scale=?,cfg_rescale=?,noise_schedule=?,model=?,width=?,height=?,raw_metadata_json=?,body_prompt_text=?,recommendation_count=?,view_count=? WHERE source_url=?", fields); summary["updated"] += 1
+            item_id = exists[0]; conn.execute("UPDATE arca_style_items SET article_id=?,board_tab=?,title=?,author=?,posted_at=?,updated_at=?,representative_image_url=?,representative_image_path=?,image_count=?,metadata_status=?,prompt=?,negative_prompt=?,seed=?,sampler=?,steps=?,scale=?,cfg_rescale=?,noise_schedule=?,model=?,width=?,height=?,model_id=?,model_family=?,model_generation=?,model_variant=?,complexity=?,quality_toggle=?,uc_preset=?,raw_metadata_json=?,body_prompt_text=?,recommendation_count=?,view_count=? WHERE source_url=?", fields); summary["updated"] += 1
         else:
-            item_id = conn.execute("INSERT INTO arca_style_items(article_id,board_tab,title,author,posted_at,collected_at,updated_at,representative_image_url,representative_image_path,image_count,metadata_status,prompt,negative_prompt,seed,sampler,steps,scale,cfg_rescale,noise_schedule,model,width,height,raw_metadata_json,body_prompt_text,recommendation_count,view_count,source_url) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", fields[:5] + (now,) + fields[5:]).lastrowid; summary["saved"] += 1
+            item_id = conn.execute("INSERT INTO arca_style_items(article_id,board_tab,title,author,posted_at,collected_at,updated_at,representative_image_url,representative_image_path,image_count,metadata_status,prompt,negative_prompt,seed,sampler,steps,scale,cfg_rescale,noise_schedule,model,width,height,model_id,model_family,model_generation,model_variant,complexity,quality_toggle,uc_preset,raw_metadata_json,body_prompt_text,recommendation_count,view_count,source_url) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", fields[:5] + (now,) + fields[5:]).lastrowid; summary["saved"] += 1
         if run_id:
             conn.execute("INSERT OR IGNORE INTO arca_collection_run_items(run_id,item_id) VALUES(?,?)", (run_id, item_id))
         for image_url, path, content_type, image_meta in downloaded:
-            conn.execute("""INSERT INTO arca_style_images(item_id,image_url,image_path,content_type,metadata_status,prompt,negative_prompt,seed,sampler,steps,scale,cfg_rescale,noise_schedule,model,width,height,raw_metadata_json,created_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(item_id,image_url) DO UPDATE SET image_path=excluded.image_path,content_type=excluded.content_type,metadata_status=excluded.metadata_status,prompt=excluded.prompt,negative_prompt=excluded.negative_prompt,seed=excluded.seed,sampler=excluded.sampler,steps=excluded.steps,scale=excluded.scale,cfg_rescale=excluded.cfg_rescale,noise_schedule=excluded.noise_schedule,model=excluded.model,width=excluded.width,height=excluded.height,raw_metadata_json=excluded.raw_metadata_json""", (item_id, image_url, path, content_type, image_meta["metadata_status"], image_meta["prompt"], image_meta["negative_prompt"], image_meta["seed"], image_meta["sampler"], image_meta["steps"], image_meta["scale"], image_meta["cfg_rescale"], image_meta["noise_schedule"], image_meta["model"], image_meta["width"], image_meta["height"], image_meta["raw_metadata_json"], now))
+            conn.execute("""INSERT INTO arca_style_images(item_id,image_url,image_path,content_type,metadata_status,prompt,negative_prompt,seed,sampler,steps,scale,cfg_rescale,noise_schedule,model,width,height,model_id,model_family,model_generation,model_variant,complexity,quality_toggle,uc_preset,raw_metadata_json,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(item_id,image_url) DO UPDATE SET image_path=excluded.image_path,content_type=excluded.content_type,metadata_status=excluded.metadata_status,prompt=excluded.prompt,negative_prompt=excluded.negative_prompt,seed=excluded.seed,sampler=excluded.sampler,steps=excluded.steps,scale=excluded.scale,cfg_rescale=excluded.cfg_rescale,noise_schedule=excluded.noise_schedule,model=excluded.model,width=excluded.width,height=excluded.height,model_id=excluded.model_id,model_family=excluded.model_family,model_generation=excluded.model_generation,model_variant=excluded.model_variant,complexity=excluded.complexity,quality_toggle=excluded.quality_toggle,uc_preset=excluded.uc_preset,raw_metadata_json=excluded.raw_metadata_json""", (item_id, image_url, path, content_type, image_meta["metadata_status"], image_meta["prompt"], image_meta["negative_prompt"], image_meta["seed"], image_meta["sampler"], image_meta["steps"], image_meta["scale"], image_meta["cfg_rescale"], image_meta["noise_schedule"], image_meta["model"], image_meta["width"], image_meta["height"], image_meta.get("model_id", ""), image_meta.get("model_family", "unknown"), image_meta.get("model_generation", "unknown"), image_meta.get("model_variant", "unknown"), image_meta.get("complexity", ""), image_meta.get("quality_toggle"), image_meta.get("uc_preset"), image_meta["raw_metadata_json"], now))
             conn.execute(
                 "UPDATE arca_style_images SET base_prompt=?,character_prompts_json=? WHERE item_id=? AND image_url=?",
                 (image_meta.get("base_prompt", image_meta["prompt"]), json.dumps(image_meta.get("character_prompts", []), ensure_ascii=False), item_id, image_url),

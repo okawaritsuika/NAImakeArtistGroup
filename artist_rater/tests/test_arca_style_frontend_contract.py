@@ -149,6 +149,25 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn(".arca-style-pagination", css)
         self.assertNotIn(".arca-style-list-scroll { overflow: visible;", css)
 
+    def test_image_level_model_filter_contract(self):
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        source = (ROOT / "static" / "arca_style_collector.js").read_text(encoding="utf-8")
+        for marker in (
+            'id="arcaModelFilter"', 'value="v5"', 'value="v4.5"',
+            'value="nai-diffusion-5-full"', 'value="nai-diffusion-5-curated"',
+            'value="nai-diffusion-4-5-full"', 'value="nai-diffusion-4-5-curated"',
+            'value="unknown"',
+        ):
+            self.assertIn(marker, html)
+        for marker in (
+            "normalizeArcaModel", "arcaModelDisplayName", 'model: arcaEl("arcaModelFilter")?.value',
+            'query.set("model", model)', "arcaStyleDetailQuery", 'arcaEl("arcaModelFilter")?.value',
+            "image.model", "createArcaModelBadge",
+        ):
+            self.assertIn(marker, source)
+        css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+        self.assertIn(".arca-image-choice .model-badge", css)
+
 
 if __name__ == "__main__":
     unittest.main()

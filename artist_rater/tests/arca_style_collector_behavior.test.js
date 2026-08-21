@@ -31,7 +31,21 @@ const {
   randomArcaStatisticsSamples,
   formatArcaRecommendation,
   hasArcaDependencyArtists,
+  normalizeArcaModel,
+  arcaModelDisplayName,
+  arcaStyleDetailQuery,
 } = require("../static/arca_style_collector.js");
+
+test("Arca list query sends image-model filters without changing the all default", () => {
+  assert.equal(arcaListQuery({ model: "all" }).has("model"), false);
+  assert.equal(arcaListQuery({ model: "v5" }).get("model"), "v5");
+  assert.equal(arcaListQuery({ model: "v4.5" }).get("model"), "v4.5");
+  assert.equal(arcaListQuery({ model: "nai-diffusion-4-5-curated" }).get("model"), "nai-diffusion-4-5-curated");
+  assert.equal(arcaStyleDetailQuery("all").has("model"), false);
+  assert.equal(arcaStyleDetailQuery("unknown").get("model"), "unknown");
+  assert.equal(normalizeArcaModel("NovelAI Diffusion V5 Full"), "nai-diffusion-5-full");
+  assert.equal(arcaModelDisplayName("nai-diffusion-5-curated"), "V5 Curated");
+});
 
 test("empty collection dates default to the local calendar day", () => {
   const localDate = new Date(2026, 0, 2, 23, 59, 59);

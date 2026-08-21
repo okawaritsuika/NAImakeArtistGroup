@@ -74,10 +74,12 @@ from novelai import (
     MODEL,
     NovelAIError,
     combine_base_prompt,
+    combine_generation_prompt,
     generate_novelai_png,
     normalize_generation_data,
     test_novelai_subscription,
 )
+from model_definitions import model_definitions_for_api, normalize_model_id
 from style_store import (
     SettingsError,
     delete_app_key,
@@ -286,6 +288,9 @@ def init_db():
                 scale REAL NOT NULL,
                 cfg_rescale REAL NOT NULL,
                 model TEXT NOT NULL,
+                complexity TEXT NOT NULL DEFAULT '',
+                quality_toggle INTEGER NOT NULL DEFAULT 0,
+                uc_preset INTEGER NOT NULL DEFAULT 0,
                 shared_dependency_reference_id INTEGER,
                 shared_dependency_reference_title TEXT,
                 shared_dependency_reference_source_url TEXT,
@@ -322,6 +327,9 @@ def init_db():
             "shared_dependency_reference_title": "TEXT",
             "shared_dependency_reference_source_url": "TEXT",
             "shared_dependency_artist_policy": "TEXT",
+            "complexity": "TEXT NOT NULL DEFAULT ''",
+            "quality_toggle": "INTEGER NOT NULL DEFAULT 0",
+            "uc_preset": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, declaration in generated_migrations.items():
             if column not in image_columns:
@@ -1688,9 +1696,10 @@ def api_test_novelai_settings():
             },
             exc.status_code,
         )
-    return json_response(
-        {"ok": True, "configured": True, "anlas": result["anlas"]}
-    )
+    response = {"ok": True, "configured": True, "anlas": result["anlas"]}
+    if result.get("usage"):
+        response["usage"] = result["usage"]
+    return json_response(response)
 
 
 @app.route("/api/settings/preferences", methods=["GET", "PUT"])
@@ -2056,6 +2065,9 @@ def _generation_response(result):
         "scale": result["scale"],
         "cfg_rescale": result["cfg_rescale"],
         "model": result["model"],
+        "complexity": result.get("complexity") or "",
+        "quality_toggle": bool(result.get("quality_toggle")),
+        "uc_preset": result.get("uc_preset") or 0,
     }
     for key in (
         "shared_dependency_reference_id",
@@ -2170,7 +2182,10 @@ def _generation_payload_hash(data):
         "variety_plus": data["variety_plus"],
         "skip_cfg_above_sigma": data["skip_cfg_above_sigma"],
         "seed": data["seed"] if data["seed_provided"] else None,
-        "model": MODEL,
+        "model": data["model"],
+        "quality_toggle": data["quality_toggle"],
+        "uc_preset": data["uc_preset"],
+        "complexity": data["complexity"],
     }
     encoded = json.dumps(
         canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -2214,8 +2229,10 @@ def api_style_maker_generate():
             return json_response({"error": "No NovelAI App Key is configured."}, 400)
 
         artist_prompt = build_artist_prompt(data["artists"])
-        combined_prompt = combine_base_prompt(data["base_prompt"], artist_prompt)
-        png_bytes, actual_seed = generate_novelai_png(app_key, data, artist_prompt)
+        combined_prompt = combine_generation_prompt(data, artist_prompt)
+        png_bytes, actual_seed = generate_novelai_png(
+            app_key, data, artist_prompt, None, data["model"]
+        )
         result = save_generated_result(
             DB_PATH,
             GENERATED_DIR,
@@ -2240,7 +2257,10 @@ def api_style_maker_generate():
             cfg_rescale=data["cfg_rescale"],
             variety_plus=data["variety_plus"],
             skip_cfg_above_sigma=data["skip_cfg_above_sigma"],
-            model=MODEL,
+            model=data["model"],
+            complexity=data["complexity"],
+            quality_toggle=data["quality_toggle"],
+            uc_preset=data["uc_preset"],
             shared_dependency_reference=data.get("shared_dependency_reference"),
             shared_dependency_artist_policy=data.get("shared_dependency_artist_policy"),
         )
@@ -2264,6 +2284,17 @@ def api_style_maker_generate():
     finally:
         if not completed:
             release_generation_request(DB_PATH, request_id)
+
+
+@app.route("/api/style-maker/models", methods=["GET"])
+def api_style_maker_models():
+    return json_response(
+        [
+            item
+            for item in model_definitions_for_api()
+            if item["generation"] in {"V5", "V4.5"}
+        ]
+    )
 
 
 def _add_generated_urls(item):
@@ -2393,6 +2424,7 @@ def _confirmed_metadata_from_bytes(image_bytes, content_type=""):
         "variety_plus": metadata.get("variety_plus"),
         "skip_cfg_above_sigma": metadata.get("skip_cfg_above_sigma"),
         "model": normalize_confirmed_model_name(metadata.get("model")),
+        "complexity": metadata.get("complexity") or "",
         "width": metadata.get("width") or image_info["width"],
         "height": metadata.get("height") or image_info["height"],
         "seed": metadata.get("seed") or None,
@@ -2445,6 +2477,9 @@ def _confirmed_source(source_type, source_id):
                 "variety_plus": bool(item["variety_plus"]) if item.get("variety_plus") is not None else None,
                 "skip_cfg_above_sigma": item.get("skip_cfg_above_sigma"),
                 "model": item.get("model") or "",
+                "complexity": item.get("complexity") or "",
+                "quality_toggle": bool(item.get("quality_toggle")),
+                "uc_preset": item.get("uc_preset") or 0,
                 "width": item.get("width"),
                 "height": item.get("height"),
                 "seed": item.get("seed"),
@@ -2496,6 +2531,9 @@ def _confirmed_source(source_type, source_id):
                 "variety_plus": bool(skip_cfg) if skip_present else None,
                 "skip_cfg_above_sigma": skip_cfg,
                 "model": item.get("model") or image_metadata.get("model") or "",
+                "complexity": image_metadata.get("complexity") or "",
+                "quality_toggle": bool(item.get("quality_toggle")) if item.get("quality_toggle") is not None else False,
+                "uc_preset": item.get("uc_preset") or 0,
                 "width": item.get("width"),
                 "height": item.get("height"),
                 "seed": item.get("seed") or None,
@@ -2537,6 +2575,7 @@ def api_style_manager_shared():
                 "q": request.args.get("q", ""),
                 "tab": request.args.get("tab", "all"),
                 "metadata": request.args.get("metadata", "all"),
+                "model": request.args.get("model", "all"),
                 "recommendation_min": request.args.get("recommendation_min", ""),
                 "sort": request.args.get("sort", "posted_desc"),
             },
@@ -2709,20 +2748,21 @@ def api_confirmed_style_detail(style_id):
 
 def _comparison_model(value, fallback):
     text = str(value or "").strip()
-    aliases = {
-        "NovelAI Diffusion V4.5": "nai-diffusion-4-5-full",
-        "NovelAI Diffusion V4.5 Full": "nai-diffusion-4-5-full",
-        "NovelAI Diffusion V4.5 Curated": "nai-diffusion-4-5-curated",
-        "NovelAI Diffusion V4 Full": "nai-diffusion-4-full",
-        "NovelAI Diffusion V3": "nai-diffusion-3",
-    }
-    return aliases.get(text, text if text.startswith("nai-diffusion-") else fallback)
+    if not text:
+        return fallback
+    return normalize_model_id(text)
 
 
 def _comparison_generation_data(group, style):
     defaults = group.get("defaults") or {}
     def value(key, fallback): return style.get(key) if style.get(key) not in (None, "") else defaults.get(key, fallback)
     base_prompt = ", ".join(part for part in [style.get("quality_prompt"), style.get("fixed_prompt"), group.get("fixed_prompt")] if part)
+    model = _comparison_model(style.get("model"), _comparison_model(defaults.get("model"), MODEL))
+    complexity = (
+        style["complexity"]
+        if "complexity" in style and style.get("complexity") is not None
+        else defaults.get("complexity", "")
+    )
     return {
         "base_prompt": base_prompt, "quality_prompt": style.get("quality_prompt") or "",
         "original_quality_prompt": style.get("original_quality_prompt") or style.get("quality_prompt") or "",
@@ -2731,8 +2771,10 @@ def _comparison_generation_data(group, style):
         "width": group["width"], "height": group["height"], "sampler": value("sampler", "k_euler_ancestral"),
         "noise_schedule": value("noise_schedule", "karras"), "steps": value("steps", 28),
         "scale": value("scale", 5.0), "cfg_rescale": value("cfg_rescale", 0.0),
-        "variety_plus": value("variety_plus", False),
-    }, _comparison_model(style.get("model"), _comparison_model(defaults.get("model"), MODEL))
+        "variety_plus": value("variety_plus", False), "complexity": complexity,
+        "quality_toggle": value("quality_toggle", False), "uc_preset": value("uc_preset", 0),
+        "model": model,
+    }, model
 
 
 def _comparison_result_url(result):
@@ -3072,7 +3114,7 @@ def api_setup_arca_browser_extension():
 def api_arca_styles():
     filters = {
         key: request.args.get(key)
-        for key in ("q", "tab", "metadata", "start_date", "end_date", "sort", "page", "per_page", "recommendation_min")
+        for key in ("q", "tab", "metadata", "start_date", "end_date", "sort", "page", "per_page", "recommendation_min", "model")
         if request.args.get(key) is not None
     }
     try:
@@ -3087,7 +3129,7 @@ def api_arca_styles():
 def api_arca_style_statistics():
     filters = {
         key: request.args.get(key)
-        for key in ("recommendation_min", "recommendation_max")
+        for key in ("recommendation_min", "recommendation_max", "model")
         if request.args.get(key) not in (None, "")
     }
     try:
@@ -3101,7 +3143,7 @@ def api_arca_tag_statistics():
     try:
         filters = {
             key: request.args.get(key)
-            for key in ("recommendation_min", "recommendation_max")
+            for key in ("recommendation_min", "recommendation_max", "model")
             if request.args.get(key) not in (None, "")
         }
         result = get_arca_tag_statistics(
@@ -3121,7 +3163,7 @@ def api_arca_quality_sequence_statistics():
     try:
         filters = {
             key: request.args.get(key)
-            for key in ("recommendation_min", "recommendation_max")
+            for key in ("recommendation_min", "recommendation_max", "model")
             if request.args.get(key) not in (None, "")
         }
         result = get_arca_quality_sequence_statistics(
@@ -3156,7 +3198,12 @@ def api_arca_style_detail(item_id):
                 return json_response({"error": "수집 항목을 찾을 수 없습니다."}, 404)
             return json_response(result)
         else:
-            item = get_arca_style_detail(DB_PATH, item_id)
+            model_filter = request.args.get("model")
+            item = (
+                get_arca_style_detail(DB_PATH, item_id, {"model": model_filter})
+                if model_filter not in (None, "")
+                else get_arca_style_detail(DB_PATH, item_id)
+            )
         if item is None:
             return json_response({"error": "수집 항목을 찾을 수 없습니다."}, 404)
         return json_response(_add_arca_urls(item))

@@ -930,6 +930,31 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertLess(body_start, prefer_index)
         self.assertLess(prefer_index, score_index)
 
+    def test_novelai_v5_model_controls_and_usage_contract(self):
+        for marker in (
+            'id="generationModel"', 'value="nai-diffusion-5-full"', 'value="nai-diffusion-5-curated"',
+            'value="nai-diffusion-4-5-full"', 'value="nai-diffusion-4-5-curated"',
+            'id="generationComplexity"', 'value="ultra"', 'id="generationQualityToggle"',
+            'id="characterPromptLimitStatus"', 'id="generationModelBadge"',
+            'id="novelAiUsage"', 'id="refreshNovelAiUsage"', 'id="novelAiUsageCountdown"',
+            'id="styleManagerModelFilter"', 'id="confirmedStyleModelBadge"',
+            'value="NovelAI Diffusion V5 Full"', 'value="NovelAI Diffusion V5 Curated"',
+            'id="confirmedStyleComplexity"', 'id="comparisonDefaultComplexity"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        for marker in (
+            "NOVELAI_MODEL_DEFINITIONS", "normalizeNovelAiModel", "maxCharacterPrompts: 22",
+            "maxCharacterPrompts: 6", "normalizeNovelAiComplexity", "validateCharacterPromptLimit",
+            "quality_toggle", "function renderNovelAiUsage", "timeUntilNextPercent",
+            "createNovelAiModelBadge", "styleManagerModelFilter", "query.set(\"model\"",
+            "confirmedStyleComplexity", "comparisonDefaultComplexity", "settings.complexity || style.complexity",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.script)
+        for marker in (".model-badge", ".novelai-usage-panel", ".model-limit-status", "@media (max-width: 760px)"):
+            self.assertIn(marker, self.css)
+
 
 if __name__ == "__main__":
     unittest.main()

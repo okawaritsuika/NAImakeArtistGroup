@@ -724,6 +724,7 @@ class GenerationApiTest(StyleApiTest):
             {
                 "style_id", "image_id", "image_url", "image_path", "artist_prompt", "seed",
                 "width", "height", "sampler", "noise_schedule", "steps", "scale", "cfg_rescale", "model",
+                "complexity", "quality_toggle", "uc_preset",
             },
         )
 
@@ -732,6 +733,9 @@ class GenerationApiTest(StyleApiTest):
         self.assertEqual(data["steps"], 28)
         self.assertEqual(data["scale"], 5.0)
         self.assertEqual(data["cfg_rescale"], 0.4)
+        self.assertEqual(data["complexity"], "")
+        self.assertFalse(data["quality_toggle"])
+        self.assertEqual(data["uc_preset"], 0)
         self.assertEqual(data["image_url"], f'/generated/{data["image_path"]}')
         self.assertTrue((app.GENERATED_DIR / data["image_path"]).is_file())
         generate.assert_called_once()
@@ -756,6 +760,30 @@ class GenerationApiTest(StyleApiTest):
         self.assertEqual(image["model"], "nai-diffusion-4-5-full")
         self.assertEqual(image["image_url"], f'/generated/{image["image_path"]}')
         self.assertNotIn("app_key", json.dumps(detail))
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_generation_preserves_nondefault_model_settings_in_response_and_history(self, generate):
+        self.save_key()
+        payload = self.request_payload(
+            request_id="request-settings",
+            model="nai-diffusion-5-curated",
+            complexity="ultra",
+            quality_toggle=True,
+            uc_preset=3,
+        )
+        response = self.client.post("/api/style-maker/generate", json=payload)
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["model"], "nai-diffusion-5-curated")
+        self.assertEqual(data["complexity"], "ultra")
+        self.assertIs(data["quality_toggle"], True)
+        self.assertEqual(data["uc_preset"], 3)
+        detail = self.client.get(f"/api/art-styles/{data['style_id']}").get_json()
+        image = detail["images"][0]
+        self.assertEqual(image["model"], "nai-diffusion-5-curated")
+        self.assertEqual(image["complexity"], "ultra")
+        self.assertEqual(image["quality_toggle"], 1)
+        self.assertEqual(image["uc_preset"], 3)
 
     @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
     def test_duplicate_request_does_not_pay_twice(self, generate):
@@ -1512,14 +1540,14 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         Image.new("RGB", (32, 48), "white").save(output, format="WEBP", lossless=True, exif=exif)
         return output.getvalue()
 
-    def test_confirmed_extract_normalizes_v45_build_label_to_full(self):
+    def test_confirmed_extract_preserves_ambiguous_v45_build_label(self):
         extracted = self.client.post(
             "/api/confirmed-styles/extract",
             data={"image": (io.BytesIO(self.metadata_png("NovelAI Diffusion V4.5 4BDE2A90")), "style.png")},
             content_type="multipart/form-data",
         )
         self.assertEqual(extracted.status_code, 200)
-        self.assertEqual(extracted.get_json()["model"], "NovelAI Diffusion V4.5 Full")
+        self.assertEqual(extracted.get_json()["model"], "NovelAI Diffusion V4.5 4BDE2A90")
 
     def test_confirmed_extract_reads_webp_exif_user_comment(self):
         extracted = self.client.post(
@@ -1548,7 +1576,7 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertIn("artist:test artist", metadata["artist_prompt"])
         self.assertEqual(metadata["character_prompts"], ["1girl, blue hair"])
         self.assertTrue(metadata["variety_plus"])
-        self.assertEqual(metadata["model"], "NovelAI Diffusion V4.5 Full")
+        self.assertEqual(metadata["model"], "NovelAI Diffusion V4.5")
 
         created = self.client.post(
             "/api/confirmed-styles",
@@ -1727,7 +1755,7 @@ class ConfirmedStyleApiTest(unittest.TestCase):
             json={"source_type": "shared", "source_id": image_id, "model": ""},
         )
         self.assertEqual(confirmed.status_code, 201)
-        self.assertEqual(confirmed.get_json()["model"], "NovelAI Diffusion V4.5 Full")
+        self.assertEqual(confirmed.get_json()["model"], "NovelAI Diffusion V4.5")
 
     def test_shared_gallery_searches_and_filters_all_available_images(self):
         app.ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)

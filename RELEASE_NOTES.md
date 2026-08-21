@@ -1,3 +1,21 @@
+# v0.1.7 — NovelAI V5 지원
+
+## NovelAI 생성
+
+- NovelAI Diffusion V5 Full·Curated와 기존 V4.5 Full·Curated를 모델 선택기와 모델 badge로 명확히 구분해 생성할 수 있습니다.
+- V5는 Character Prompt 최대 22개, V4.5는 최대 6개를 사용합니다. 모델을 바꿀 때 제한을 넘는 기존 입력을 보존하고, 지원 수를 초과한 상태에서는 생성을 막아 입력이 조용히 잘리지 않도록 했습니다.
+- V5 Complexity를 사용하지 않거나 Low·Medium·High·Ultra로 선택할 수 있습니다. Complexity는 실제 API의 별도 파라미터가 아니라 `low complexity` 등의 프롬프트 태그로 처리하며, 기존 quality prompt·negative prompt·qualityToggle·구조화된 캐릭터 프롬프트를 유지합니다.
+
+## Metadata와 공유 그림체
+
+- PNG·WebP EXIF·NovelAI stealth·raw metadata의 원본 `model` 값을 보존하고, 실제 모델 ID를 확정할 수 있는 V5/V4.5 Full·Curated만 badge로 표시합니다. 근거가 부족한 값은 Unknown으로 두며, 구조화된 Character Prompt도 복원합니다.
+- 아카라이브 공유 그림체에 이미지 단위 모델 필터를 추가해 전체·V5만·V4.5만·V5/V4.5 세부 모델·Unknown을 선택할 수 있습니다. 한 게시글에 여러 세대 이미지가 섞여 있어도 실제 이미지 metadata 기준으로 분리합니다.
+
+## Usage와 호환성
+
+- NovelAI 구독 응답의 `usage.isNegative`, `usage.percent`, `usage.timeUntilNextPercent`를 표시하고 기존 Anlas 사용량도 유지합니다. 이전 usage 없는 응답과 기존 사용자 DB는 호환됩니다.
+- 생성 기록·확정 그림체·비교군에 모델과 V5 Complexity를 보존해 V4.5와 V5를 함께 다시 생성·비교할 수 있습니다.
+
 # v0.1.6 — 작가 예제와 공유 그림체 의존 생성 개선
 
 ## 작가 뽑기와 평가 예제

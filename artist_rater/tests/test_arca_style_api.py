@@ -205,6 +205,19 @@ class ArcaStyleApiTest(unittest.TestCase):
             "sort": "posted_asc", "page": "3", "per_page": "20", "recommendation_min": "10",
         })
 
+    @patch("app.get_arca_style_page")
+    def test_list_forwards_model_filter(self, get_page):
+        get_page.return_value = {"items": [], "page": 1, "per_page": 50, "total": 0, "total_pages": 1}
+        self.client.get("/api/arca-styles?model=v5")
+        self.assertEqual(get_page.call_args.args[1], {"model": "v5"})
+
+    @patch("app.get_arca_style_detail")
+    def test_detail_forwards_model_filter(self, get_detail):
+        get_detail.return_value = {"id": 1, "images": []}
+        response = self.client.get("/api/arca-styles/1?model=v5")
+        self.assertEqual(response.status_code, 200)
+        get_detail.assert_called_once_with(app.DB_PATH, 1, {"model": "v5"})
+
     def test_list_rejects_unknown_date_sort(self):
         response = self.client.get("/api/arca-styles?sort=collected_desc")
         self.assertEqual(response.status_code, 400)
@@ -233,6 +246,12 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         get_statistics.assert_called_once_with(app.DB_PATH, {"recommendation_min": "30", "recommendation_max": "100"})
 
+    @patch("app.get_arca_style_statistics")
+    def test_statistics_forwards_model_filter(self, get_statistics):
+        get_statistics.return_value = {"artists": [], "quality_tags": [], "quality_sequences": []}
+        self.client.get("/api/arca-styles/statistics?model=v4.5")
+        get_statistics.assert_called_once_with(app.DB_PATH, {"model": "v4.5"})
+
     @patch("app.get_arca_tag_statistics")
     def test_tag_statistics_adds_local_image_urls(self, get_statistics):
         get_statistics.return_value = {
@@ -245,6 +264,12 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.get_json()["images"][0]["image_url"], "/arca-style-images/weighted.png")
         get_statistics.assert_called_once_with(app.DB_PATH, "artist", "artist:foo", "12", {})
 
+    @patch("app.get_arca_tag_statistics")
+    def test_tag_statistics_forwards_model_filter(self, get_statistics):
+        get_statistics.return_value = {"kind": "artist", "tag": "artist:foo", "images": []}
+        self.client.get("/api/arca-styles/statistics/tag?kind=artist&tag=artist%3Afoo&model=v5")
+        get_statistics.assert_called_once_with(app.DB_PATH, "artist", "artist:foo", 24, {"model": "v5"})
+
     @patch("app.get_arca_quality_sequence_statistics")
     def test_quality_sequence_statistics_keeps_tag_order_and_adds_image_urls(self, get_statistics):
         get_statistics.return_value = {
@@ -255,6 +280,12 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["images"][0]["image_url"], "/arca-style-images/sequence.png")
         get_statistics.assert_called_once_with(app.DB_PATH, ["masterpiece", "best quality"], "30", {})
+
+    @patch("app.get_arca_quality_sequence_statistics")
+    def test_quality_sequence_statistics_forwards_model_filter(self, get_statistics):
+        get_statistics.return_value = {"tags": [], "image_count": 0, "images": []}
+        self.client.get("/api/arca-styles/statistics/sequence?model=v5")
+        get_statistics.assert_called_once_with(app.DB_PATH, [], 40, {"model": "v5"})
 
     @patch("app.get_latest_resumable_collection_job")
     def test_current_collection_job_returns_resumable_work(self, current_job):

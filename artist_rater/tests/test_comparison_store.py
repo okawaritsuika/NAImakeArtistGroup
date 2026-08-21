@@ -74,6 +74,34 @@ class ComparisonStoreTest(unittest.TestCase):
         self.assertFalse((self.image_dir / first).exists())
         self.assertEqual((self.image_dir / second).read_bytes(), b"second")
 
+    def test_group_preserves_model_and_complexity_and_accepts_broad_v5_input(self):
+        group_id = create_group(self.db_path, {
+            "name": "V5 비교군",
+            "character_prompts": ["char"] * 22,
+            "model": "nai-diffusion-5-full",
+            "complexity": "high",
+            "width": 832,
+            "height": 1216,
+            "seed_mode": "none",
+            "defaults": {"steps": 23},
+            "style_ids": [10],
+        })
+        group = get_group(self.db_path, group_id)
+        self.assertEqual(group["defaults"]["model"], "nai-diffusion-5-full")
+        self.assertEqual(group["defaults"]["complexity"], "high")
+        self.assertEqual(len(group["character_prompts"]), 22)
+
+    def test_group_rejects_more_than_broadest_supported_character_limit(self):
+        with self.assertRaisesRegex(ValueError, "최대 22"):
+            create_group(self.db_path, {
+                "character_prompts": ["char"] * 23,
+                "width": 832,
+                "height": 1216,
+                "seed_mode": "none",
+                "defaults": {},
+                "style_ids": [10],
+            })
+
 
 if __name__ == "__main__":
     unittest.main()

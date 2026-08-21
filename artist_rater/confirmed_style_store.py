@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import sqlite3
 import uuid
 from contextlib import closing
@@ -10,10 +11,15 @@ from pathlib import Path
 from PIL import Image
 
 from style_logic import normalize_numeric_prompt_closers
+from model_definitions import COMPLEXITY_VALUES, get_model_definition, normalize_model_id
 
 
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_TEXT_LENGTH = 16384
+# Older confirmed-style records predate a model field and accepted up to 20
+# character prompts.  Keep that limit only for those legacy/unknown records;
+# recognized models use the central per-model limits below.
+LEGACY_UNKNOWN_MAX_CHARACTER_PROMPTS = 20
 ALLOWED_IMAGE_FORMATS = {
     "PNG": (".png", "image/png"),
     "JPEG": (".jpg", "image/jpeg"),
@@ -23,12 +29,22 @@ ALLOWED_IMAGE_FORMATS = {
 
 def normalize_confirmed_model_name(value):
     model = str(value or "").strip()
-    lowered = model.casefold()
-    if lowered.startswith("novelai diffusion v4.5 curated") or lowered == "nai-diffusion-4-5-curated":
-        return "NovelAI Diffusion V4.5 Curated"
-    if lowered.startswith("novelai diffusion v4.5") or lowered == "nai-diffusion-4-5-full":
-        return "NovelAI Diffusion V4.5 Full"
+    try:
+        return get_model_definition(model).display_name
+    except ValueError:
+        pass
     return model
+
+
+def _model_generation_hint(value, model_id=""):
+    if model_id:
+        return get_model_definition(model_id).generation
+    lowered = str(value or "").strip().casefold()
+    if re.match(r"^(?:novelai\s+diffusion\s+)?v5(?:\b|[._ -])", lowered):
+        return "V5"
+    if re.match(r"^(?:novelai\s+diffusion\s+)?v4[._-]?5(?:\b|[._ -])", lowered):
+        return "V4.5"
+    return ""
 
 
 def _connect(db_path):
@@ -62,6 +78,9 @@ def init_confirmed_style_tables(db_path):
                 variety_plus INTEGER,
                 skip_cfg_above_sigma REAL,
                 model TEXT NOT NULL DEFAULT '',
+                complexity TEXT NOT NULL DEFAULT '',
+                quality_toggle INTEGER NOT NULL DEFAULT 0,
+                uc_preset INTEGER NOT NULL DEFAULT 0,
                 width INTEGER,
                 height INTEGER,
                 seed INTEGER,
@@ -102,6 +121,12 @@ def init_confirmed_style_tables(db_path):
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(confirmed_styles)")}
         if "character_prompts_json" not in columns:
             connection.execute("ALTER TABLE confirmed_styles ADD COLUMN character_prompts_json TEXT NOT NULL DEFAULT '[]'")
+        if "complexity" not in columns:
+            connection.execute("ALTER TABLE confirmed_styles ADD COLUMN complexity TEXT NOT NULL DEFAULT ''")
+        if "quality_toggle" not in columns:
+            connection.execute("ALTER TABLE confirmed_styles ADD COLUMN quality_toggle INTEGER NOT NULL DEFAULT 0")
+        if "uc_preset" not in columns:
+            connection.execute("ALTER TABLE confirmed_styles ADD COLUMN uc_preset INTEGER NOT NULL DEFAULT 0")
 
 
 def _text(payload, key):
@@ -172,8 +197,24 @@ def normalize_confirmed_style(payload):
         if value and value not in normalized_excluded:
             normalized_excluded.append(value)
     character_prompts = payload.get("character_prompts", [])
-    if not isinstance(character_prompts, list) or len(character_prompts) > 20:
-        raise ValueError("character_prompts must be a list of up to 20 strings.")
+    model_value = _text(payload, "model")
+    normalized_model_name = normalize_confirmed_model_name(model_value)
+    try:
+        model_id = normalize_model_id(model_value)
+        max_character_prompts = get_model_definition(model_id).max_character_prompts
+    except ValueError:
+        try:
+            model_id = normalize_model_id(normalized_model_name)
+            max_character_prompts = get_model_definition(model_id).max_character_prompts
+        except ValueError:
+            model_id = ""
+            generation_hint = _model_generation_hint(model_value)
+            max_character_prompts = 22 if generation_hint == "V5" else 6 if generation_hint == "V4.5" else LEGACY_UNKNOWN_MAX_CHARACTER_PROMPTS
+    generation_hint = _model_generation_hint(model_value, model_id)
+    if not isinstance(character_prompts, list) or len(character_prompts) > max_character_prompts:
+        raise ValueError(
+            f"character_prompts must be a list of up to {max_character_prompts} strings."
+        )
     normalized_characters = []
     for item in character_prompts:
         value = item.get("prompt") if isinstance(item, dict) else item
@@ -194,6 +235,20 @@ def normalize_confirmed_style(payload):
             raw_metadata = {}
     if not isinstance(raw_metadata, dict):
         raw_metadata = {}
+    complexity = _text(payload, "complexity").casefold()
+    if complexity in {"none", "off", "disabled"}:
+        complexity = ""
+    if complexity and complexity not in COMPLEXITY_VALUES:
+        raise ValueError("complexity must be one of low, medium, high, or ultra.")
+    if complexity and generation_hint != "V5":
+        raise ValueError("complexity is only supported by V5 models.")
+    quality_toggle = payload.get("quality_toggle", payload.get("qualityToggle", False))
+    if quality_toggle not in (True, False, 0, 1):
+        raise ValueError("quality_toggle must be a boolean.")
+    quality_toggle = bool(quality_toggle)
+    uc_preset = payload.get("uc_preset", payload.get("ucPreset", 0))
+    if isinstance(uc_preset, bool) or not isinstance(uc_preset, int) or not 0 <= uc_preset <= 4:
+        raise ValueError("uc_preset must be an integer from 0 to 4.")
     return {
         "name": _text(payload, "name"),
         "description": _text(payload, "description"),
@@ -211,7 +266,10 @@ def normalize_confirmed_style(payload):
         "cfg_rescale": _nullable_float(payload, "cfg_rescale", 0, 100),
         "variety_plus": _nullable_bool(payload, "variety_plus"),
         "skip_cfg_above_sigma": _nullable_float(payload, "skip_cfg_above_sigma", 0),
-        "model": normalize_confirmed_model_name(_text(payload, "model")),
+        "model": normalized_model_name,
+        "complexity": complexity,
+        "quality_toggle": quality_toggle,
+        "uc_preset": uc_preset,
         "width": _nullable_int(payload, "width", 1, 100000),
         "height": _nullable_int(payload, "height", 1, 100000),
         "seed": _nullable_int(payload, "seed", 0, 4294967295),
@@ -257,6 +315,10 @@ def _decoded(row):
         item["raw_metadata"] = {}
     if item.get("variety_plus") is not None:
         item["variety_plus"] = bool(item["variety_plus"])
+    if item.get("quality_toggle") is not None:
+        item["quality_toggle"] = bool(item["quality_toggle"])
+    if item.get("uc_preset") is not None:
+        item["uc_preset"] = int(item["uc_preset"])
     return item
 
 

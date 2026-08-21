@@ -12,6 +12,46 @@ const arcaState = {
 };
 const arcaEl = (id) => typeof document === "undefined" ? null : document.getElementById(id);
 
+const ARCA_NOVELAI_MODEL_NAMES = Object.freeze({
+  "nai-diffusion-5-full": "V5 Full",
+  "nai-diffusion-5-curated": "V5 Curated",
+  "nai-diffusion-4-5-full": "V4.5 Full",
+  "nai-diffusion-4-5-curated": "V4.5 Curated",
+});
+
+function normalizeArcaModel(value) {
+  const raw = String(value || "").trim();
+  const lowered = raw.toLowerCase();
+  if (ARCA_NOVELAI_MODEL_NAMES[lowered]) return lowered;
+  if (lowered === "novelai diffusion v5") return "nai-diffusion-5-full";
+  if (lowered === "novelai diffusion v5 full") return "nai-diffusion-5-full";
+  if (lowered === "novelai diffusion v5 curated") return "nai-diffusion-5-curated";
+  if (lowered === "novelai diffusion v4.5") return "nai-diffusion-4-5-full";
+  if (lowered === "novelai diffusion v4.5 full") return "nai-diffusion-4-5-full";
+  if (lowered === "novelai diffusion v4.5 curated") return "nai-diffusion-4-5-curated";
+  return raw;
+}
+
+function arcaModelDisplayName(value) {
+  const normalized = normalizeArcaModel(value);
+  if (typeof globalThis.novelAiModelDisplayName === "function") return globalThis.novelAiModelDisplayName(normalized);
+  return ARCA_NOVELAI_MODEL_NAMES[normalized] || (normalized || "Unknown");
+}
+
+function arcaModelBadgeClass(value) {
+  const normalized = normalizeArcaModel(value) || "unknown";
+  if (typeof globalThis.novelAiModelBadgeClass === "function") return globalThis.novelAiModelBadgeClass(normalized);
+  return `model-badge-${normalized.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "unknown"}`;
+}
+
+function createArcaModelBadge(value) {
+  const badge = document.createElement("span");
+  badge.className = `model-badge ${arcaModelBadgeClass(value)}`;
+  badge.textContent = arcaModelDisplayName(value);
+  badge.dataset.model = normalizeArcaModel(value) || "unknown";
+  return badge;
+}
+
 function formatArcaLocalDate(value) {
   const year = value.getFullYear();
   const month = String(value.getMonth() + 1).padStart(2, "0");
@@ -59,6 +99,15 @@ function arcaListQuery(value = {}) {
   });
   const recommendationMin = String(value.recommendation_min ?? "").trim();
   if (recommendationMin) query.set("recommendation_min", recommendationMin);
+  const model = String(value.model || "all").trim();
+  if (model && model !== "all") query.set("model", model);
+  return query;
+}
+
+function arcaStyleDetailQuery(model = "all") {
+  const query = new URLSearchParams();
+  const value = String(model || "all").trim();
+  if (value && value !== "all") query.set("model", value);
   return query;
 }
 
@@ -843,6 +892,8 @@ function renderArcaCard(item) {
     badge.textContent = value;
     meta.append(badge);
   });
+  const models = Array.isArray(item.models) ? item.models : [item.model];
+  models.filter((value, index, values) => values.some(Boolean) && values.indexOf(value) === index).forEach((model) => meta.append(createArcaModelBadge(model)));
   const prompt = document.createElement("p");
   prompt.className = "arca-style-prompt-preview";
   prompt.textContent = item.prompt || "";
@@ -1426,6 +1477,10 @@ function renderArcaStyleGroups(groups) {
       if (values.image_url) preview.src = values.image_url;
       else preview.removeAttribute("src");
       preview.alt = `선택 이미지 ${selectedIndex + 1}`;
+      previewFrame.querySelectorAll(".arca-selected-model-badge").forEach((badge) => badge.remove());
+      const modelBadge = createArcaModelBadge(image.model);
+      modelBadge.classList.add("arca-selected-model-badge");
+      previewFrame.append(modelBadge);
       base.textarea.value = values.base;
       negative.textarea.value = values.negative;
       character.textarea.value = values.character;
@@ -1448,7 +1503,7 @@ function renderArcaStyleGroups(groups) {
       const thumbnail = document.createElement("img");
       thumbnail.src = image.image_url;
       thumbnail.alt = "";
-      button.append(thumbnail);
+      button.append(thumbnail, createArcaModelBadge(image.model));
       button.addEventListener("click", () => selectImage(image, imageIndex));
       buttons.push(button);
       thumbnails.append(button);
@@ -1487,6 +1542,7 @@ async function loadArcaStyles() {
     const query = arcaListQuery({
       q: arcaEl("arcaStyleSearch")?.value,
       metadata: arcaEl("arcaMetadataFilter")?.value,
+      model: arcaEl("arcaModelFilter")?.value,
       recommendation_min: arcaEl("arcaRecommendationMinList")?.value,
       sort: arcaEl("arcaStyleSort")?.value,
       page: arcaState.page,
@@ -1621,7 +1677,9 @@ async function collectArcaUrl() {
 
 async function openArcaStyle(id) {
   try {
-    const item = await arcaFetch(`/api/arca-styles/${id}`);
+    const modelQuery = arcaStyleDetailQuery(arcaEl("arcaModelFilter")?.value);
+    const suffix = modelQuery.toString() ? `?${modelQuery}` : "";
+    const item = await arcaFetch(`/api/arca-styles/${id}${suffix}`);
     arcaState.selectedId = id;
     arcaState.selectedItem = item;
     arcaEl("arcaStyleDialogTitle").textContent = item.title || "수집 그림체";
@@ -1738,7 +1796,7 @@ function bindArcaCollector() {
   arcaEl("saveArcaStyle")?.addEventListener("click", saveArcaStyle);
   arcaEl("deleteArcaStyle")?.addEventListener("click", deleteArcaStyle);
   arcaEl("closeArcaStyle")?.addEventListener("click", () => arcaEl("arcaStyleDialog").classList.add("hidden"));
-  for (const id of ["arcaStyleSearch", "arcaMetadataFilter", "arcaRecommendationMinList", "arcaStyleSort", "arcaStylePageSize"]) {
+  for (const id of ["arcaStyleSearch", "arcaMetadataFilter", "arcaModelFilter", "arcaRecommendationMinList", "arcaStyleSort", "arcaStylePageSize"]) {
     arcaEl(id)?.addEventListener("input", () => {
       arcaState.page = 1;
       clearTimeout(arcaState.timer);
@@ -1781,10 +1839,12 @@ if (typeof module !== "undefined") module.exports = {
   etaText, formatBytes, imageRestoreEstimateText, imageDownloadSummary, collectionCountsText, groupTitle, promptSection, promptKindClass, imagePromptFields,
   arcaBrowserSessionText, isArcaBrowserSessionPending,
   arcaListQuery, arcaCoverageQuery, arcaCoverageText,
+  arcaStyleDetailQuery,
   formatArcaLocalDate, fillMissingArcaDates, arcaBrowserSessionAction,
   isArcaCollectionBusy, shouldRefreshArcaBrowserSession,
   normalizeArcaStatisticRows, arcaStatisticsSummary, arcaStatisticEntryText,
   formatArcaWeight, filterArcaStatisticRows, filterAndSortArcaStatisticRows, paginateArcaStatisticRows,
   arcaTagDetailQuery, arcaSequenceDetailQuery, arcaStatisticsQuery, arcaRecommendationPreset,
   randomArcaStatisticsSamples, formatArcaRecommendation, hasArcaDependencyArtists,
+  normalizeArcaModel, arcaModelDisplayName,
 };

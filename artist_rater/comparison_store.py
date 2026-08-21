@@ -5,6 +5,8 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+from model_definitions import MODEL_DEFINITIONS, normalize_model_id
+
 
 def _connect(db_path):
     connection = sqlite3.connect(db_path)
@@ -85,11 +87,28 @@ def create_group(db_path, payload):
     if seed_mode != "manual": seed = None
     prompts = payload.get("character_prompts", [])
     if not isinstance(prompts, list) or any(not isinstance(item, str) for item in prompts): raise ValueError("캐릭터 프롬프트를 확인해 주세요.")
-    if len([item for item in prompts if item.strip()]) > 6: raise ValueError("캐릭터 프롬프트는 최대 6개까지 추가할 수 있습니다.")
+    defaults = payload.get("defaults") if isinstance(payload.get("defaults"), dict) else {}
+    model_value = payload.get("model") or defaults.get("model")
+    if model_value not in (None, ""):
+        normalize_model_id(model_value)
+    # A comparison group can contain styles from different model generations.
+    # Preserve up to the broadest supported input here; each deferred/immediate
+    # generation validates against the selected style's stored model.
+    max_character_prompts = max(
+        definition.max_character_prompts for definition in MODEL_DEFINITIONS.values()
+    )
+    if len([item for item in prompts if item.strip()]) > max_character_prompts:
+        raise ValueError(
+            f"캐릭터 프롬프트는 현재 모델에서 최대 {max_character_prompts}개까지 추가할 수 있습니다."
+        )
     style_ids = normalize_style_ids(payload.get("style_ids"))
+    stored_defaults = dict(defaults)
+    for key in ("model", "complexity", "quality_toggle", "uc_preset"):
+        if key in payload:
+            stored_defaults[key] = payload[key]
     timestamp = datetime.now(timezone.utc).isoformat()
     with closing(_connect(db_path)) as connection, connection:
-        cursor = connection.execute("INSERT INTO comparison_groups(name,fixed_prompt,character_prompts_json,width,height,seed_mode,seed,defaults_json,selected_style_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (name, str(payload.get("fixed_prompt") or "").strip(), json.dumps([item.strip() for item in prompts if item.strip()], ensure_ascii=False), width, height, seed_mode, seed, json.dumps(payload.get("defaults") or {}, ensure_ascii=False), json.dumps(style_ids), timestamp, timestamp))
+        cursor = connection.execute("INSERT INTO comparison_groups(name,fixed_prompt,character_prompts_json,width,height,seed_mode,seed,defaults_json,selected_style_ids_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (name, str(payload.get("fixed_prompt") or "").strip(), json.dumps([item.strip() for item in prompts if item.strip()], ensure_ascii=False), width, height, seed_mode, seed, json.dumps(stored_defaults, ensure_ascii=False), json.dumps(style_ids), timestamp, timestamp))
         return cursor.lastrowid
 
 

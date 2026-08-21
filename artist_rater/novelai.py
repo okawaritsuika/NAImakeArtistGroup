@@ -12,6 +12,11 @@ import urllib.request
 
 from png_validator import validate_png
 from style_logic import normalize_numeric_prompt_closers
+from model_definitions import (
+    COMPLEXITY_VALUES,
+    get_model_definition,
+    normalize_model_id,
+)
 
 SUBSCRIPTION_URL = "https://image.novelai.net/user/subscription"
 GENERATION_URL = "https://image.novelai.net/ai/generate-image"
@@ -31,6 +36,7 @@ MAX_CHARACTER_PROMPT_LENGTH = 4096
 MAX_ERROR_BODY_BYTES = 16 * 1024
 SAFE_SAMPLER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SAFE_NOISE_SCHEDULES = {"native", "karras", "exponential", "polyexponential"}
+COMPLEXITY_TAGS = {value: f"{value} complexity" for value in COMPLEXITY_VALUES}
 
 
 class NovelAIError(Exception):
@@ -110,10 +116,28 @@ def _prompt_string(data, key):
     return value
 
 
+def _normalize_complexity(data, definition):
+    value = data.get("complexity", "")
+    if value is None:
+        value = ""
+    if type(value) is not str:
+        raise ValueError("complexity must be one of low, medium, high, or ultra.")
+    value = value.strip().lower()
+    if value in {"", "none", "off", "disabled"}:
+        return ""
+    if value not in COMPLEXITY_TAGS:
+        raise ValueError("complexity must be one of low, medium, high, or ultra.")
+    if not definition.supports_complexity:
+        raise ValueError(f"complexity is only supported by {definition.generation} models.")
+    return value
+
+
 def normalize_generation_data(data):
     if not isinstance(data, dict):
         raise ValueError("Request body must be a JSON object.")
 
+    model = normalize_model_id(data.get("model"), default=MODEL)
+    definition = get_model_definition(model)
     width = _required_int(data, "width", 64, 2048)
     height = _required_int(data, "height", 64, 2048)
     if width % 64 or height % 64:
@@ -132,8 +156,10 @@ def normalize_generation_data(data):
         if len(value) > MAX_CHARACTER_PROMPT_LENGTH:
             raise ValueError("A character prompt is too long.")
         normalized_characters.append(value)
-    if len(normalized_characters) > MAX_CHARACTER_PROMPTS:
-        raise ValueError("Too many character prompts.")
+    if len(normalized_characters) > definition.max_character_prompts:
+        raise ValueError(
+            f"Too many character prompts for {definition.display_name} (maximum {definition.max_character_prompts})."
+        )
 
     sampler = data.get("sampler")
     if type(sampler) is not str or not SAFE_SAMPLER.fullmatch(sampler.strip()):
@@ -152,6 +178,14 @@ def normalize_generation_data(data):
     variety_plus = data.get("variety_plus", False)
     if type(variety_plus) is not bool:
         raise ValueError("variety_plus must be a boolean.")
+
+    quality_toggle = data.get("quality_toggle", data.get("qualityToggle", False))
+    if type(quality_toggle) is not bool:
+        raise ValueError("quality_toggle must be a boolean.")
+    uc_preset = data.get("uc_preset", data.get("ucPreset", 0))
+    if type(uc_preset) is not int or not 0 <= uc_preset <= 4:
+        raise ValueError("uc_preset must be an integer from 0 to 4.")
+    complexity = _normalize_complexity(data, definition)
 
     excluded_quality_tags = data.get("excluded_quality_tags", [])
     if not isinstance(excluded_quality_tags, list) or any(type(value) is not str for value in excluded_quality_tags):
@@ -177,19 +211,36 @@ def normalize_generation_data(data):
             "seed": seed,
             "variety_plus": variety_plus,
             "skip_cfg_above_sigma": VARIETY_PLUS_SKIP_CFG if variety_plus else None,
+            "model": model,
+            "quality_toggle": quality_toggle,
+            "uc_preset": uc_preset,
+            "complexity": complexity,
         }
     )
     return normalized
 
 
-def build_generation_payload(data, artist_prompt, seed=None, model=MODEL):
-    normalized = normalize_generation_data(data)
+def combine_generation_prompt(data, artist_prompt):
+    combined = combine_base_prompt(data["base_prompt"], artist_prompt)
+    complexity_tag = COMPLEXITY_TAGS.get(data.get("complexity", ""), "")
+    if complexity_tag:
+        combined = ", ".join(part for part in (combined, complexity_tag) if part)
+    return combined
+
+
+def build_generation_payload(data, artist_prompt, seed=None, model=None):
+    if model is None:
+        model = data.get("model", MODEL) if isinstance(data, dict) else MODEL
+    model = normalize_model_id(model, default=MODEL)
+    source = dict(data)
+    source["model"] = model
+    normalized = normalize_generation_data(source)
     if seed is not None:
         if type(seed) is not int or not 1 <= seed <= 4294967295:
             raise ValueError("seed must be an integer from 1 to 4294967295.")
         normalized["seed"] = seed
     actual_seed = normalized["seed"]
-    combined = combine_base_prompt(normalized["base_prompt"], artist_prompt)
+    combined = combine_generation_prompt(normalized, artist_prompt)
     negative = normalized["negative_prompt"]
     char_captions = [
         {"char_caption": prompt, "centers": [{"x": 0.5, "y": 0.5}]}
@@ -219,8 +270,8 @@ def build_generation_payload(data, artist_prompt, seed=None, model=MODEL):
             "legacy": False,
             "legacy_v3_extend": False,
             "add_original_image": False,
-            "ucPreset": 0,
-            "qualityToggle": False,
+            "ucPreset": normalized["uc_preset"],
+            "qualityToggle": normalized["quality_toggle"],
             "prefer_brownian": True,
             "controlnet_strength": 1.0,
             "dynamic_thresholding": False,
@@ -288,8 +339,15 @@ def _safe_png_info(archive):
     return png_info
 
 
-def generate_novelai_png(app_key, data, artist_prompt, opener=None, model=MODEL):
-    normalized = normalize_generation_data(data)
+def generate_novelai_png(app_key, data, artist_prompt, opener=None, model=None):
+    source_data = dict(data)
+    if model is not None:
+        # Comparison generation passes its selected model separately.  Make it
+        # part of validation before applying model-specific limits (notably
+        # V5's 22 character prompts) and prompt handling.
+        source_data["model"] = model
+    normalized = normalize_generation_data(source_data)
+    model = normalized["model"]
     payload = build_generation_payload(normalized, artist_prompt, normalized["seed"], model=model)
     request = urllib.request.Request(
         GENERATION_URL,
@@ -350,6 +408,35 @@ def _subscription_total(data):
     return sum(values)
 
 
+def _subscription_usage(data):
+    usage = data.get("usage")
+    if usage is None:
+        return {}
+    if not isinstance(usage, dict):
+        raise ValueError("usage must be an object.")
+    normalized = {}
+    if "isNegative" in usage:
+        if type(usage["isNegative"]) is not bool:
+            raise ValueError("usage.isNegative must be a boolean.")
+        normalized["isNegative"] = usage["isNegative"]
+    if "percent" in usage:
+        percent = usage["percent"]
+        if type(percent) is not int or not 0 <= percent <= 100:
+            raise ValueError("usage.percent must be an integer from 0 to 100.")
+        normalized["percent"] = percent
+    if "timeUntilNextPercent" in usage:
+        remaining = usage["timeUntilNextPercent"]
+        if (
+            isinstance(remaining, bool)
+            or not isinstance(remaining, (int, float))
+            or not math.isfinite(remaining)
+            or remaining < 0
+        ):
+            raise ValueError("usage.timeUntilNextPercent must be a nonnegative number.")
+        normalized["timeUntilNextPercent"] = remaining
+    return normalized
+
+
 def test_novelai_subscription(app_key, opener=None):
     request = urllib.request.Request(SUBSCRIPTION_URL, method="GET")
     request.add_unredirected_header("Authorization", f"Bearer {app_key}")
@@ -362,6 +449,7 @@ def test_novelai_subscription(app_key, opener=None):
             raise ValueError("Subscription response is too large.")
         data = json.loads(raw.decode("utf-8"))
         anlas = _subscription_total(data)
+        usage = _subscription_usage(data)
     except urllib.error.HTTPError as exc:
         try:
             if exc.code in (401, 403):
@@ -377,4 +465,7 @@ def test_novelai_subscription(app_key, opener=None):
         raise NovelAIError(502, _connection_error_message(exc)) from None
     except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
         raise NovelAIError(502, "Could not parse the NovelAI response.") from None
-    return {"anlas": anlas}
+    result = {"anlas": anlas}
+    if usage:
+        result["usage"] = usage
+    return result

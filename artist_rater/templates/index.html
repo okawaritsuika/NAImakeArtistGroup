@@ -444,10 +444,11 @@
                 </label>
               </div>
               <div class="style-subhead">
-                <h3>캐릭터 프롬프트</h3>
+                <h3>캐릭터 프롬프트 <span id="characterPromptLimit" class="model-limit-hint">V4.5 최대 6개</span></h3>
                 <button id="addCharacterPrompt" class="icon-button" type="button" title="캐릭터 프롬프트 추가" aria-label="캐릭터 프롬프트 추가">＋</button>
               </div>
               <div id="characterPromptList" class="character-prompt-list"></div>
+              <p id="characterPromptLimitStatus" class="field-hint model-limit-status" role="status"></p>
               <section class="prompt-control-groups">
                 <div class="style-subhead">
                   <h3>프롬프트 그룹</h3>
@@ -458,7 +459,12 @@
               <section id="generationParameters" class="generation-parameters">
                 <button id="toggleGenerationParameters" class="generation-parameters-toggle" type="button" aria-expanded="true">▼ 생성 파라미터 닫기</button>
                 <div class="generation-parameters-body">
-                  <label class="parameter-row"><span>모델</span><input id="generationModel" value="NAID4.5F" readonly></label>
+                  <label class="parameter-row model-parameter-row"><span>모델</span><select id="generationModel" aria-label="NovelAI 생성 모델">
+                    <optgroup label="NovelAI V5"><option value="nai-diffusion-5-full">V5 Full</option><option value="nai-diffusion-5-curated">V5 Curated</option></optgroup>
+                    <optgroup label="NovelAI V4.5"><option value="nai-diffusion-4-5-full" selected>V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option></optgroup>
+                  </select><span id="generationModelBadge" class="model-badge model-badge-v4-5-full">V4.5 Full</span></label>
+                  <label id="generationComplexityRow" class="parameter-row v5-only-control"><span>Complexity</span><select id="generationComplexity"><option value="">사용 안 함</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="ultra">Ultra</option></select></label>
+                  <label class="parameter-row"><span>Quality</span><span class="compact-check"><input id="generationQualityToggle" type="checkbox"> Quality tags 사용</span></label>
                   <label class="parameter-row"><span>해상도</span><select id="generationResolutionPreset"><option value="832x1216" selected>832 × 1216</option><option value="1216x832">1216 × 832</option><option value="1024x1024">1024 × 1024</option><option value="custom">직접 입력</option></select></label>
                   <div class="parameter-row resolution-inputs"><span>직접 입력</span><input id="generationWidth" type="number" min="64" step="64" value="832" aria-label="너비"><input id="generationHeight" type="number" min="64" step="64" value="1216" aria-label="높이"></div>
                   <label class="parameter-row"><span>샘플러</span><select id="generationSampler"><option value="k_euler_ancestral">k_euler_ancestral</option><option value="k_dpmpp_2m">k_dpmpp_2m</option><option value="k_dpmpp_sde">k_dpmpp_sde</option></select></label>
@@ -493,6 +499,12 @@
                 <button id="stopContinuous" class="ghost" type="button" disabled>중지</button>
               </div>
               <div id="generationStatus" class="status" role="status"></div>
+              <section id="novelAiUsage" class="novelai-usage-panel" aria-live="polite">
+                <div class="novelai-usage-head"><strong>NovelAI Usage</strong><button id="refreshNovelAiUsage" class="ghost" type="button">새로고침</button></div>
+                <div id="novelAiUsageText" class="novelai-usage-text">사용량을 확인하지 않았습니다.</div>
+                <div id="novelAiUsageCountdown" class="novelai-usage-countdown"></div>
+                <div id="novelAiUsageAvailability" class="novelai-usage-availability"></div>
+              </section>
             </div>
           </aside>
 
@@ -558,6 +570,7 @@
             <label class="field"><span>구분</span><select id="styleManagerScopeFilter"></select></label>
             <label id="styleManagerMetadataField" class="field hidden"><span>메타데이터</span><select id="styleManagerMetadataFilter"><option value="all">전체</option><option value="ok">추출 성공</option><option value="body_only">본문 추출</option><option value="no_metadata">없음</option><option value="error">오류</option></select></label>
             <label id="styleManagerRecommendationField" class="field hidden"><span>최소 추천수</span><input id="styleManagerRecommendationMin" type="number" min="0" step="1" placeholder="전체"></label>
+            <label id="styleManagerModelField" class="field"><span>모델</span><select id="styleManagerModelFilter"><option value="all">전체</option><option value="v5">V5 전체</option><option value="v4.5">V4.5 전체</option><option value="nai-diffusion-5-full">V5 Full</option><option value="nai-diffusion-5-curated">V5 Curated</option><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option><option value="unknown">Unknown</option></select></label>
             <label class="field"><span>정렬</span><select id="styleManagerSort"><option value="newest">최신순</option><option value="oldest">오래된순</option><option id="styleManagerRecommendSort" value="recommend">추천순</option></select></label>
             <label class="field"><span>표시 개수</span><select id="styleManagerPageSize"><option value="12">12개</option><option value="24" selected>24개</option><option value="48">48개</option><option value="96">96개</option></select></label>
             <label class="field"><span>그림 크기</span><select id="styleManagerCardSize"><option value="small">작게</option><option value="medium" selected>보통</option><option value="large">크게</option></select></label>
@@ -628,7 +641,7 @@
               <label class="field"><span>공통 시드</span><select id="comparisonSeedMode"><option value="none">미지정</option><option value="manual">직접 입력</option><option value="first">첫 번째 생성 그림 시드</option></select></label>
               <label id="comparisonSeedField" class="field hidden"><span>시드</span><input id="comparisonSeed" type="number" min="1" max="4294967295"></label>
             </div></section>
-            <section class="comparison-settings-section"><h4>저장 설정이 없을 때의 기본값</h4><div class="comparison-settings-body confirmed-style-parameter-grid"><label class="field"><span>샘플러</span><input id="comparisonDefaultSampler" value="k_euler_ancestral"></label><label class="field"><span>스케줄러</span><input id="comparisonDefaultSchedule" value="karras"></label><label class="field"><span>Steps</span><input id="comparisonDefaultSteps" type="number" value="28"></label><label class="field"><span>CFG Scale</span><input id="comparisonDefaultScale" type="number" step="0.01" value="5"></label><label class="field"><span>CFG Rescale</span><input id="comparisonDefaultRescale" type="number" step="0.01" value="0"></label><label class="field"><span>Variety+</span><select id="comparisonDefaultVariety"><option value="0">꺼짐</option><option value="1">켜짐</option></select></label><label class="field"><span>모델</span><select id="comparisonDefaultModel"><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option><option value="nai-diffusion-4-full">V4 Full</option><option value="nai-diffusion-3">V3</option></select></label></div></section>
+            <section class="comparison-settings-section"><h4>저장 설정이 없을 때의 기본값</h4><div class="comparison-settings-body confirmed-style-parameter-grid"><label class="field"><span>샘플러</span><input id="comparisonDefaultSampler" value="k_euler_ancestral"></label><label class="field"><span>스케줄러</span><input id="comparisonDefaultSchedule" value="karras"></label><label class="field"><span>Steps</span><input id="comparisonDefaultSteps" type="number" value="28"></label><label class="field"><span>CFG Scale</span><input id="comparisonDefaultScale" type="number" step="0.01" value="5"></label><label class="field"><span>CFG Rescale</span><input id="comparisonDefaultRescale" type="number" step="0.01" value="0"></label><label class="field"><span>Variety+</span><select id="comparisonDefaultVariety"><option value="0">꺼짐</option><option value="1">켜짐</option></select></label><label class="field"><span>Quality</span><span class="compact-check"><input id="comparisonDefaultQualityToggle" type="checkbox"> Quality tags 사용</span></label><label class="field"><span>UC preset</span><select id="comparisonDefaultUcPreset"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label><label id="comparisonDefaultComplexityRow" class="field v5-only-control"><span>Complexity</span><select id="comparisonDefaultComplexity"><option value="">사용 안 함</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="ultra">Ultra</option></select></label><label class="field"><span>모델</span><select id="comparisonDefaultModel"><optgroup label="NovelAI V5"><option value="nai-diffusion-5-full">V5 Full</option><option value="nai-diffusion-5-curated">V5 Curated</option></optgroup><optgroup label="NovelAI V4.5"><option value="nai-diffusion-4-5-full" selected>V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option></optgroup><option value="nai-diffusion-4-full">V4 Full</option><option value="nai-diffusion-3">V3</option></select></label></div></section>
             <div id="comparisonModalStatus" class="status"></div><button id="createComparison" class="primary" type="button">선택한 그림체 생성</button>
             </div>
           </aside>
@@ -714,6 +727,7 @@
           <section class="panel arca-style-filters">
             <label class="field"><span>목록 검색</span><input id="arcaStyleSearch" type="search" placeholder="제목, 프롬프트, 링크"></label>
             <label class="field"><span>메타데이터</span><select id="arcaMetadataFilter"><option value="all">전체</option><option value="ok">추출 성공</option><option value="body_only">본문 추출</option><option value="no_metadata">없음</option><option value="error">오류</option></select></label>
+            <label class="field"><span>NovelAI 모델</span><select id="arcaModelFilter"><option value="all">전체</option><option value="v5">V5만</option><option value="v4.5">V4.5만</option><option value="nai-diffusion-5-full">V5 Full</option><option value="nai-diffusion-5-curated">V5 Curated</option><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option><option value="unknown">Unknown</option></select></label>
             <label class="field"><span>최소 추천수</span><input id="arcaRecommendationMinList" type="number" min="0" step="1" placeholder="전체"></label>
             <label class="field"><span>정렬</span><select id="arcaStyleSort"><option value="posted_desc" selected>최신순</option><option value="posted_asc">오래된순</option><option value="recommend_desc">추천순</option><option value="views_desc">조회순</option></select></label>
             <label class="field"><span>페이지당</span><select id="arcaStylePageSize"><option value="20">20개</option><option value="50" selected>50개</option><option value="100">100개</option><option value="200">200개</option></select></label>
@@ -1124,8 +1138,11 @@
               <label class="field"><span>CFG Scale</span><input id="confirmedStyleScale" type="number" min="0" step="0.01"></label>
               <label class="field"><span>CFG Rescale</span><input id="confirmedStyleCfgRescale" type="number" min="0" step="0.01"></label>
               <label class="field"><span>Variety+</span><select id="confirmedStyleVariety"><option value="unknown">알 수 없음</option><option value="1">켜짐</option><option value="0">꺼짐</option></select></label>
-              <label class="field"><span>모델</span><select id="confirmedStyleModel">
+              <label id="confirmedStyleComplexityRow" class="field v5-only-control"><span>Complexity</span><select id="confirmedStyleComplexity"><option value="">사용 안 함</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="ultra">Ultra</option></select></label>
+              <label class="field"><span>모델 <span id="confirmedStyleModelBadge" class="model-badge model-badge-unknown">Unknown</span></span><select id="confirmedStyleModel">
                 <option value="">알 수 없음 / 직접 확인</option>
+                <option value="NovelAI Diffusion V5 Full">NovelAI Diffusion V5 Full</option>
+                <option value="NovelAI Diffusion V5 Curated">NovelAI Diffusion V5 Curated</option>
                 <option value="NovelAI Diffusion V4.5 Full">NovelAI Diffusion V4.5 Full</option>
                 <option value="NovelAI Diffusion V4.5 Curated">NovelAI Diffusion V4.5 Curated</option>
                 <option value="NovelAI Diffusion V4 Full">NovelAI Diffusion V4 Full</option>

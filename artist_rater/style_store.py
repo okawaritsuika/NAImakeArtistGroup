@@ -266,6 +266,9 @@ def _stored_result(row):
         "variety_plus": bool(row["variety_plus"]) if row["variety_plus"] is not None else None,
         "skip_cfg_above_sigma": row["skip_cfg_above_sigma"],
         "model": row["model"],
+        "complexity": row["complexity"] if "complexity" in row.keys() else "",
+        "quality_toggle": bool(row["quality_toggle"]) if "quality_toggle" in row.keys() else False,
+        "uc_preset": row["uc_preset"] if "uc_preset" in row.keys() else 0,
     }
 
 
@@ -280,6 +283,8 @@ def _find_request(conn, request_id):
                generated_images.steps, generated_images.scale,
                generated_images.cfg_rescale, generated_images.variety_plus,
                generated_images.skip_cfg_above_sigma, generated_images.model,
+               generated_images.complexity,
+               generated_images.quality_toggle, generated_images.uc_preset,
                generated_images.shared_dependency_reference_id,
                generated_images.shared_dependency_reference_title,
                generated_images.shared_dependency_reference_source_url,
@@ -336,6 +341,8 @@ def reserve_generation_request(db_path, request_id, payload_hash):
                        generated_images.steps, generated_images.scale,
                        generated_images.cfg_rescale, generated_images.variety_plus,
                        generated_images.skip_cfg_above_sigma, generated_images.model,
+                       generated_images.complexity,
+                       generated_images.quality_toggle, generated_images.uc_preset,
                        generated_images.shared_dependency_reference_id,
                        generated_images.shared_dependency_reference_title,
                        generated_images.shared_dependency_reference_source_url,
@@ -444,6 +451,9 @@ def save_generated_result(
     variety_plus=False,
     skip_cfg_above_sigma=None,
     model="",
+    complexity="",
+    quality_toggle=False,
+    uc_preset=0,
     shared_dependency_reference=None,
     shared_dependency_artist_policy=None,
 ):
@@ -482,6 +492,13 @@ def save_generated_result(
         dependency_reference_source_url = dependency_reference_source_url.strip()
     if shared_dependency_artist_policy not in {None, "highest", "random"}:
         raise ValueError("shared_dependency_artist_policy must be highest or random.")
+    if type(complexity) is not str:
+        raise ValueError("complexity must be a string.")
+    complexity = complexity.strip()
+    if type(quality_toggle) is not bool:
+        raise ValueError("quality_toggle must be a boolean.")
+    if type(uc_preset) is not int or isinstance(uc_preset, bool) or not 0 <= uc_preset <= 4:
+        raise ValueError("uc_preset must be an integer from 0 to 4.")
     timestamp = datetime.now(timezone.utc).isoformat()
     generated_root = Path(generated_dir).resolve()
     generated_root.mkdir(parents=True, exist_ok=True)
@@ -536,14 +553,16 @@ def save_generated_result(
                     original_quality_prompt, excluded_quality_tags_json, fixed_prompt, negative_prompt,
                     character_prompts_json, combined_prompt, artist_prompt,
                     artists_json, seed, width, height, sampler, noise_schedule, steps, scale,
-                    cfg_rescale, variety_plus, skip_cfg_above_sigma, model,
+                    cfg_rescale, variety_plus, skip_cfg_above_sigma, model, complexity,
+                    quality_toggle, uc_preset,
                     shared_dependency_reference_id, shared_dependency_reference_title,
                     shared_dependency_reference_source_url, shared_dependency_artist_policy,
                     created_at
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?
                 )
                 """,
                 (
@@ -571,6 +590,9 @@ def save_generated_result(
                     1 if variety_plus else 0,
                     skip_cfg_above_sigma,
                     model,
+                    complexity,
+                    1 if quality_toggle else 0,
+                    uc_preset,
                     dependency_reference_id,
                     dependency_reference_title,
                     dependency_reference_source_url,
@@ -628,6 +650,9 @@ def save_generated_result(
             "variety_plus": bool(variety_plus),
             "skip_cfg_above_sigma": skip_cfg_above_sigma,
             "model": model,
+            "complexity": complexity,
+            "quality_toggle": quality_toggle,
+            "uc_preset": uc_preset,
         }
     except Exception:
         if not committed:

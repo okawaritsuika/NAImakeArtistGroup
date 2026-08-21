@@ -39,7 +39,7 @@ class FakeResponse:
 
 class LauncherControllerTest(unittest.TestCase):
     def test_packaged_version_matches_next_release(self):
-        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.6")
+        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.7")
 
     def test_independent_frozen_environment_removes_parent_bootloader_state(self):
         env = launcher.independent_frozen_environment({

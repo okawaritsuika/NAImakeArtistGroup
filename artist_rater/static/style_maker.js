@@ -48,6 +48,9 @@ const styleState = {
   generationRemoteCollapsed: false,
   generationRemoteClosed: false,
   generationRemoteDragging: false,
+  novelAiUsage: null,
+  novelAiUsageCountdownTimer: null,
+  novelAiUsageRequest: null,
   confirmedModalSource: null,
   confirmedModalFile: null,
   confirmedModalObjectUrl: "",
@@ -106,6 +109,153 @@ const STYLE_MANAGER_PAGE_SIZES = [12, 24, 48, 96];
 const RANDOM_STYLE_TARGETS = ["artists", "weights", "quality", "negative"];
 const OPUS_FREE_MAX_STEPS = 28;
 const OPUS_FREE_MAX_PIXELS = 1024 * 1024;
+
+const NOVELAI_MODEL_DEFINITIONS = Object.freeze({
+  "nai-diffusion-5-full": Object.freeze({ id: "nai-diffusion-5-full", generation: "V5", family: "V5", displayName: "V5 Full", isV5: true, maxCharacterPrompts: 22, supportsComplexity: true }),
+  "nai-diffusion-5-curated": Object.freeze({ id: "nai-diffusion-5-curated", generation: "V5", family: "V5", displayName: "V5 Curated", isV5: true, maxCharacterPrompts: 22, supportsComplexity: true }),
+  "nai-diffusion-4-5-full": Object.freeze({ id: "nai-diffusion-4-5-full", generation: "V4.5", family: "V4.5", displayName: "V4.5 Full", isV5: false, maxCharacterPrompts: 6, supportsComplexity: false }),
+  "nai-diffusion-4-5-curated": Object.freeze({ id: "nai-diffusion-4-5-curated", generation: "V4.5", family: "V4.5", displayName: "V4.5 Curated", isV5: false, maxCharacterPrompts: 6, supportsComplexity: false }),
+});
+
+const NOVELAI_MODEL_ALIASES = Object.freeze({
+  "naid5f": "nai-diffusion-5-full",
+  "naid5c": "nai-diffusion-5-curated",
+  "naid4.5f": "nai-diffusion-4-5-full",
+  "naid4.5c": "nai-diffusion-4-5-curated",
+});
+
+function explicitNovelAiModelAlias(value) {
+  const raw = String(value ?? "").trim();
+  const lowered = raw.toLowerCase();
+  const family = lowered.match(/^(?:novelai\s+diffusion\s+)?v(5|4\.5)(?=$|[\s:_-])/i)?.[1];
+  if (!family) return "";
+  const variants = [...lowered.matchAll(/(?:^|[\s:_-])(full|curated)(?=$|[\s:_-])/gi)].map((match) => match[1].toLowerCase());
+  if (variants.length !== 1) return "";
+  return family === "5"
+    ? (variants[0] === "full" ? "nai-diffusion-5-full" : "nai-diffusion-5-curated")
+    : (variants[0] === "full" ? "nai-diffusion-4-5-full" : "nai-diffusion-4-5-curated");
+}
+
+function normalizeNovelAiModel(value, fallback = "nai-diffusion-4-5-full") {
+  const raw = String(value ?? "").trim();
+  const lowered = raw.toLowerCase();
+  if (NOVELAI_MODEL_DEFINITIONS[lowered]) return lowered;
+  if (NOVELAI_MODEL_ALIASES[lowered]) return NOVELAI_MODEL_ALIASES[lowered];
+  const explicitAlias = explicitNovelAiModelAlias(raw);
+  if (explicitAlias) return explicitAlias;
+  return raw || fallback;
+}
+
+function novelAiModelDefinition(value) {
+  const id = normalizeNovelAiModel(value, "");
+  return NOVELAI_MODEL_DEFINITIONS[id] || {
+    id: id || "unknown",
+    generation: "Unknown",
+    family: "Unknown",
+    displayName: "Unknown",
+    isV5: false,
+    maxCharacterPrompts: 6,
+    supportsComplexity: false,
+  };
+}
+
+function novelAiModelDisplayName(value) {
+  const definition = novelAiModelDefinition(value);
+  return definition.displayName === "Unknown" && String(value || "").trim()
+    ? String(value).trim()
+    : definition.displayName;
+}
+
+function novelAiModelBadgeLabel(value) {
+  const id = normalizeNovelAiModel(value, "");
+  return NOVELAI_MODEL_DEFINITIONS[id]?.displayName || "Unknown";
+}
+
+function novelAiModelBadgeClass(value) {
+  const id = normalizeNovelAiModel(value, "");
+  const className = NOVELAI_MODEL_DEFINITIONS[id]?.displayName || "Unknown";
+  return `model-badge-${className.replace(/^NovelAI\s+Diffusion\s+/i, "").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase() || "unknown"}`;
+}
+
+function createNovelAiModelBadge(value, className = "") {
+  const badge = document.createElement("span");
+  badge.className = `model-badge ${novelAiModelBadgeClass(value)}${className ? ` ${className}` : ""}`;
+  badge.textContent = novelAiModelBadgeLabel(value);
+  const normalized = normalizeNovelAiModel(value, "");
+  badge.dataset.model = NOVELAI_MODEL_DEFINITIONS[normalized] ? normalized : "unknown";
+  return badge;
+}
+
+function appendNovelAiModelBadge(parent, value, className = "") {
+  if (!parent) return null;
+  const badge = createNovelAiModelBadge(value, className);
+  parent.append(badge);
+  return badge;
+}
+
+function normalizeNovelAiComplexity(value, model = "") {
+  const definition = novelAiModelDefinition(model);
+  const complexity = String(value || "").trim().toLowerCase();
+  return definition.supportsComplexity && ["low", "medium", "high", "ultra"].includes(complexity) ? complexity : "";
+}
+
+function novelAiModelFilterMatches(itemModel, filter) {
+  const value = String(filter || "all").toLowerCase();
+  if (value === "all") return true;
+  const normalized = normalizeNovelAiModel(itemModel, "");
+  if (value === "unknown") return !NOVELAI_MODEL_DEFINITIONS[normalized];
+  if (value === "v5") return Boolean(NOVELAI_MODEL_DEFINITIONS[normalized]?.isV5);
+  if (value === "v4_5" || value === "v4.5") return NOVELAI_MODEL_DEFINITIONS[normalized]?.generation === "V4.5";
+  return normalized === value;
+}
+
+function normalizeNovelAiGeneration(value) {
+  const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (normalized === "v5" || normalized === "5") return "v5";
+  if (["v4.5", "v45", "v4.5full", "v4.5curated"].includes(normalized)) return "v4.5";
+  return "";
+}
+
+function hasModelMetadataValue(item, key) {
+  return item && item[key] !== undefined && item[key] !== null && String(item[key]).trim() !== "";
+}
+
+function itemModelMetadataGeneration(item) {
+  for (const key of ["model_generation", "model_family"]) {
+    const generation = normalizeNovelAiGeneration(item?.[key]);
+    if (generation) return generation;
+  }
+  return "";
+}
+
+function novelAiModelFilterMatchesItem(item, filter) {
+  const value = String(filter || "all").toLowerCase();
+  if (value === "all") return true;
+  const metadataGeneration = itemModelMetadataGeneration(item);
+  const hasModelId = hasModelMetadataValue(item, "model_id");
+  const modelId = hasModelId ? normalizeNovelAiModel(item.model_id, "") : "";
+  const rawModel = item?.model;
+  if (value === "v5" || value === "v4_5" || value === "v4.5") {
+    const generation = value === "v5" ? "v5" : "v4.5";
+    if (metadataGeneration) return metadataGeneration === generation;
+    if (hasModelId) return novelAiModelFilterMatches(modelId, value);
+    return novelAiModelFilterMatches(rawModel, value);
+  }
+  if (value === "unknown") {
+    if (metadataGeneration) return false;
+    if (hasModelId) return !NOVELAI_MODEL_DEFINITIONS[modelId];
+    return novelAiModelFilterMatches(rawModel, value);
+  }
+  if (hasModelId) return modelId === value;
+  return novelAiModelFilterMatches(rawModel, value);
+}
+
+if (typeof globalThis !== "undefined") {
+  globalThis.novelAiModelDisplayName = novelAiModelDisplayName;
+  globalThis.novelAiModelBadgeLabel = novelAiModelBadgeLabel;
+  globalThis.novelAiModelBadgeClass = novelAiModelBadgeClass;
+  globalThis.normalizeNovelAiModel = normalizeNovelAiModel;
+}
 
 function normalizeSharedDependencyArtistPolicy(value) {
   return value === "random" ? "random" : "highest";
@@ -839,6 +989,9 @@ function formatPromptAutocompleteTag(item, prefixArtist = true) {
 
 function readGenerationSettings() {
   return {
+    model: normalizeNovelAiModel(styleElement("generationModel")?.value),
+    complexity: normalizeNovelAiComplexity(styleElement("generationComplexity")?.value, styleElement("generationModel")?.value),
+    quality_toggle: Boolean(styleElement("generationQualityToggle")?.checked),
     resolution_preset: styleElement("generationResolutionPreset")?.value || "832x1216",
     width: Number(styleElement("generationWidth")?.value || 832),
     height: Number(styleElement("generationHeight")?.value || 1216),
@@ -875,6 +1028,10 @@ function applyGenerationSettings(settings = {}) {
     const element = styleElement(id);
     if (element && value !== undefined && value !== null) element.value = String(value);
   };
+  setValue("generationModel", normalizeNovelAiModel(settings.model));
+  setValue("generationComplexity", normalizeNovelAiComplexity(settings.complexity, settings.model));
+  const qualityToggle = styleElement("generationQualityToggle");
+  if (qualityToggle && typeof settings.quality_toggle === "boolean") qualityToggle.checked = settings.quality_toggle;
   setValue("generationResolutionPreset", settings.resolution_preset);
   setValue("generationWidth", settings.width);
   setValue("generationHeight", settings.height);
@@ -3197,7 +3354,10 @@ function addCharacterPrompt(value = "", characterId = createRequestId()) {
   tokens.className = "prompt-token-surface";
   tokens.dataset.promptField = "character";
   tokens.setAttribute("aria-label", "캐릭터 프롬프트 토큰");
-  input.addEventListener("input", persistAndRenderPromptControls);
+  input.addEventListener("input", () => {
+    persistAndRenderPromptControls();
+    syncCharacterPromptLimit();
+  });
   bindPromptTagAutocomplete(input);
   editor.append(input, autocomplete, tokens);
   const remove = document.createElement("button");
@@ -3211,10 +3371,12 @@ function addCharacterPrompt(value = "", characterId = createRequestId()) {
     row.remove();
     if (!styleElement("characterPromptList")?.children.length) addCharacterPrompt();
     persistAndRenderPromptControls();
+    syncCharacterPromptLimit();
   });
   row.append(editor, remove);
   list.append(row);
   renderPromptTokens(tokens, value, "character", characterId);
+  syncCharacterPromptLimit();
 }
 
 function createRequestId() {
@@ -3227,13 +3389,11 @@ function generationNumber(id, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
-function sharedDependencyParameterValue(value, minimum, maximum) {
-  if (value === null || value === undefined || (typeof value === "string" && value.trim() === "")) return null;
-  const numeric = Number(value);
-  return Number.isFinite(numeric) && numeric >= minimum && numeric <= maximum ? numeric : null;
+function currentGenerationModel() {
+  return normalizeNovelAiModel(styleElement("generationModel")?.value);
 }
 
-function readCharacterPrompts() {
+function characterPromptValues() {
   if (typeof document === "undefined") return [];
   return [...document.querySelectorAll("#characterPromptList .character-prompt-row")]
     .map((row) => buildEffectivePromptText(
@@ -3245,8 +3405,74 @@ function readCharacterPrompts() {
     .filter(Boolean);
 }
 
+function rawCharacterPromptValues() {
+  if (typeof document === "undefined") return [];
+  return [...document.querySelectorAll("#characterPromptList .character-prompt-row")]
+    .map((row) => String(row.querySelector("textarea")?.value || "").trim())
+    .filter(Boolean);
+}
+
+function syncCharacterPromptLimit(model = currentGenerationModel()) {
+  const definition = novelAiModelDefinition(model);
+  const values = rawCharacterPromptValues();
+  const count = values.length;
+  const limit = definition.maxCharacterPrompts;
+  const over = count > limit;
+  const label = styleElement("characterPromptLimit");
+  const status = styleElement("characterPromptLimitStatus");
+  const add = styleElement("addCharacterPrompt");
+  const list = styleElement("characterPromptList");
+  if (label) label.textContent = `${definition.displayName} 최대 ${limit}개`;
+  if (status) {
+    status.textContent = over
+      ? `${definition.displayName}에서는 캐릭터 프롬프트를 최대 ${limit}개까지만 사용할 수 있습니다. 입력은 삭제하지 않았으며, 모델을 바꾸면 다시 사용할 수 있습니다.`
+      : `${count}/${limit}개 입력됨 · 모델을 바꾸어도 기존 입력은 유지됩니다.`;
+    status.classList.toggle("error", over);
+  }
+  if (add) add.disabled = count >= limit;
+  if (list) list.dataset.modelLimit = String(limit);
+  return { model: definition.id, count, limit, over };
+}
+
+function validateCharacterPromptLimit(model = currentGenerationModel(), values = characterPromptValues()) {
+  const definition = novelAiModelDefinition(model);
+  if (rawCharacterPromptValues().length > definition.maxCharacterPrompts) {
+    throw new Error(`${definition.displayName}에서는 캐릭터 프롬프트를 최대 ${definition.maxCharacterPrompts}개까지만 사용할 수 있습니다. 모델을 V5로 바꾸거나 입력을 줄여 주세요.`);
+  }
+  return values;
+}
+
+function syncNovelAiModelControls(model = currentGenerationModel()) {
+  const definition = novelAiModelDefinition(model);
+  const row = styleElement("generationComplexityRow");
+  const select = styleElement("generationComplexity");
+  const badge = styleElement("generationModelBadge");
+  row?.classList.toggle("hidden", !definition.supportsComplexity);
+  if (select) {
+    select.disabled = !definition.supportsComplexity;
+    if (definition.supportsComplexity) select.value = normalizeNovelAiComplexity(select.value, definition.id);
+  }
+  if (badge) {
+    badge.className = `model-badge ${novelAiModelBadgeClass(definition.id)}`;
+    badge.textContent = definition.displayName;
+    badge.dataset.model = definition.id;
+  }
+  return syncCharacterPromptLimit(definition.id);
+}
+
+function sharedDependencyParameterValue(value, minimum, maximum) {
+  if (value === null || value === undefined || (typeof value === "string" && value.trim() === "")) return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= minimum && numeric <= maximum ? numeric : null;
+}
+
+function readCharacterPrompts() {
+  return characterPromptValues();
+}
+
 function buildGenerationRequest(requestId = createRequestId()) {
   if (!styleState.artists.length) throw new Error("먼저 그림체 작가를 구성하세요.");
+  const model = currentGenerationModel();
   const width = generationNumber("generationWidth", 832);
   const height = generationNumber("generationHeight", 1216);
   const steps = generationNumber("generationSteps", 28);
@@ -3270,8 +3496,12 @@ function buildGenerationRequest(requestId = createRequestId()) {
   const excludedQualityTags = styleState.excludedPromptTags
     .map((item) => String(item?.prompt || "").trim())
     .filter(Boolean);
+  const characterPrompts = validateCharacterPromptLimit(model);
   const payload = {
     request_id: requestId,
+    model,
+    complexity: normalizeNovelAiComplexity(styleElement("generationComplexity")?.value, model),
+    quality_toggle: Boolean(styleElement("generationQualityToggle")?.checked),
     weight_mode: styleElement("weightMode")?.value || "balanced",
     ...(sharedDependencyMode && styleState.sharedDependencyReferenceId
       ? {
@@ -3294,7 +3524,7 @@ function buildGenerationRequest(requestId = createRequestId()) {
     excluded_quality_tags: excludedQualityTags,
     fixed_prompt: fixedPrompt,
     negative_prompt: buildEffectivePromptText(styleElement("negativePrompt")?.value, "negative", "", styleState.promptGroups),
-    character_prompts: readCharacterPrompts(),
+    character_prompts: characterPrompts,
     width,
     height,
     sampler: styleElement("generationSampler")?.value || "k_euler_ancestral",
@@ -3397,6 +3627,7 @@ function renderGenerationResult(result) {
   const meta = document.createElement("div");
   meta.className = "latest-result-meta";
   meta.textContent = `그림체 #${result.style_id} · ${result.width}×${result.height} · ${result.sampler} / ${result.noise_schedule} · ${result.steps} steps · Scale ${result.scale} · CFG Rescale ${result.cfg_rescale} · Seed ${result.seed}`;
+  appendNovelAiModelBadge(meta, result.model);
   target.append(image, meta);
 }
 
@@ -3420,7 +3651,7 @@ function normalizeStyleHistoryItem(item) {
     ? { ...value.generation_settings }
     : {};
   const hasValue = (source, key) => source?.[key] !== undefined && source?.[key] !== null && source?.[key] !== "";
-  ["width", "height", "steps", "scale", "cfg_rescale", "sampler", "variety_plus", "model", "seed"]
+  ["width", "height", "steps", "scale", "cfg_rescale", "sampler", "variety_plus", "model", "complexity", "quality_toggle", "uc_preset", "seed"]
     .forEach((key) => {
       if (!hasValue(generation, key) && hasValue(value, key)) generation[key] = value[key];
     });
@@ -3458,7 +3689,8 @@ function styleHistoryPreviewMeta(item) {
   const normalized = normalizeStyleHistoryItem(item);
   const settings = normalized.generation_settings || {};
   const scheduler = settings.scheduler || settings.noise_schedule || "native";
-  return `생성 #${normalized.id} · 작가 ${normalized.artists.length}명 · ${managerKnown(settings.width)}×${managerKnown(settings.height)} · ${managerKnown(settings.sampler)} / ${managerKnown(scheduler)} · ${managerKnown(settings.steps)} steps · CFG ${managerKnown(settings.scale)} · Rescale ${managerKnown(settings.cfg_rescale)} · Seed ${managerKnown(settings.seed)}`;
+  const complexity = settings.complexity ? ` · Complexity ${settings.complexity}` : "";
+  return `생성 #${normalized.id} · ${novelAiModelDisplayName(settings.model)}${complexity} · 작가 ${normalized.artists.length}명 · ${managerKnown(settings.width)}×${managerKnown(settings.height)} · ${managerKnown(settings.sampler)} / ${managerKnown(scheduler)} · ${managerKnown(settings.steps)} steps · CFG ${managerKnown(settings.scale)} · Rescale ${managerKnown(settings.cfg_rescale)} · Seed ${managerKnown(settings.seed)}`;
 }
 
 function styleHistoryArtistPrompt(item) {
@@ -3511,6 +3743,7 @@ function renderStyleHistoryDetail(item) {
   heading.textContent = `생성 #${normalized.id}`;
   const meta = document.createElement("p");
   meta.textContent = styleHistoryPreviewMeta(normalized);
+  appendNovelAiModelBadge(meta, normalized.generation_settings?.model || normalized.model);
   const actions = document.createElement("div");
   actions.className = "style-history-detail-actions";
   const load = document.createElement("button");
@@ -3576,6 +3809,7 @@ function renderStyleHistoryList() {
     const info = document.createElement("small");
     info.textContent = `${Array.isArray(item.artists) ? item.artists.length : 0}명${item.confirmed ? " · 확정됨" : ""}`;
     select.append(title, info);
+    appendNovelAiModelBadge(select, item.generation_settings?.model || item.model);
     select.addEventListener("click", () => {
       styleState.historySelectedId = item.id;
       renderStyleHistorySelection(item);
@@ -3635,6 +3869,7 @@ function applyStyleHistoryItem(item) {
   normalized.character_prompts.forEach((prompt, index) => addCharacterPrompt(prompt, `history-${normalized.id}-${index + 1}`));
   if (!normalized.character_prompts.length) addCharacterPrompt();
   applyGenerationSettings(normalized.generation_settings);
+  syncNovelAiModelControls();
   renderStyleArtistList();
   renderWeightGraph();
   updateArtistPrompt();
@@ -3669,6 +3904,10 @@ async function deleteStyleHistoryItem(item) {
   }
 }
 
+function shouldRefreshNovelAiUsageAfterGeneration(payload = {}, result = {}) {
+  return !result?.usage && novelAiModelDefinition(payload?.model).generation === "V5";
+}
+
 async function generateCurrentStyle() {
   if (styleState.generating) throw new Error("이미 생성 중입니다.");
   let payload;
@@ -3683,6 +3922,8 @@ async function generateCurrentStyle() {
   try {
     const result = await apiFetch("/api/style-maker/generate", { method: "POST", body: JSON.stringify(payload) });
     renderGenerationResult(result);
+    if (result?.usage) renderNovelAiUsage(result);
+    else if (shouldRefreshNovelAiUsageAfterGeneration(payload, result)) void loadNovelAiUsage({ silent: true });
     styleState.managerDirty = true;
     styleState.historyDirty = true;
     if (!styleElement("styleMakerHistory")?.classList.contains("history-collapsed")) loadStyleHistory({ force: true });
@@ -3832,6 +4073,7 @@ async function openSettingsModal() {
     });
     globalThis.appDialog.setPreferences?.(preferences);
     if (status) status.textContent = data.configured ? "저장된 키가 있습니다." : "저장된 키가 없습니다.";
+    if (data.configured) void loadNovelAiUsage({ silent: true });
   } catch (error) {
     if (status) status.textContent = error.message;
   }
@@ -3880,6 +4122,7 @@ async function testNovelAiKey() {
   const status = styleElement("novelAiSettingsStatus");
   try {
     const data = await apiFetch("/api/settings/novelai/test", { method: "POST" });
+    renderNovelAiUsage(data);
     if (status) status.textContent = `연결 성공 · Anlas ${data.anlas}`;
   } catch (error) {
     if (status) status.textContent = error.message;
@@ -3909,6 +4152,7 @@ function styleManagerFilterValues() {
     query: styleElement("styleManagerSearch")?.value || "",
     scope: styleElement("styleManagerScopeFilter")?.value || "all",
     metadata: styleElement("styleManagerMetadataFilter")?.value || "all",
+    model: styleElement("styleManagerModelFilter")?.value || "all",
     recommendationMin: styleElement("styleManagerRecommendationMin")?.value || "",
     sort: styleElement("styleManagerSort")?.value || "newest",
   };
@@ -3918,6 +4162,7 @@ function filterStyleManagerItems(styles, mode, filters = {}) {
   const query = String(filters.query || "").trim().toLocaleLowerCase();
   const scope = String(filters.scope || "all");
   const metadata = String(filters.metadata || "all");
+  const model = String(filters.model || "all");
   const recommendationMin = filters.recommendationMin === "" || filters.recommendationMin === null
     ? null
     : Number(filters.recommendationMin);
@@ -3936,6 +4181,7 @@ function filterStyleManagerItems(styles, mode, filters = {}) {
     if (mode === "confirmed" && scope !== "all" && item.source_type !== scope) return false;
     if (mode === "shared" && scope !== "all" && item.board_tab !== scope) return false;
     if (mode === "shared" && metadata !== "all" && item.metadata_status !== metadata) return false;
+    if (!novelAiModelFilterMatchesItem(item, model)) return false;
     if (mode === "shared" && Number.isFinite(recommendationMin) && Number(item.recommendation_count) < recommendationMin) return false;
     return true;
   });
@@ -3973,6 +4219,88 @@ function updateStyleManagerListStatus(total) {
     status.textContent = `${total}개 · ${styleState.managerPage}페이지`;
   }
   renderStyleManagerPagination(total);
+}
+
+function formatNovelAiUsageCountdown(seconds) {
+  const total = Math.max(0, Math.ceil(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const rest = total % 60;
+  return [hours, minutes, rest].map((value) => String(value).padStart(2, "0")).join(":");
+}
+
+function normalizeNovelAiUsage(value = {}) {
+  const source = value?.usage && typeof value.usage === "object" ? value.usage : value;
+  const percentValue = Number(source?.percent ?? value?.percent);
+  const countdownValue = Number(source?.timeUntilNextPercent ?? source?.time_until_next_percent ?? value?.timeUntilNextPercent ?? value?.time_until_next_percent);
+  const explicitAvailable = source?.available ?? source?.is_available ?? value?.available ?? value?.is_available;
+  return {
+    percent: Number.isFinite(percentValue) ? Math.max(0, Math.min(100, percentValue)) : null,
+    seconds: Number.isFinite(countdownValue) ? Math.max(0, countdownValue) : null,
+    isNegative: source?.isNegative ?? source?.is_negative ?? value?.isNegative ?? value?.is_negative,
+    available: typeof explicitAvailable === "boolean"
+      ? explicitAvailable
+      : source?.isNegative === undefined && value?.isNegative === undefined
+        ? null
+        : !(source?.isNegative ?? value?.isNegative),
+    anlas: value?.anlas ?? source?.anlas ?? null,
+  };
+}
+
+function renderNovelAiUsage(value = {}) {
+  const usage = normalizeNovelAiUsage(value);
+  styleState.novelAiUsage = usage;
+  clearInterval(styleState.novelAiUsageCountdownTimer);
+  const text = styleElement("novelAiUsageText");
+  const countdown = styleElement("novelAiUsageCountdown");
+  const availability = styleElement("novelAiUsageAvailability");
+  if (text) text.textContent = usage.percent === null
+    ? (usage.anlas === null ? "사용량 정보를 제공하지 않았습니다." : `Anlas ${usage.anlas}`)
+    : `V5 Usage: ${usage.percent}%${usage.anlas === null ? "" : ` · Anlas ${usage.anlas}`}`;
+  if (availability) {
+    availability.classList.toggle("is-available", usage.available === true);
+    availability.classList.toggle("is-unavailable", usage.available === false);
+    availability.textContent = usage.available === true
+      ? "현재 사용 가능"
+      : usage.available === false
+        ? "현재 사용 불가"
+        : "현재 상태 알 수 없음";
+  }
+  const renderCountdown = () => {
+    if (!countdown) return;
+    if (styleState.novelAiUsage.seconds === null) {
+      countdown.textContent = "다음 변화까지: 알 수 없음";
+      return;
+    }
+    countdown.textContent = `다음 변화까지: ${formatNovelAiUsageCountdown(styleState.novelAiUsage.seconds)}`;
+  };
+  renderCountdown();
+  if (styleState.novelAiUsage.seconds !== null) {
+    styleState.novelAiUsageCountdownTimer = setInterval(() => {
+      if (!styleState.novelAiUsage || styleState.novelAiUsage.seconds === null) return;
+      styleState.novelAiUsage.seconds = Math.max(0, styleState.novelAiUsage.seconds - 1);
+      renderCountdown();
+    }, 1000);
+  }
+  return usage;
+}
+
+async function loadNovelAiUsage({ silent = false } = {}) {
+  if (styleState.novelAiUsageRequest) return styleState.novelAiUsageRequest;
+  styleState.novelAiUsageRequest = (async () => {
+    try {
+      const result = await apiFetch("/api/settings/novelai/test", { method: "POST" });
+      renderNovelAiUsage(result);
+      if (!silent) showStyleStatus("NovelAI 사용량을 새로고침했습니다.", "ok");
+      return result;
+    } catch (error) {
+      if (!silent) showStyleStatus(error.message, "error");
+      return null;
+    } finally {
+      styleState.novelAiUsageRequest = null;
+    }
+  })();
+  return styleState.novelAiUsageRequest;
 }
 
 function setStyleManagerLoadProgress({ label = "", completed = 0, total = 0, indeterminate = false, failures = 0 } = {}) {
@@ -4081,6 +4409,7 @@ function renderStyleManagerList(styles) {
       info.textContent = `${style.board_tab || "공유"}${style.confirmed ? " · 확정됨" : ""}`;
     }
     body.append(title, info);
+    appendNovelAiModelBadge(body, style.model);
     if (styleState.managerDescriptions) {
       const description = document.createElement("span");
       description.className = "style-manager-card-description";
@@ -4167,6 +4496,7 @@ function styleManagerSharedQuery(offset) {
   if (filters.query.trim()) query.set("q", filters.query.trim());
   if (filters.scope !== "all") query.set("tab", filters.scope);
   if (filters.metadata !== "all") query.set("metadata", filters.metadata);
+  if (filters.model !== "all") query.set("model", filters.model);
   if (String(filters.recommendationMin).trim()) query.set("recommendation_min", filters.recommendationMin);
   const sorts = { newest: "posted_desc", oldest: "posted_asc", recommend: "recommend_desc" };
   query.set("sort", sorts[filters.sort] || "posted_desc");
@@ -4513,10 +4843,13 @@ function managerGenerationText(item) {
     `${managerKnown(item.steps)} steps`,
     `CFG ${managerKnown(item.scale)}`,
     `Rescale ${managerKnown(item.cfg_rescale)}`,
+    item.complexity ? `Complexity ${item.complexity}` : "",
+    `Quality ${item.quality_toggle ? "켜짐" : "꺼짐"}`,
+    `UC ${normalizeUcPreset(item.uc_preset)}`,
     variety,
     `Seed ${managerKnown(item.seed)}`,
-    managerKnown(item.model),
-  ].join(" · ");
+    novelAiModelDisplayName(item.model),
+  ].filter(Boolean).join(" · ");
 }
 
 function normalizedManagerModalImage(item) {
@@ -4594,7 +4927,7 @@ function renderStyleManagerDetail(item) {
   closeButton.setAttribute("aria-label", "상세보기 닫기");
   closeButton.addEventListener("click", resetStyleManagerDetail);
   headActions.append(closeButton);
-  head.append(heading, headActions);
+  head.append(heading, createNovelAiModelBadge(item.model), headActions);
   const detailGrid = document.createElement("div");
   detailGrid.className = "style-manager-detail-grid";
   const imageStage = document.createElement("section");
@@ -4691,16 +5024,20 @@ function confirmedFormValue(id, value) {
   if (element) element.value = value === null || value === undefined ? "" : String(value);
 }
 
+function confirmedFormChecked(id, value) {
+  const element = styleElement(id);
+  if (element) element.checked = Boolean(value);
+}
+
+function normalizeUcPreset(value) {
+  const numeric = Number(value);
+  return Number.isInteger(numeric) && numeric >= 0 && numeric <= 4 ? numeric : 0;
+}
+
 function normalizeConfirmedModelName(value) {
   const model = String(value || "").trim();
-  const lowered = model.toLowerCase();
-  if (lowered.startsWith("novelai diffusion v4.5 curated") || lowered === "nai-diffusion-4-5-curated") {
-    return "NovelAI Diffusion V4.5 Curated";
-  }
-  if (lowered.startsWith("novelai diffusion v4.5") || lowered === "nai-diffusion-4-5-full") {
-    return "NovelAI Diffusion V4.5 Full";
-  }
-  return model;
+  const definition = novelAiModelDefinition(model);
+  return NOVELAI_MODEL_DEFINITIONS[definition.id] ? `NovelAI Diffusion ${definition.displayName}` : model;
 }
 
 function setConfirmedModelValue(value) {
@@ -4714,6 +5051,36 @@ function setConfirmedModelValue(value) {
     element.append(option);
   }
   element.value = model;
+  syncConfirmedComplexityControl(model);
+  const badge = styleElement("confirmedStyleModelBadge");
+  if (badge) {
+    badge.className = `model-badge ${novelAiModelBadgeClass(model)}`;
+    badge.textContent = novelAiModelBadgeLabel(model);
+    const normalized = normalizeNovelAiModel(model, "");
+    badge.dataset.model = NOVELAI_MODEL_DEFINITIONS[normalized] ? normalized : "unknown";
+  }
+}
+
+function syncConfirmedComplexityControl(model = styleElement("confirmedStyleModel")?.value) {
+  const definition = novelAiModelDefinition(model);
+  const row = styleElement("confirmedStyleComplexityRow");
+  const select = styleElement("confirmedStyleComplexity");
+  row?.classList.toggle("hidden", !definition.supportsComplexity);
+  if (select) {
+    select.disabled = !definition.supportsComplexity;
+    if (definition.supportsComplexity) select.value = normalizeNovelAiComplexity(select.value, definition.id);
+  }
+}
+
+function syncComparisonComplexityControl(model = styleElement("comparisonDefaultModel")?.value) {
+  const definition = novelAiModelDefinition(model);
+  const row = styleElement("comparisonDefaultComplexityRow");
+  const select = styleElement("comparisonDefaultComplexity");
+  row?.classList.toggle("hidden", !definition.supportsComplexity);
+  if (select) {
+    select.disabled = !definition.supportsComplexity;
+    if (definition.supportsComplexity) select.value = normalizeNovelAiComplexity(select.value, definition.id);
+  }
 }
 
 function renderConfirmedExcludedTags() {
@@ -4899,7 +5266,7 @@ function renderConfirmedDuplicateCandidates(group) {
     appendMetaRow(info, "캐릭터 프롬프트", (style.character_prompts || []).join("\n"));
     appendMetaRow(info, "네거티브", style.negative_prompt);
     appendMetaRow(info, "이미지 크기", `${selectedImage.width || style.width || "?"}×${selectedImage.height || style.height || "?"}`);
-    appendMetaRow(info, "생성 설정", `${style.model || "모델 미상"} · ${style.sampler || "샘플러 미상"} / ${style.noise_schedule || "스케줄러 미상"} · ${style.steps || "?"} steps · CFG ${style.scale ?? "?"}`);
+    appendMetaRow(info, "생성 설정", `${style.model || "모델 미상"} · ${style.sampler || "샘플러 미상"} / ${style.noise_schedule || "스케줄러 미상"} · ${style.steps || "?"} steps · CFG ${style.scale ?? "?"}${style.complexity ? ` · Complexity ${style.complexity}` : ""}`);
     if (style.description) appendMetaRow(info, "설명", style.description);
   }
 }
@@ -5097,6 +5464,9 @@ function openConfirmedStyleModal(item = null, editing = false, sourceMode = styl
   confirmedFormValue("confirmedStyleScale", source.scale);
   confirmedFormValue("confirmedStyleCfgRescale", source.cfg_rescale);
   confirmedFormValue("confirmedStyleVariety", source.variety_plus === true ? "1" : source.variety_plus === false ? "0" : "unknown");
+  confirmedFormValue("confirmedStyleComplexity", source.complexity || "");
+  confirmedFormChecked("confirmedStyleQualityToggle", source.quality_toggle ?? source.qualityToggle ?? false);
+  confirmedFormValue("confirmedStyleUcPreset", normalizeUcPreset(source.uc_preset ?? source.ucPreset));
   setConfirmedModelValue(source.model || "");
   setConfirmedPreview(source.image_url || "", !source.image_url);
   renderConfirmedExcludedTags();
@@ -5238,12 +5608,13 @@ function renderComparisonStyleDetail(item) {
   image.src = item.image_url || "";
   image.alt = item.name || `확정 그림체 #${item.id}`;
   target.append(image);
+  appendNovelAiModelBadge(target, item.model);
   comparisonTextRow(target, "이름", item.name || `확정 그림체 #${item.id}`);
   comparisonTextRow(target, "작가 프롬프트", item.artist_prompt);
   comparisonTextRow(target, "퀄리티 프롬프트", item.quality_prompt);
   comparisonTextRow(target, "고정 프롬프트", item.fixed_prompt);
   comparisonTextRow(target, "네거티브 프롬프트", item.negative_prompt);
-  comparisonTextRow(target, "생성 설정", `${item.sampler || "기본"} / ${item.noise_schedule || "기본"} · ${item.steps ?? "기본"} steps · CFG ${item.scale ?? "기본"} · Rescale ${item.cfg_rescale ?? "기본"} · Variety+ ${item.variety_plus === true ? "켜짐" : item.variety_plus === false ? "꺼짐" : "기본"} · ${item.model || "기본 모델"}`);
+  comparisonTextRow(target, "생성 설정", `${item.sampler || "기본"} / ${item.noise_schedule || "기본"} · ${item.steps ?? "기본"} steps · CFG ${item.scale ?? "기본"} · Rescale ${item.cfg_rescale ?? "기본"} · Variety+ ${item.variety_plus === true ? "켜짐" : item.variety_plus === false ? "꺼짐" : "기본"} · Quality ${item.quality_toggle ? "켜짐" : "꺼짐"} · UC ${normalizeUcPreset(item.uc_preset)}${item.complexity ? ` · Complexity ${item.complexity}` : ""} · ${item.model || "기본 모델"}`);
 }
 
 function updateComparisonSelectedSummary() {
@@ -5283,7 +5654,7 @@ function renderComparisonPicker() {
       comparisonFocusedStyleId = item.id;
       renderComparisonStyleDetail(item);
     });
-    label.append(checkbox, image, name, artist);
+    label.append(checkbox, image, name, createNovelAiModelBadge(item.model), artist);
     target.append(label);
   });
   updateComparisonSelectedSummary();
@@ -5291,7 +5662,9 @@ function renderComparisonPicker() {
 
 function comparisonSetValue(id, value) {
   const element = styleElement(id);
-  if (element) element.value = value === null || value === undefined ? "" : String(value);
+  if (!element) return;
+  if (element.type === "checkbox") element.checked = Boolean(value);
+  else element.value = value === null || value === undefined ? "" : String(value);
 }
 
 function syncComparisonResolutionFields() {
@@ -5340,8 +5713,12 @@ async function openComparisonEditor(group = null) {
   comparisonSetValue("comparisonDefaultScale", defaults.scale ?? 5);
   comparisonSetValue("comparisonDefaultRescale", defaults.cfg_rescale ?? 0);
   comparisonSetValue("comparisonDefaultVariety", defaults.variety_plus ? "1" : "0");
+  comparisonSetValue("comparisonDefaultQualityToggle", defaults.quality_toggle ?? defaults.qualityToggle ?? false);
+  comparisonSetValue("comparisonDefaultUcPreset", normalizeUcPreset(defaults.uc_preset ?? defaults.ucPreset));
+  comparisonSetValue("comparisonDefaultComplexity", defaults.complexity || "");
   comparisonSetValue("comparisonDefaultModel", defaults.model || "nai-diffusion-4-5-full");
-  ["comparisonName", "comparisonFixedPrompt", "comparisonResolution", "comparisonWidth", "comparisonHeight", "comparisonSeedMode", "comparisonSeed", "comparisonDefaultSampler", "comparisonDefaultSchedule", "comparisonDefaultSteps", "comparisonDefaultScale", "comparisonDefaultRescale", "comparisonDefaultVariety", "comparisonDefaultModel"].forEach((id) => { const element = styleElement(id); if (element) element.disabled = Boolean(group); });
+  syncComparisonComplexityControl();
+  ["comparisonName", "comparisonFixedPrompt", "comparisonResolution", "comparisonWidth", "comparisonHeight", "comparisonSeedMode", "comparisonSeed", "comparisonDefaultSampler", "comparisonDefaultSchedule", "comparisonDefaultSteps", "comparisonDefaultScale", "comparisonDefaultRescale", "comparisonDefaultVariety", "comparisonDefaultQualityToggle", "comparisonDefaultUcPreset", "comparisonDefaultComplexity", "comparisonDefaultModel"].forEach((id) => { const element = styleElement(id); if (element) element.disabled = Boolean(group); });
   const save = styleElement("createComparison");
   if (save) save.textContent = group ? "선택 변경 저장" : "선택한 그림체 생성";
   styleElement("comparisonGroups")?.classList.add("hidden");
@@ -5527,7 +5904,9 @@ function renderComparisonResultDetail(group, item) {
   comparisonTextRow(info, "고정 프롬프트", combinePromptSections(settings.style_fixed_prompt || style.fixed_prompt, settings.comparison_fixed_prompt || group.fixed_prompt));
   comparisonTextRow(info, "캐릭터 프롬프트", (settings.character_prompts || group.character_prompts || []).join("\n"));
   comparisonTextRow(info, "네거티브 프롬프트", settings.negative_prompt || style.negative_prompt);
-  comparisonTextRow(info, "생성 설정", `${settings.sampler || style.sampler || "기본"} / ${settings.noise_schedule || style.noise_schedule || "기본"} · ${settings.steps ?? style.steps ?? "기본"} steps · CFG ${settings.scale ?? style.scale ?? "기본"} · Rescale ${settings.cfg_rescale ?? style.cfg_rescale ?? "기본"} · Variety+ ${(settings.variety_plus ?? style.variety_plus) ? "켜짐" : "꺼짐"} · ${settings.model || style.model || "기본 모델"} · Seed ${settings.seed ?? "미지정"}`);
+  const complexity = settings.complexity || style.complexity || "";
+  comparisonTextRow(info, "생성 설정", `${settings.sampler || style.sampler || "기본"} / ${settings.noise_schedule || style.noise_schedule || "기본"} · ${settings.steps ?? style.steps ?? "기본"} steps · CFG ${settings.scale ?? style.scale ?? "기본"} · Rescale ${settings.cfg_rescale ?? style.cfg_rescale ?? "기본"} · Variety+ ${(settings.variety_plus ?? style.variety_plus) ? "켜짐" : "꺼짐"} · Quality ${(settings.quality_toggle ?? style.quality_toggle) ? "켜짐" : "꺼짐"} · UC ${normalizeUcPreset(settings.uc_preset ?? style.uc_preset)}${complexity ? ` · Complexity ${complexity}` : ""} · ${novelAiModelDisplayName(settings.model || style.model)} · Seed ${settings.seed ?? "미지정"}`);
+  appendNovelAiModelBadge(head, settings.model || style.model);
   target.append(image, head, actions, info);
 }
 
@@ -5646,6 +6025,12 @@ function comparisonRequestPayload(styleIds) {
       scale: Number(styleElement("comparisonDefaultScale").value),
       cfg_rescale: Number(styleElement("comparisonDefaultRescale").value),
       variety_plus: styleElement("comparisonDefaultVariety").value === "1",
+      quality_toggle: Boolean(styleElement("comparisonDefaultQualityToggle")?.checked),
+      uc_preset: normalizeUcPreset(styleElement("comparisonDefaultUcPreset")?.value),
+      complexity: normalizeNovelAiComplexity(
+        styleElement("comparisonDefaultComplexity").value,
+        styleElement("comparisonDefaultModel").value,
+      ),
       model: styleElement("comparisonDefaultModel").value,
     },
   };
@@ -5711,6 +6096,9 @@ function applyExtractedConfirmedMetadata(metadata) {
   confirmedFormValue("confirmedStyleScale", metadata.scale);
   confirmedFormValue("confirmedStyleCfgRescale", metadata.cfg_rescale);
   confirmedFormValue("confirmedStyleVariety", metadata.variety_plus === true ? "1" : metadata.variety_plus === false ? "0" : "unknown");
+  confirmedFormValue("confirmedStyleComplexity", metadata.complexity || "");
+  confirmedFormChecked("confirmedStyleQualityToggle", metadata.quality_toggle ?? metadata.qualityToggle ?? false);
+  confirmedFormValue("confirmedStyleUcPreset", normalizeUcPreset(metadata.uc_preset ?? metadata.ucPreset));
   setConfirmedModelValue(metadata.model || "");
   styleState.confirmedModalExcludedTags = [...(metadata.excluded_quality_tags || [])];
   styleState.confirmedModalOriginalQualityPrompt = metadata.original_quality_prompt || metadata.quality_prompt || "";
@@ -5920,6 +6308,12 @@ function readConfirmedStyleForm() {
     scale: nullableConfirmedNumber("confirmedStyleScale"),
     cfg_rescale: nullableConfirmedNumber("confirmedStyleCfgRescale"),
     variety_plus: variety === "1" ? true : variety === "0" ? false : null,
+    quality_toggle: Boolean(styleElement("confirmedStyleQualityToggle")?.checked),
+    uc_preset: normalizeUcPreset(styleElement("confirmedStyleUcPreset")?.value),
+    complexity: normalizeNovelAiComplexity(
+      styleElement("confirmedStyleComplexity")?.value,
+      styleElement("confirmedStyleModel")?.value,
+    ),
     model: styleElement("confirmedStyleModel")?.value || "",
   };
 }
@@ -6326,6 +6720,14 @@ function initializeStyleMaker() {
       button.textContent = collapsed ? "▶ 생성 파라미터 열기" : "▼ 생성 파라미터 닫기";
     }
   });
+  styleElement("generationModel")?.addEventListener("change", () => {
+    syncNovelAiModelControls();
+    savePromptDraft();
+  });
+  styleElement("generationComplexity")?.addEventListener("change", () => {
+    syncNovelAiModelControls();
+    savePromptDraft();
+  });
   styleElement("generationResolutionPreset")?.addEventListener("change", (event) => {
     if (event.target.value !== "custom") {
       const [width, height] = event.target.value.split("x");
@@ -6383,6 +6785,9 @@ function initializeStyleMaker() {
     "generationScheduler",
     "generationSteps",
     "generationVarietyPlus",
+    "generationQualityToggle",
+    "generationModel",
+    "generationComplexity",
     "generationSeed",
     "generationSeedFixed",
     "generationCount",
@@ -6415,6 +6820,8 @@ function initializeStyleMaker() {
   styleState.selectedPromptPresetKey = storedPreset.selected_key;
   styleState.promptGroups = storedPrompts.prompt_groups;
   applyGenerationSettings(storedPrompts.generation_settings);
+  syncNovelAiModelControls();
+  void loadNovelAiUsage({ silent: true });
   styleElement("basePrompt").value = storedPrompts.base_prompt;
   styleElement("fixedPrompt").value = storedPrompts.fixed_prompt;
   styleElement("negativePrompt").value = storedPrompts.negative_prompt;
@@ -6455,6 +6862,7 @@ if (typeof document !== "undefined") {
     document.querySelectorAll("[data-delete-confirmation-category]").forEach((checkbox) => { checkbox.checked = false; });
   });
   styleElement("testNovelAiKey")?.addEventListener("click", testNovelAiKey);
+  styleElement("refreshNovelAiUsage")?.addEventListener("click", () => { void loadNovelAiUsage(); });
   styleElement("deleteNovelAiKey")?.addEventListener("click", deleteNovelAiKey);
   styleElement("refreshStyleManager")?.addEventListener("click", loadStyleManager);
   document.querySelectorAll("[data-style-manager-mode]").forEach((button) => {
@@ -6462,7 +6870,7 @@ if (typeof document !== "undefined") {
   });
   syncStyleManagerFilterControls();
   styleElement("styleManagerSearch")?.addEventListener("input", () => applyStyleManagerFilters({ delayed: true }));
-  ["styleManagerScopeFilter", "styleManagerMetadataFilter", "styleManagerRecommendationMin", "styleManagerSort"]
+  ["styleManagerScopeFilter", "styleManagerMetadataFilter", "styleManagerModelFilter", "styleManagerRecommendationMin", "styleManagerSort"]
     .forEach((id) => styleElement(id)?.addEventListener("change", () => applyStyleManagerFilters()));
   const managerPageSize = styleElement("styleManagerPageSize");
   if (managerPageSize) {
@@ -6520,6 +6928,8 @@ if (typeof document !== "undefined") {
   styleElement("toggleComparisonSettingsColumn")?.addEventListener("click", () => toggleComparisonColumn("settings"));
   styleElement("comparisonResolution")?.addEventListener("change", (event) => { const [width, height] = event.target.value.split("x"); if (width && height) { styleElement("comparisonWidth").value = width; styleElement("comparisonHeight").value = height; } syncComparisonResolutionFields(); });
   styleElement("comparisonSeedMode")?.addEventListener("change", syncComparisonResolutionFields);
+  styleElement("comparisonDefaultModel")?.addEventListener("change", () => syncComparisonComplexityControl());
+  styleElement("confirmedStyleModel")?.addEventListener("change", () => syncConfirmedComplexityControl());
   bindPromptTagAutocomplete(styleElement("comparisonFixedPrompt"));
   styleElement("addComparisonCharacterPrompt")?.addEventListener("click", addComparisonCharacterPrompt);
   styleElement("createComparison")?.addEventListener("click", createComparison);
@@ -6724,5 +7134,14 @@ if (typeof module !== "undefined" && module.exports) {
     setSharedDependencyReference,
     clearSharedDependencyReference,
     setSharedDependencyReferenceFromArca,
+    normalizeNovelAiModel,
+    novelAiModelDefinition,
+    novelAiModelDisplayName,
+    novelAiModelBadgeClass,
+    normalizeNovelAiComplexity,
+    novelAiModelFilterMatches,
+    normalizeNovelAiUsage,
+    formatNovelAiUsageCountdown,
+    shouldRefreshNovelAiUsageAfterGeneration,
   };
 }

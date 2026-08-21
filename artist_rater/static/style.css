@@ -4000,3 +4000,169 @@ textarea {
     width: min(300px, calc(100vw - 20px));
   }
 }
+
+.model-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, .04);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.model-badge-v5-full,
+.model-badge-v5-curated {
+  border-color: #7a9be8;
+  color: #cbd9ff;
+  background: rgba(90, 126, 220, .18);
+}
+
+.model-badge-v4-5-full,
+.model-badge-v4-5-curated {
+  border-color: #55b8a8;
+  color: #b8f0e4;
+  background: rgba(67, 166, 148, .16);
+}
+
+.model-badge-unknown {
+  border-color: #8b734c;
+  color: #f0c98b;
+  background: rgba(201, 145, 63, .12);
+}
+
+.model-parameter-row,
+.novelai-usage-head,
+.style-history-card-select,
+.comparison-style-choice {
+  min-width: 0;
+}
+
+.model-parameter-row {
+  grid-template-columns: 92px minmax(0, 1fr) auto;
+}
+
+.model-parameter-row > select {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.model-limit-hint {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.model-limit-status {
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.model-limit-status.error {
+  color: #ffb5a8;
+}
+
+.novelai-usage-panel {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  margin-top: 9px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(17, 22, 29, .84);
+}
+
+.novelai-usage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.novelai-usage-head button {
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+.novelai-usage-text,
+.novelai-usage-countdown,
+.novelai-usage-availability {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.novelai-usage-availability.is-available {
+  color: #b8f0e4;
+}
+
+.novelai-usage-availability.is-unavailable {
+  color: #ffb5a8;
+}
+
+.arca-selected-model-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 1;
+}
+
+.arca-selected-image-frame {
+  position: relative;
+}
+
+.arca-image-choice {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.arca-image-choice .model-badge {
+  justify-self: center;
+  max-width: calc(100% - 8px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.arca-style-meta .model-badge {
+  flex: 0 0 auto;
+}
+
+.style-history-card-select .model-badge,
+.comparison-style-choice .model-badge {
+  margin-top: 3px;
+}
+
+@media (max-width: 760px) {
+  .model-parameter-row {
+    align-items: stretch;
+    grid-template-columns: 1fr auto;
+  }
+
+  .model-parameter-row > span {
+    grid-column: 1 / -1;
+  }
+
+  .model-parameter-row > select {
+    grid-column: 1;
+    width: 100%;
+  }
+
+  .model-parameter-row > .model-badge {
+    grid-column: 2;
+    align-self: center;
+  }
+
+  .novelai-usage-panel {
+    margin-bottom: 4px;
+  }
+}

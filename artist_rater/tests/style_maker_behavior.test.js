@@ -1,5 +1,9 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
+
+const styleMakerSource = fs.readFileSync(path.join(__dirname, "../static/style_maker.js"), "utf8");
 
 const {
   CUSTOM_RANGE_FIELDS,
@@ -76,7 +80,117 @@ const {
   styleHistoryPreviewMeta,
   deleteConfirmationEnabledFromSkip,
   skipDeleteConfirmationFromEnabled,
+  normalizeNovelAiModel,
+  novelAiModelDefinition,
+  novelAiModelDisplayName,
+  novelAiModelBadgeClass,
+  normalizeNovelAiComplexity,
+  novelAiModelFilterMatches,
+  normalizeNovelAiUsage,
+  formatNovelAiUsageCountdown,
+  shouldRefreshNovelAiUsageAfterGeneration,
 } = require("../static/style_maker.js");
+
+test("NovelAI model definitions keep V5/V4.5 limits and complexity capability", () => {
+  assert.equal(normalizeNovelAiModel("NAID4.5F"), "nai-diffusion-4-5-full");
+  assert.equal(normalizeNovelAiModel("NovelAI Diffusion V5 Curated"), "nai-diffusion-5-curated");
+  assert.equal(novelAiModelDefinition("nai-diffusion-5-full").maxCharacterPrompts, 22);
+  assert.equal(novelAiModelDefinition("nai-diffusion-4-5-full").maxCharacterPrompts, 6);
+  assert.equal(normalizeNovelAiComplexity("ultra", "nai-diffusion-5-full"), "ultra");
+  assert.equal(normalizeNovelAiComplexity("ultra", "nai-diffusion-4-5-full"), "");
+  assert.equal(novelAiModelDisplayName("nai-diffusion-4-5-curated"), "V4.5 Curated");
+});
+
+test("model filters distinguish exact, family, and unknown records", () => {
+  assert.equal(novelAiModelFilterMatches("nai-diffusion-5-full", "v5"), true);
+  assert.equal(novelAiModelFilterMatches("nai-diffusion-4-5-full", "v5"), false);
+  assert.equal(novelAiModelFilterMatches("nai-diffusion-4-5-curated", "v4.5"), true);
+  assert.equal(novelAiModelFilterMatches("nai-diffusion-4-full", "v4.5"), false);
+  assert.equal(novelAiModelFilterMatches("nai-diffusion-3", "v4.5"), false);
+  assert.equal(novelAiModelFilterMatches("old-model", "unknown"), true);
+  assert.equal(novelAiModelFilterMatches("nai-diffusion-5-full", "nai-diffusion-5-curated"), false);
+});
+
+test("model switching preserves V5 complexity while omitting it for V4.5 requests", () => {
+  const selectedComplexity = "high";
+  assert.equal(normalizeNovelAiComplexity(selectedComplexity, "nai-diffusion-4-5-full"), "");
+  assert.equal(normalizeNovelAiComplexity(selectedComplexity, "nai-diffusion-5-full"), selectedComplexity);
+});
+
+test("generated history re-applies direct model, complexity, quality toggle, and optional UC preset fields", () => {
+  const direct = normalizeStyleHistoryItem({
+    id: 41,
+    model: "nai-diffusion-5-full",
+    complexity: "ultra",
+    quality_toggle: true,
+    uc_preset: 3,
+  });
+  assert.equal(direct.generation_settings.model, "nai-diffusion-5-full");
+  assert.equal(direct.generation_settings.complexity, "ultra");
+  assert.equal(direct.generation_settings.quality_toggle, true);
+  assert.equal(direct.generation_settings.uc_preset, 3);
+  assert.match(styleHistoryPreviewMeta(direct), /V5 Full · Complexity ultra/);
+
+  const nested = normalizeStyleHistoryItem({
+    id: 42,
+    model: "nai-diffusion-4-5-full",
+    complexity: "",
+    quality_toggle: true,
+    generation_settings: {
+      model: "nai-diffusion-5-curated",
+      complexity: "medium",
+      quality_toggle: false,
+      uc_preset: 1,
+    },
+  });
+  assert.deepEqual(nested.generation_settings, {
+    model: "nai-diffusion-5-curated",
+    complexity: "medium",
+    quality_toggle: false,
+    uc_preset: 1,
+  });
+});
+
+test("successful V5 generation refreshes usage only when response omits usage", () => {
+  assert.equal(shouldRefreshNovelAiUsageAfterGeneration({ model: "nai-diffusion-5-full" }, { image_url: "/x.png" }), true);
+  assert.equal(shouldRefreshNovelAiUsageAfterGeneration({ model: "nai-diffusion-5-full" }, { usage: { percent: 12 } }), false);
+  assert.equal(shouldRefreshNovelAiUsageAfterGeneration({ model: "nai-diffusion-4-5-full" }, { image_url: "/x.png" }), false);
+});
+
+test("history, confirmed, and comparison surfaces attach model badges", () => {
+  for (const marker of [
+    "appendNovelAiModelBadge(meta, result.model)",
+    "appendNovelAiModelBadge(select, item.generation_settings?.model || item.model)",
+    "setConfirmedModelValue(source.model || \"\")",
+    "appendNovelAiModelBadge(target, item.model)",
+    "createNovelAiModelBadge(item.model)",
+  ]) {
+    assert.ok(styleMakerSource.includes(marker), `missing badge attachment: ${marker}`);
+  }
+  assert.equal(novelAiModelBadgeClass("nai-diffusion-5-full"), "model-badge-v5-full");
+  assert.equal(novelAiModelBadgeClass("nai-diffusion-5-curated"), "model-badge-v5-curated");
+  assert.equal(novelAiModelBadgeClass("nai-diffusion-4-5-full"), "model-badge-v4-5-full");
+  assert.equal(novelAiModelBadgeClass("nai-diffusion-4-5-curated"), "model-badge-v4-5-curated");
+});
+
+test("confirmed and comparison surfaces preserve and expose V5 complexity", () => {
+  for (const marker of [
+    "styleElement(\"confirmedStyleComplexity\")",
+    "confirmedFormValue(\"confirmedStyleComplexity\", source.complexity || \"\")",
+    "complexity: normalizeNovelAiComplexity(",
+    "comparisonDefaultComplexity",
+    "settings.complexity || style.complexity",
+  ]) {
+    assert.ok(styleMakerSource.includes(marker), `missing complexity connection: ${marker}`);
+  }
+});
+
+test("NovelAI usage normalizes nested response and formats a browser countdown", () => {
+  assert.deepEqual(normalizeNovelAiUsage({ anlas: 321, usage: { percent: 42, timeUntilNextPercent: 3661, isNegative: false } }), {
+    percent: 42, seconds: 3661, isNegative: false, available: true, anlas: 321,
+  });
+  assert.equal(formatNovelAiUsageCountdown(3661), "01:01:01");
+});
 
 test("delete confirmation settings use a positive UI value with legacy API inversion", () => {
   assert.equal(deleteConfirmationEnabledFromSkip(false), true);
@@ -411,10 +525,31 @@ test("confirmed imports group exact weighted artist prompts and separate unknown
   ]);
 });
 
-test("confirmed style models normalize NovelAI V4.5 build labels to Full", () => {
-  assert.equal(normalizeConfirmedModelName("NovelAI Diffusion V4.5 4BDE2A90"), "NovelAI Diffusion V4.5 Full");
-  assert.equal(normalizeConfirmedModelName("NovelAI Diffusion V4.5"), "NovelAI Diffusion V4.5 Full");
-  assert.equal(normalizeConfirmedModelName("NovelAI Diffusion V4.5 Curated"), "NovelAI Diffusion V4.5 Curated");
+test("confirmed style models preserve ambiguous NovelAI build labels", () => {
+  assert.equal(
+    normalizeConfirmedModelName("NovelAI Diffusion V4.5 4BDE2A90"),
+    "NovelAI Diffusion V4.5 4BDE2A90"
+  );
+
+  assert.equal(
+    normalizeConfirmedModelName("NovelAI Diffusion V4.5"),
+    "NovelAI Diffusion V4.5"
+  );
+
+  assert.equal(
+    normalizeConfirmedModelName("NovelAI Diffusion V4.5 Curated"),
+    "NovelAI Diffusion V4.5 Curated"
+  );
+
+  assert.equal(
+    normalizeConfirmedModelName("NovelAI Diffusion V5 4BDE2A90"),
+    "NovelAI Diffusion V5 4BDE2A90"
+  );
+
+  assert.equal(
+    normalizeConfirmedModelName("nai-diffusion-5-curated"),
+    "NovelAI Diffusion V5 Curated"
+  );
 });
 
 test("confirmed imports flag every existing style with the same weighted artist prompt", () => {

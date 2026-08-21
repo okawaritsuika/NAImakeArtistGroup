@@ -12,6 +12,15 @@ Danbooru 작가를 평가하고, 평가 결과로 NovelAI용 그림체 프롬프
 - 이미지별 베이스·네거티브·캐릭터 프롬프트 비교
 - 추천·조회·게시일 기준 그림체 정렬
 
+## NovelAI V5와 V4.5
+
+- `nai-diffusion-5-full`, `nai-diffusion-5-curated`, `nai-diffusion-4-5-full`, `nai-diffusion-4-5-curated`를 함께 선택하고 생성할 수 있습니다. 생성 기록·확정 그림체·비교군에도 선택·저장된 모델 정보를 보존합니다.
+- V5는 Character Prompt를 최대 22개, V4.5는 최대 6개까지 지원합니다. 모델을 바꿀 때 제한을 넘는 입력을 삭제하거나 잘라내지 않고, 현재 모델에서 생성할 수 없도록 안내합니다.
+- V5의 Complexity는 `low complexity`, `medium complexity`, `high complexity`, `ultra complexity` 프롬프트 태그로 선택하며, 선택하지 않으면 자동으로 추가하지 않습니다. 기존 quality prompt·negative prompt·qualityToggle과 NovelAI의 구조화된 캐릭터 프롬프트도 유지합니다.
+- PNG·WebP EXIF·NovelAI stealth·raw metadata에서 실제 모델 값을 우선해 V5 Full/Curated, V4.5 Full/Curated를 표시하고 Character Prompt를 복원합니다. 실제 모델을 판별할 수 없는 이미지는 `Unknown`으로 남깁니다.
+- 아카라이브 공유 그림체는 게시글이 아니라 이미지 단위의 메타데이터 모델로 `전체`, `V5만`, `V4.5만`, 세부 모델, `Unknown` 필터를 적용할 수 있습니다. V4.5와 V5가 섞인 게시글도 각 이미지가 올바른 결과에 남습니다.
+- NovelAI Usage의 사용 가능 여부·퍼센트·다음 변화까지의 시간을 표시하면서 기존 Anlas 표시를 유지합니다. 새 필드가 없는 구독 응답과 기존 사용자 DB도 계속 읽습니다.
+
 ## EXE 사용
 
 1. GitHub Releases에서 `DanbooruArtistRater.exe`를 받습니다.
@@ -30,7 +39,7 @@ Danbooru 작가를 평가하고, 평가 결과로 NovelAI용 그림체 프롬프
 
 확장은 `arca.live` 쿠키 읽기와 `127.0.0.1` 로컬 앱 연결 권한만 사용합니다. 전달된 Arca 쿠키는 앱 프로세스 메모리에만 있고 응답·로그·설정 파일에는 저장되지 않습니다. NovelAI App Key도 GitHub나 EXE에 포함되지 않으며 사용자 PC의 `data/settings.json`에만 저장됩니다.
 
-그림체 수집은 NovelAI PNG 프롬프트 메타데이터 정리가 목적입니다. 메타데이터를 추출할 수 없는 JPEG·WebP·SVG 샘플 원본은 내려받아 보관하지 않고, 게시글 정보와 재확인 방지 기록만 남깁니다.
+그림체 수집은 NovelAI PNG 프롬프트 메타데이터 정리가 목적입니다. 메타데이터를 추출할 수 없는 JPEG·SVG·일부 WebP 샘플 원본은 내려받아 보관하지 않고, 게시글 정보와 재확인 방지 기록만 남깁니다.
 
 배포본에는 빌드 시점의 공유 그림체 게시글·프롬프트·고정 원본 게시글 주소만 기본 데이터로 포함되며 이미지 파일은 포함되지 않습니다. 로컬 이미지가 없는 동안 원본 이미지 URL도 화면에 노출하지 않습니다. `용량·시간 확인`은 로컬 DB와 이미 받은 파일만 사용하므로 즉시 끝나고 사이트를 다시 조회하지 않습니다. `다운로드 시작`을 누르면 아직 유효한 이미지 URL을 우선 사용하고, 만료된 URL만 고정 원본 게시글에서 게시글별로 갱신한 직후 저장합니다. ac.namu.la의 429 제한을 피하도록 요청 시작을 1.1초 간격으로 조절하며, 429와 일시 오류는 같은 작업 안에서 자동 재시도합니다. 중단 후 다시 실행하면 남은 이미지만 이어받습니다.
 
