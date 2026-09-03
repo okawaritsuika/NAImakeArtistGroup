@@ -14,6 +14,7 @@ const styleState = {
   promptTagAutocompleteInput: null,
   promptTagAutocompleteBox: null,
   promptTagAutocompleteRequestToken: 0,
+  promptTagAutocompleteNextId: 0,
   selectedFixedArtistNames: new Set(),
   initialized: false,
   draggingIndex: null,
@@ -86,11 +87,20 @@ const styleState = {
   promptGroups: [],
   promptPresets: [],
   selectedPromptPresetKey: "",
+  promptPresetModelFilter: "all",
   promptPresetRequestToken: 0,
   promptPresetModalIndex: 0,
   lastPromptPresetArtistSignature: "",
   excludedPromptTags: [],
   suppressAutomaticPromptPreset: false,
+  artistSources: [{ source_type: "rating_management", source_id: "all" }],
+  artistSourceDraft: [],
+  artistSourceSummaries: [],
+  artistSourceDetails: {},
+  focusedArtistSourceKey: "",
+  artistSourceLoadState: "idle",
+  artistSourcePreviousFocus: null,
+  artistSourceArtistSearchQuery: "",
   weightProfile: [
     { position: 0, weight: 0.1 },
     { position: 1, weight: 2.3 },
@@ -109,6 +119,12 @@ const STYLE_MANAGER_PAGE_SIZES = [12, 24, 48, 96];
 const RANDOM_STYLE_TARGETS = ["artists", "weights", "quality", "negative"];
 const OPUS_FREE_MAX_STEPS = 28;
 const OPUS_FREE_MAX_PIXELS = 1024 * 1024;
+const ARTIST_SOURCE_SECTION_LABELS = Object.freeze({
+  rating_management: "평가 관리",
+  nai_test: "NAI 작가 테스트",
+  style_group: "그림체 그룹",
+});
+const ARTIST_SOURCE_DEFAULT = Object.freeze({ source_type: "rating_management", source_id: "all" });
 
 const NOVELAI_MODEL_DEFINITIONS = Object.freeze({
   "nai-diffusion-5-full": Object.freeze({ id: "nai-diffusion-5-full", generation: "V5", family: "V5", displayName: "V5 Full", isV5: true, maxCharacterPrompts: 22, supportsComplexity: true }),
@@ -220,6 +236,15 @@ function hasModelMetadataValue(item, key) {
   return item && item[key] !== undefined && item[key] !== null && String(item[key]).trim() !== "";
 }
 
+function itemModelIdentifier(item) {
+  if (hasModelMetadataValue(item, "model_id")) return normalizeNovelAiModel(item.model_id, "");
+  const family = itemModelMetadataGeneration(item);
+  const variant = String(item?.model_variant || "").trim().toLowerCase();
+  if (family === "v5" && ["full", "curated"].includes(variant)) return `nai-diffusion-5-${variant}`;
+  if (family === "v4.5" && ["full", "curated"].includes(variant)) return `nai-diffusion-4-5-${variant}`;
+  return normalizeNovelAiModel(item?.model, "");
+}
+
 function itemModelMetadataGeneration(item) {
   for (const key of ["model_generation", "model_family"]) {
     const generation = normalizeNovelAiGeneration(item?.[key]);
@@ -246,6 +271,8 @@ function novelAiModelFilterMatchesItem(item, filter) {
     if (hasModelId) return !NOVELAI_MODEL_DEFINITIONS[modelId];
     return novelAiModelFilterMatches(rawModel, value);
   }
+  const identifier = itemModelIdentifier(item);
+  if (identifier && NOVELAI_MODEL_DEFINITIONS[identifier]) return identifier === value;
   if (hasModelId) return modelId === value;
   return novelAiModelFilterMatches(rawModel, value);
 }
@@ -493,6 +520,453 @@ async function runLatestStyleRequest(requestState, request, handlers = {}) {
 
 function styleElement(id) {
   return typeof document === "undefined" ? null : document.getElementById(id);
+}
+
+function normalizeArtistSourceDescriptors(value, { allowEmpty = false } = {}) {
+  if (!Array.isArray(value)) throw new Error("작가 출처 목록 형식을 확인하세요.");
+  const seen = new Set();
+  const normalized = value.flatMap((item) => {
+    if (!item || typeof item !== "object") throw new Error("작가 출처 목록 형식을 확인하세요.");
+    const sourceType = String(item.source_type || "").trim().toLowerCase();
+    const sourceId = String(item.source_id ?? "").trim();
+    if (!Object.prototype.hasOwnProperty.call(ARTIST_SOURCE_SECTION_LABELS, sourceType) || !sourceId) {
+      throw new Error("작가 출처를 확인하세요.");
+    }
+    const key = `${sourceType}:${sourceId}`;
+    if (seen.has(key)) throw new Error("같은 작가 출처를 중복 선택할 수 없습니다.");
+    seen.add(key);
+    return [{ source_type: sourceType, source_id: sourceId }];
+  });
+  if (!allowEmpty && !normalized.length) throw new Error("작가 출처를 하나 이상 선택하세요.");
+  return normalized;
+}
+
+function cloneArtistSourceDescriptors(value) {
+  return normalizeArtistSourceDescriptors(value, { allowEmpty: true }).map((item) => ({ ...item }));
+}
+
+function artistSourceKey(source) {
+  return `${source?.source_type || ""}:${source?.source_id || ""}`;
+}
+
+function artistSourceStatusLabel(status) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "unavailable") return "사용 불가";
+  if (normalized === "completed") return "완료";
+  if (normalized === "running") return "진행 중";
+  if (normalized === "paused") return "일시정지";
+  if (normalized === "cancelled") return "중단됨";
+  if (normalized === "pending") return "대기 중";
+  return "사용 가능";
+}
+
+function artistSourceSummaryLabel(source) {
+  const summary = styleState.artistSourceSummaries.find((item) => artistSourceKey(item) === artistSourceKey(source));
+  return String(summary?.label || (
+    source?.source_type === "rating_management" ? "평가 관리 전체" :
+      source?.source_type === "nai_test" ? `NAI 작가 테스트 #${source?.source_id}` :
+        `그림체 그룹 #${source?.source_id}`
+  ));
+}
+
+function renderArtistSourceProjection() {
+  const selected = styleState.artistSources || [];
+  const count = styleElement("styleArtistSourceCount");
+  const summary = styleElement("styleArtistSourceSummary");
+  if (count) count.textContent = `${selected.length}개 선택`;
+  if (summary) {
+    const labels = selected.map(artistSourceSummaryLabel);
+    const visible = labels.slice(0, 2);
+    if (labels.length > 2) visible.push(`외 ${labels.length - 2}개`);
+    summary.textContent = visible.join(", ") || "선택된 출처 없음";
+    summary.title = labels.join(", ");
+  }
+}
+
+function renderArtistSourceDraftSummary() {
+  const target = styleElement("styleArtistSourceDraftSummary");
+  if (!target) return;
+  const selected = styleState.artistSourceDraft || [];
+  target.textContent = `${selected.length}개 선택`;
+}
+
+function artistSourceSummaryMatchesSearch(summary, query) {
+  return !query || String(summary?.label || "").toLocaleLowerCase().includes(query);
+}
+
+function artistSourceIsUnavailable(source) {
+  const summary = styleState.artistSourceSummaries.find((item) => artistSourceKey(item) === artistSourceKey(source));
+  return String(summary?.status || "").toLowerCase() === "unavailable" || summary?.unavailable === true;
+}
+
+function updateArtistSourceApplyState() {
+  const button = styleElement("styleArtistSourceApply");
+  if (!button) return;
+  button.disabled = !(styleState.artistSourceDraft || []).length
+    || (styleState.artistSourceDraft || []).some(artistSourceIsUnavailable);
+}
+
+function toggleArtistSource(source) {
+  const key = artistSourceKey(source);
+  const selected = styleState.artistSourceDraft || [];
+  const index = selected.findIndex((item) => artistSourceKey(item) === key);
+  styleState.artistSourceDraft = index >= 0
+    ? selected.filter((_, itemIndex) => itemIndex !== index)
+    : [...selected, { source_type: source.source_type, source_id: String(source.source_id) }];
+  styleState.focusedArtistSourceKey = key;
+  renderArtistSourceList();
+  renderArtistSourceDraftSummary();
+  renderArtistSourceDetail();
+  updateArtistSourceApplyState();
+  void loadArtistSourceDetail(source);
+}
+
+function focusArtistSource(source, { load = true } = {}) {
+  if (!source) return;
+  styleState.focusedArtistSourceKey = artistSourceKey(source);
+  renderArtistSourceList();
+  renderArtistSourceDetail();
+  if (load) void loadArtistSourceDetail(source);
+}
+
+function renderArtistSourceList() {
+  const target = styleElement("styleArtistSourceList");
+  if (!target) return;
+  target.replaceChildren();
+  if (styleState.artistSourceLoadState === "loading" && !styleState.artistSourceSummaries.length) {
+    const loading = document.createElement("p");
+    loading.className = "style-artist-source-list-empty";
+    loading.textContent = "출처 목록을 불러오는 중입니다...";
+    target.append(loading);
+    return;
+  }
+  if (styleState.artistSourceLoadState === "error" && !styleState.artistSourceSummaries.length) {
+    const error = document.createElement("p");
+    error.className = "style-artist-source-list-empty";
+    error.textContent = "출처 목록을 불러오지 못했습니다.";
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "ghost";
+    retry.textContent = "다시 시도";
+    retry.addEventListener("click", () => void loadArtistSourceSummaries({ force: true }));
+    target.append(error, retry);
+    return;
+  }
+  const query = String(styleElement("styleArtistSourceSearch")?.value || "").trim().toLocaleLowerCase();
+  let visibleCount = 0;
+  for (const sectionType of Object.keys(ARTIST_SOURCE_SECTION_LABELS)) {
+    const summaries = styleState.artistSourceSummaries.filter((summary) => (
+      summary.source_type === sectionType && artistSourceSummaryMatchesSearch(summary, query)
+    ));
+    if (!summaries.length) continue;
+    const section = document.createElement("section");
+    section.className = "style-artist-source-section";
+    const heading = document.createElement("h3");
+    heading.textContent = ARTIST_SOURCE_SECTION_LABELS[sectionType];
+    section.append(heading);
+    summaries.forEach((summary) => {
+      visibleCount += 1;
+      const card = document.createElement("article");
+      card.className = "style-artist-source-card";
+      const key = artistSourceKey(summary);
+      const selected = (styleState.artistSourceDraft || []).some((item) => artistSourceKey(item) === key);
+      card.classList.toggle("selected", selected);
+      card.classList.toggle("focused", styleState.focusedArtistSourceKey === key);
+      card.classList.toggle("unavailable", artistSourceIsUnavailable(summary));
+      card.tabIndex = 0;
+      card.setAttribute("role", "button");
+      card.setAttribute("aria-pressed", String(selected));
+      card.setAttribute("aria-label", `${summary.label || "작가 출처"} ${selected ? "선택됨" : "선택 안 됨"}`);
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selected;
+      checkbox.tabIndex = -1;
+      checkbox.setAttribute("aria-label", `${summary.label || "작가 출처"} 선택`);
+      checkbox.addEventListener("click", (event) => event.stopPropagation());
+      checkbox.addEventListener("change", () => toggleArtistSource(summary));
+      const main = document.createElement("div");
+      main.className = "style-artist-source-card-main";
+      const title = document.createElement("span");
+      title.className = "style-artist-source-card-title";
+      title.textContent = summary.label || "작가 출처";
+      const meta = document.createElement("span");
+      meta.className = "style-artist-source-card-meta";
+      meta.textContent = `${summary.artist_count || 0}명 · 유효 점수 ${summary.scored_artist_count || 0}명`;
+      main.append(title, meta);
+      const status = document.createElement("span");
+      status.className = "style-artist-source-card-status";
+      status.textContent = artistSourceStatusLabel(summary.status);
+      const detail = document.createElement("button");
+      detail.type = "button";
+      detail.className = "style-artist-source-card-detail ghost";
+      detail.textContent = "상세";
+      detail.addEventListener("click", (event) => {
+        event.stopPropagation();
+        focusArtistSource(summary);
+      });
+      card.addEventListener("click", (event) => {
+        if (event.target.closest("button, input")) return;
+        toggleArtistSource(summary);
+      });
+      card.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        toggleArtistSource(summary);
+      });
+      card.append(checkbox, main, status, detail);
+      section.append(card);
+    });
+    target.append(section);
+  }
+  if (!visibleCount) {
+    const empty = document.createElement("p");
+    empty.className = "style-artist-source-list-empty";
+    empty.textContent = query ? "검색 결과가 없습니다." : "사용 가능한 작가 출처가 없습니다.";
+    target.append(empty);
+  }
+}
+
+function artistSourceDetailValue(label, value) {
+  const row = document.createElement("div");
+  const name = document.createElement("strong");
+  name.textContent = label;
+  const text = document.createElement("span");
+  text.textContent = String(value ?? "-");
+  row.append(name, text);
+  return row;
+}
+
+function renderArtistSourcePrompt(prompt, index) {
+  const details = document.createElement("details");
+  details.className = "style-artist-source-prompt";
+  details.open = index === 0;
+  const summary = document.createElement("summary");
+  summary.textContent = prompt.label || `변형 ${index + 1}`;
+  const fields = [
+    ["프롬프트", prompt.prompt ?? prompt.base_prompt],
+    ["leading prompt", prompt.leading_prompt],
+    ["fixed prompt", prompt.fixed_prompt],
+    ["negative prompt", prompt.negative_prompt],
+  ];
+  fields.forEach(([label, value]) => {
+    const wrapper = document.createElement("div");
+    const title = document.createElement("span");
+    title.className = "style-artist-source-prompt-label";
+    title.textContent = label;
+    const text = document.createElement("p");
+    text.className = "style-artist-source-prompt-text";
+    text.textContent = String(value || "");
+    wrapper.append(title, text);
+    details.append(wrapper);
+  });
+  return details;
+}
+
+function renderArtistSourceDetail() {
+  const empty = styleElement("styleArtistSourceDetailEmpty");
+  const header = styleElement("styleArtistSourceDetailHeader");
+  const meta = styleElement("styleArtistSourceDetailMeta");
+  const artists = styleElement("styleArtistSourceArtistList");
+  const promptSection = styleElement("styleArtistSourcePromptSection");
+  const promptList = styleElement("styleArtistSourcePromptList");
+  if (!header || !meta || !artists || !promptSection || !promptList) return;
+  const detail = styleState.artistSourceDetails[styleState.focusedArtistSourceKey];
+  const source = detail?.source;
+  empty.hidden = Boolean(source);
+  header.replaceChildren();
+  meta.replaceChildren();
+  artists.replaceChildren();
+  promptList.replaceChildren();
+  if (!source) {
+    promptSection.hidden = true;
+    return;
+  }
+  const title = document.createElement("h3");
+  title.className = "style-artist-source-detail-title";
+  title.textContent = source.label || "작가 출처";
+  header.append(title);
+  const detailMeta = [
+    artistSourceStatusLabel(source.status),
+    `${detail.artists?.length || 0}명`,
+    `유효 점수 ${detail.artists?.filter((item) => item.score !== null && item.score !== undefined).length || 0}명`,
+    source.updated_at ? `수정 ${source.updated_at}` : "",
+  ].filter(Boolean);
+  detailMeta.forEach((value) => {
+    const item = document.createElement("span");
+    item.textContent = value;
+    meta.append(item);
+  });
+  const query = styleState.artistSourceArtistSearchQuery;
+  const visibleArtists = (detail.artists || []).filter((item) => (
+    !query || String(item.artist_tag || item.artist_key || "").toLocaleLowerCase().includes(query)
+  ));
+  if (!visibleArtists.length) {
+    artists.textContent = query ? "검색 결과가 없습니다." : "작가 정보가 없습니다.";
+  } else {
+    visibleArtists.forEach((artist) => {
+      const row = document.createElement("div");
+      row.className = "style-artist-source-artist-row";
+      if (artist.score === null || artist.score === undefined) row.classList.add("no-score");
+      const name = document.createElement("span");
+      name.className = "style-artist-source-artist-name";
+      name.textContent = artist.artist_tag || artist.artist_key || "이름 없음";
+      const score = document.createElement("span");
+      score.className = "style-artist-source-artist-score";
+      score.textContent = artist.score === null || artist.score === undefined
+        ? "점수 없음 · 후보 제외"
+        : `평균 ${Number(artist.score).toFixed(2).replace(/0+$/, "").replace(/\.$/, "")} · 구간 ${artist.score_bucket}`;
+      const scoreSources = document.createElement("span");
+      scoreSources.className = "style-artist-source-artist-sources";
+      const sourceLabels = (artist.score_sources || []).map((item) => item.label || `${item.source_type}:${item.source_id}`);
+      scoreSources.textContent = sourceLabels.length ? `점수 근거: ${sourceLabels.join(", ")}` : "점수 근거 없음";
+      row.append(name, score, scoreSources);
+      artists.append(row);
+    });
+  }
+  const prompts = Array.isArray(detail.prompts) ? detail.prompts : [];
+  const settings = detail.settings && typeof detail.settings === "object" ? detail.settings : {};
+  promptSection.hidden = !prompts.length && !Object.keys(settings).length;
+  prompts.forEach((prompt, index) => promptList.append(renderArtistSourcePrompt(prompt, index)));
+  if (Object.keys(settings).length) {
+    const settingsBlock = document.createElement("div");
+    settingsBlock.className = "style-artist-source-prompt";
+    const heading = document.createElement("strong");
+    heading.textContent = "생성 설정";
+    settingsBlock.append(heading);
+    Object.entries(settings).forEach(([key, value]) => settingsBlock.append(artistSourceDetailValue(key, value)));
+    promptList.append(settingsBlock);
+  }
+}
+
+async function loadArtistSourceDetail(source) {
+  const key = artistSourceKey(source);
+  if (styleState.artistSourceDetails[key]) {
+    renderArtistSourceDetail();
+    return styleState.artistSourceDetails[key];
+  }
+  try {
+    const detail = await apiFetch(`/api/style-maker/artist-sources/${encodeURIComponent(source.source_type)}/${encodeURIComponent(source.source_id)}`);
+    styleState.artistSourceDetails[key] = detail;
+    renderArtistSourceDetail();
+    return detail;
+  } catch (error) {
+    const summary = styleState.artistSourceSummaries.find((item) => artistSourceKey(item) === key);
+    if (summary) {
+      summary.status = "unavailable";
+      summary.unavailable = true;
+    }
+    styleState.artistSourceDetails[key] = { source: { ...source, label: artistSourceSummaryLabel(source), status: "unavailable" }, artists: [], prompts: [], settings: {} };
+    renderArtistSourceList();
+    renderArtistSourceDetail();
+    return null;
+  }
+}
+
+async function loadArtistSourceSummaries({ force = false } = {}) {
+  if (!force && styleState.artistSourceLoadState === "ready") return true;
+  styleState.artistSourceLoadState = "loading";
+  renderArtistSourceList();
+  try {
+    const data = await apiFetch("/api/style-maker/artist-sources");
+    const summaries = Array.isArray(data.sources) ? data.sources.map((item) => ({
+      ...item,
+      source_id: String(item.source_id),
+    })) : [];
+    const known = new Set(summaries.map(artistSourceKey));
+    const unavailable = (styleState.artistSourceDraft || [])
+      .filter((draft) => !known.has(artistSourceKey(draft)))
+      .map((draft) => ({
+        ...draft,
+        label: artistSourceSummaryLabel(draft),
+        status: "unavailable",
+        unavailable: true,
+        artist_count: 0,
+        scored_artist_count: 0,
+        updated_at: "",
+      }));
+    styleState.artistSourceSummaries = [...summaries, ...unavailable];
+    styleState.artistSourceLoadState = "ready";
+    const focused = styleState.artistSourceSummaries.find((item) => artistSourceKey(item) === styleState.focusedArtistSourceKey)
+      || styleState.artistSourceSummaries.find((item) => (styleState.artistSourceDraft || []).some((draft) => artistSourceKey(draft) === artistSourceKey(item)))
+      || styleState.artistSourceSummaries[0];
+    if (focused) styleState.focusedArtistSourceKey = artistSourceKey(focused);
+    renderArtistSourceList();
+    renderArtistSourceDraftSummary();
+    renderArtistSourceProjection();
+    renderArtistSourceDetail();
+    if (focused) await loadArtistSourceDetail(focused);
+    return true;
+  } catch (error) {
+    styleState.artistSourceLoadState = "error";
+    renderArtistSourceList();
+    return false;
+  }
+}
+
+function closeArtistSourceModal() {
+  const modal = styleElement("styleArtistSourceModal");
+  if (modal) modal.hidden = true;
+  styleState.artistSourceDraft = [];
+  styleState.artistSourceArtistSearchQuery = "";
+  const search = styleElement("styleArtistSourceArtistSearch");
+  if (search) search.value = "";
+  const previous = styleState.artistSourcePreviousFocus;
+  styleState.artistSourcePreviousFocus = null;
+  if (previous && typeof previous.focus === "function") previous.focus();
+}
+
+function openArtistSourceModal() {
+  const modal = styleElement("styleArtistSourceModal");
+  if (!modal) return;
+  styleState.artistSourcePreviousFocus = typeof document !== "undefined" ? document.activeElement : null;
+  styleState.artistSourceDraft = cloneArtistSourceDescriptors(styleState.artistSources || [ARTIST_SOURCE_DEFAULT]);
+  styleState.artistSourceArtistSearchQuery = "";
+  const artistSearch = styleElement("styleArtistSourceArtistSearch");
+  if (artistSearch) artistSearch.value = "";
+  const search = styleElement("styleArtistSourceSearch");
+  if (search) search.value = "";
+  const focused = styleState.artistSourceDraft[0] || styleState.artistSourceSummaries[0];
+  styleState.focusedArtistSourceKey = focused ? artistSourceKey(focused) : "";
+  modal.hidden = false;
+  renderArtistSourceList();
+  renderArtistSourceDraftSummary();
+  renderArtistSourceDetail();
+  updateArtistSourceApplyState();
+  styleElement("styleArtistSourceSearch")?.focus();
+  void loadArtistSourceSummaries();
+}
+
+function applyArtistSourceDraft() {
+  const status = styleElement("styleArtistSourceDraftSummary");
+  try {
+    const draft = normalizeArtistSourceDescriptors(styleState.artistSourceDraft);
+    if (draft.some(artistSourceIsUnavailable)) throw new Error("사용 불가 출처를 제거한 뒤 적용하세요.");
+    styleState.artistSources = draft;
+    renderArtistSourceProjection();
+    closeArtistSourceModal();
+    return true;
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    updateArtistSourceApplyState();
+    return false;
+  }
+}
+
+function trapArtistSourceFocus(event) {
+  if (event.key !== "Tab") return;
+  const modal = styleElement("styleArtistSourceModal");
+  if (!modal || modal.hidden) return;
+  const focusable = [...modal.querySelectorAll("button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex='-1'])")];
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }
 
 function styleNumber(id, fallback) {
@@ -831,7 +1305,7 @@ function normalizePromptGroup(group, index = 0) {
   };
 }
 
-function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, characterPromptIds = [], promptGroups = [], generationSettings = {}, fixedPrompt = "") {
+function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, characterPromptIds = [], promptGroups = [], generationSettings = {}, fixedPrompt = "", leadingPrompt = "") {
   const prompts = Array.isArray(characterPrompts)
     ? characterPrompts.map((value) => (typeof value === "string" ? value : ""))
     : [""];
@@ -839,6 +1313,7 @@ function promptStoragePayload(basePrompt, negativePrompt, characterPrompts, char
   return {
     base_prompt: typeof basePrompt === "string" ? basePrompt : "",
     fixed_prompt: typeof fixedPrompt === "string" ? fixedPrompt : "",
+    leading_prompt: typeof leadingPrompt === "string" ? leadingPrompt : "",
     negative_prompt: typeof negativePrompt === "string" ? negativePrompt : "",
     character_prompts: prompts,
     character_prompt_ids: ids,
@@ -860,6 +1335,7 @@ function normalizeStoredPrompts(value) {
     Array.isArray(value.prompt_groups) ? value.prompt_groups : [],
     value.generation_settings && typeof value.generation_settings === "object" ? value.generation_settings : {},
     typeof value.fixed_prompt === "string" ? value.fixed_prompt : "",
+    typeof value.leading_prompt === "string" ? value.leading_prompt : "",
   );
 }
 
@@ -1135,6 +1611,7 @@ function savePromptDraft() {
   const draft = {
     base_prompt: styleElement("basePrompt")?.value || "",
     fixed_prompt: styleElement("fixedPrompt")?.value || "",
+    leading_prompt: styleElement("leadingPrompt")?.value || "",
     negative_prompt: styleElement("negativePrompt")?.value || "",
     character_prompts: characters,
     character_prompt_ids: characterIds,
@@ -1148,6 +1625,7 @@ function savePromptDraft() {
     styleState.promptGroups,
     readGenerationSettings(),
     draft.fixed_prompt,
+    draft.leading_prompt,
   );
   try { localStorage.setItem(PROMPT_STORAGE_KEY, JSON.stringify(payload)); } catch (_) { /* Storage can be disabled. */ }
 }
@@ -1162,20 +1640,60 @@ function savePromptPresetSettings() {
   if (typeof localStorage === "undefined") return;
   const payload = {
     selected_key: styleState.selectedPromptPresetKey || "",
+    model_filter: normalizePromptPresetModelFilter(styleState.promptPresetModelFilter),
   };
   try { localStorage.setItem(PROMPT_PRESET_STORAGE_KEY, JSON.stringify(payload)); } catch (_) { /* Storage can be disabled. */ }
 }
 
 function loadPromptPresetSettings() {
-  if (typeof localStorage === "undefined") return { selected_key: "" };
+  if (typeof localStorage === "undefined") return { selected_key: "", model_filter: "all" };
   try {
     const value = JSON.parse(localStorage.getItem(PROMPT_PRESET_STORAGE_KEY) || "null");
     return {
       selected_key: typeof value?.selected_key === "string" ? value.selected_key : "",
+      model_filter: normalizePromptPresetModelFilter(value?.model_filter),
     };
   } catch (_) {
-    return { selected_key: "" };
+    return { selected_key: "", model_filter: "all" };
   }
+}
+
+function normalizePromptPresetModelFilter(value) {
+  const normalized = String(value ?? "all").trim().toLowerCase().replaceAll("_", "-");
+  const aliases = {
+    "": "all",
+    all: "all",
+    v5: "v5",
+    "4.5": "v4.5",
+    "v4-5": "v4.5",
+    "v4.5": "v4.5",
+    "v5-full": "nai-diffusion-5-full",
+    "v5 full": "nai-diffusion-5-full",
+    "v5-curated": "nai-diffusion-5-curated",
+    "v5 curated": "nai-diffusion-5-curated",
+    "v4.5-full": "nai-diffusion-4-5-full",
+    "v4.5 full": "nai-diffusion-4-5-full",
+    "v4.5-curated": "nai-diffusion-4-5-curated",
+    "v4.5 curated": "nai-diffusion-4-5-curated",
+    unknown: "unknown",
+  };
+  const result = aliases[normalized] || normalized;
+  return [
+    "all",
+    "v5",
+    "v4.5",
+    "nai-diffusion-5-full",
+    "nai-diffusion-5-curated",
+    "nai-diffusion-4-5-full",
+    "nai-diffusion-4-5-curated",
+    "unknown",
+  ].includes(result) ? result : "all";
+}
+
+function currentPromptPresetModelFilter() {
+  const filter = normalizePromptPresetModelFilter(styleElement("promptPresetModelFilter")?.value || styleState.promptPresetModelFilter);
+  styleState.promptPresetModelFilter = filter;
+  return filter;
 }
 
 function setPromptPresetStatus(message, state = "") {
@@ -1407,7 +1925,8 @@ async function saveAndApplyPromptPreset() {
 async function loadPromptPresets({ force = false } = {}) {
   if (!styleState.artists.length) return false;
   const artists = chooseArtistsForPrompt(styleState.artists).map((item) => item.artist);
-  const signature = [...artists].sort().join("\n");
+  const modelFilter = currentPromptPresetModelFilter();
+  const signature = `${modelFilter}\0${[...artists].sort().join("\n")}`;
   if (!force && signature === styleState.lastPromptPresetArtistSignature) return false;
   styleState.lastPromptPresetArtistSignature = signature;
   const token = ++styleState.promptPresetRequestToken;
@@ -1415,7 +1934,7 @@ async function loadPromptPresets({ force = false } = {}) {
   try {
     const result = await apiFetch("/api/style-maker/prompt-presets", {
       method: "POST",
-      body: JSON.stringify({ artists, limit: 30 }),
+      body: JSON.stringify({ artists, limit: 30, model_filter: modelFilter }),
     });
     if (token !== styleState.promptPresetRequestToken) return false;
     styleState.promptPresets = Array.isArray(result.presets) ? result.presets : [];
@@ -2264,6 +2783,7 @@ function readStyleOptions() {
   return {
     count,
     scores: normalizeSelectedScores(styleState.allowedScores),
+    artist_sources: normalizeArtistSourceDescriptors(styleState.artistSources || [ARTIST_SOURCE_DEFAULT]),
     weight_mode: mode,
     min_weight: minWeight,
     max_weight: maxWeight,
@@ -3123,7 +3643,11 @@ function handleStyleArtistAutocompleteKeydown(event, context = "main") {
 }
 
 function hidePromptTagAutocomplete() {
-  styleState.promptTagAutocompleteBox?.classList.add("hidden");
+  const input = styleState.promptTagAutocompleteInput;
+  const box = styleState.promptTagAutocompleteBox;
+  box?.classList.add("hidden");
+  input?.setAttribute("aria-expanded", "false");
+  input?.removeAttribute("aria-activedescendant");
   styleState.promptTagAutocompleteRequestToken += 1;
   styleState.promptTagAutocompleteItems = [];
   styleState.promptTagAutocompleteIndex = -1;
@@ -3136,8 +3660,14 @@ function setPromptTagAutocompleteIndex(index) {
   if (!box || !styleState.promptTagAutocompleteItems.length) return;
   styleState.promptTagAutocompleteIndex = (index + styleState.promptTagAutocompleteItems.length) % styleState.promptTagAutocompleteItems.length;
   box.querySelectorAll("button").forEach((button, buttonIndex) => {
-    button.classList.toggle("active", buttonIndex === styleState.promptTagAutocompleteIndex);
+    const active = buttonIndex === styleState.promptTagAutocompleteIndex;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
   });
+  const activeButton = box.querySelector("button.active");
+  if (activeButton && styleState.promptTagAutocompleteInput) {
+    styleState.promptTagAutocompleteInput.setAttribute("aria-activedescendant", activeButton.id);
+  }
 }
 
 function applyPromptTagAutocomplete(index = styleState.promptTagAutocompleteIndex) {
@@ -3161,20 +3691,27 @@ function applyPromptTagAutocomplete(index = styleState.promptTagAutocompleteInde
 async function updatePromptTagAutocomplete(input) {
   const box = input?.closest(".field")?.querySelector(".prompt-tag-autocomplete");
   if (!input || !box) return;
+  preparePromptTagAutocompleteA11y(input, box);
   const fragment = currentPromptTagFragment(input.value, input.selectionStart);
+  if (/^\{\{\s*artist\s*\}\}$/i.test(fragment.trim())) {
+    hidePromptTagAutocomplete();
+    return;
+  }
   const query = fragment.replace(/^artist:/i, "");
   if (query.length < 2) {
     hidePromptTagAutocomplete();
     return;
   }
   if (styleState.promptTagAutocompleteBox && styleState.promptTagAutocompleteBox !== box) {
-    styleState.promptTagAutocompleteBox.classList.add("hidden");
+    hidePromptTagAutocomplete();
   }
   const requestToken = ++styleState.promptTagAutocompleteRequestToken;
   styleState.promptTagAutocompleteInput = input;
   styleState.promptTagAutocompleteBox = box;
   try {
-    const items = await apiFetch(`/api/tags/autocomplete?q=${encodeURIComponent(query)}`);
+    const category = String(input.dataset.autocompleteCategory || "").trim();
+    const categoryQuery = category ? `&category=${encodeURIComponent(category)}` : "";
+    const items = await apiFetch(`/api/tags/autocomplete?q=${encodeURIComponent(query)}${categoryQuery}`);
     if (requestToken !== styleState.promptTagAutocompleteRequestToken || styleState.promptTagAutocompleteInput !== input) return;
     styleState.promptTagAutocompleteItems = Array.isArray(items) ? items : [];
     styleState.promptTagAutocompleteIndex = -1;
@@ -3182,6 +3719,9 @@ async function updatePromptTagAutocomplete(input) {
     styleState.promptTagAutocompleteItems.forEach((item, index) => {
       const button = document.createElement("button");
       button.type = "button";
+      button.id = `${box.id}-option-${index}`;
+      button.setAttribute("role", "option");
+      button.setAttribute("aria-selected", "false");
       const name = document.createElement("span");
       name.textContent = item.name;
       const detail = document.createElement("span");
@@ -3191,7 +3731,9 @@ async function updatePromptTagAutocomplete(input) {
       button.addEventListener("click", () => applyPromptTagAutocomplete(index));
       box.append(button);
     });
-    box.classList.toggle("hidden", !styleState.promptTagAutocompleteItems.length);
+    const hasItems = styleState.promptTagAutocompleteItems.length > 0;
+    box.classList.toggle("hidden", !hasItems);
+    input.setAttribute("aria-expanded", String(hasItems));
   } catch {
     if (requestToken === styleState.promptTagAutocompleteRequestToken) hidePromptTagAutocomplete();
   }
@@ -3214,8 +3756,23 @@ function handlePromptTagAutocompleteKeydown(event) {
   }
 }
 
+function preparePromptTagAutocompleteA11y(input, box) {
+  if (!input || !box) return;
+  if (!box.id) {
+    if (!input.id) input.id = `prompt-tag-input-${++styleState.promptTagAutocompleteNextId}`;
+    box.id = `${input.id}-autocomplete`;
+  }
+  input.setAttribute("role", "combobox");
+  input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-expanded", input.getAttribute("aria-expanded") || "false");
+  input.setAttribute("aria-controls", box.id);
+  box.setAttribute("role", "listbox");
+}
+
 function bindPromptTagAutocomplete(input) {
   if (!input || input.dataset.tagAutocompleteBound === "true") return;
+  const box = input.closest(".field")?.querySelector(".prompt-tag-autocomplete");
+  preparePromptTagAutocompleteA11y(input, box);
   input.dataset.tagAutocompleteBound = "true";
   input.addEventListener("input", () => {
     clearTimeout(styleState.promptTagAutocompleteTimer);
@@ -3223,6 +3780,11 @@ function bindPromptTagAutocomplete(input) {
   });
   input.addEventListener("keydown", handlePromptTagAutocompleteKeydown);
 }
+
+globalThis.promptTagAutocomplete = Object.freeze({
+  bind: bindPromptTagAutocomplete,
+  hide: hidePromptTagAutocomplete,
+});
 
 function filteredRatedArtists(searchId = "styleArtistSearch") {
   const query = (styleElement(searchId)?.value || "").trim().toLowerCase();
@@ -3493,6 +4055,7 @@ function buildGenerationRequest(requestId = createRequestId()) {
   if (seedFixed && (!Number.isInteger(seed) || seed < 1 || seed > 4294967295)) throw new Error("고정 시드를 확인하세요.");
   const qualityPrompt = buildEffectivePromptText(styleElement("basePrompt")?.value, "base", "", styleState.promptGroups);
   const fixedPrompt = styleElement("fixedPrompt")?.value || "";
+  const leadingPrompt = styleElement("leadingPrompt")?.value || "";
   const excludedQualityTags = styleState.excludedPromptTags
     .map((item) => String(item?.prompt || "").trim())
     .filter(Boolean);
@@ -3519,6 +4082,7 @@ function buildGenerationRequest(requestId = createRequestId()) {
     )
       .map(({ artist, score, weight }) => ({ artist, score, weight })),
     base_prompt: combinePromptSections(qualityPrompt, fixedPrompt),
+    leading_prompt: leadingPrompt,
     quality_prompt: qualityPrompt,
     original_quality_prompt: combinePromptSections(qualityPrompt, ...excludedQualityTags),
     excluded_quality_tags: excludedQualityTags,
@@ -4158,6 +4722,14 @@ function styleManagerFilterValues() {
   };
 }
 
+function styleManagerRecordKey(item) {
+  const existing = String(item?.record_key || "").trim();
+  if (existing) return existing;
+  return item?.source_type === "comparison"
+    ? `comparison:${item?.id}`
+    : `generated:${item?.id}`;
+}
+
 function filterStyleManagerItems(styles, mode, filters = {}) {
   const query = String(filters.query || "").trim().toLocaleLowerCase();
   const scope = String(filters.scope || "all");
@@ -4171,6 +4743,7 @@ function filterStyleManagerItems(styles, mode, filters = {}) {
       const haystack = [
         item.name, item.title, item.description, item.artist_prompt, item.quality_prompt, item.base_prompt,
         item.fixed_prompt, item.negative_prompt, item.model, item.source_url,
+        item.source_label, item.source_name, item.source_artist_tag,
         ...(Array.isArray(item.artists) ? item.artists : []).map((artist) => artist?.artist),
         ...(Array.isArray(item.character_prompts) ? item.character_prompts : []).map((character) => character?.prompt || character),
       ].filter(Boolean).join("\n").toLocaleLowerCase();
@@ -4180,6 +4753,7 @@ function filterStyleManagerItems(styles, mode, filters = {}) {
     if (mode === "generated" && scope === "unconfirmed" && item.confirmed) return false;
     if (mode === "confirmed" && scope !== "all" && item.source_type !== scope) return false;
     if (mode === "shared" && scope !== "all" && item.board_tab !== scope) return false;
+    if (mode === "all_generated" && scope !== "all" && item.source_type !== scope) return false;
     if (mode === "shared" && metadata !== "all" && item.metadata_status !== metadata) return false;
     if (!novelAiModelFilterMatchesItem(item, model)) return false;
     if (mode === "shared" && Number.isFinite(recommendationMin) && Number(item.recommendation_count) < recommendationMin) return false;
@@ -4193,7 +4767,8 @@ function filterStyleManagerItems(styles, mode, filters = {}) {
     }
     const direction = filters.sort === "oldest" ? 1 : -1;
     return direction * timestamp(left).localeCompare(timestamp(right))
-      || direction * (Number(left.id || 0) - Number(right.id || 0));
+      || direction * (Number(left.id || 0) - Number(right.id || 0))
+      || direction * String(left.record_key || "").localeCompare(String(right.record_key || ""));
   });
   return filtered;
 }
@@ -4369,10 +4944,13 @@ function renderStyleManagerList(styles) {
     button.type = "button";
     button.className = "style-manager-item";
     button.dataset.styleManagerId = String(style.id);
+    button.dataset.styleManagerRecordKey = styleManagerRecordKey(style);
     button.classList.add(`manager-${styleState.managerMode}-item`);
-    button.classList.toggle("selection-mode", styleState.managerSelectionMode && styleState.managerMode !== "shared");
+    const selectionAllowed = !["shared", "all_generated"].includes(styleState.managerMode);
+    button.classList.toggle("selection-mode", styleState.managerSelectionMode && selectionAllowed);
     button.classList.toggle("selected", styleState.selectedStyleIds.has(style.id));
-    const detailActive = styleState.managerDetail && String(styleState.managerDetail.id) === String(style.id);
+    const detailActive = styleState.managerDetail
+      && styleManagerRecordKey(styleState.managerDetail) === styleManagerRecordKey(style);
     button.classList.toggle("detail-active", Boolean(detailActive));
     if (detailActive) button.setAttribute("aria-current", "true");
     button.setAttribute("aria-pressed", String(styleState.selectedStyleIds.has(style.id)));
@@ -4399,12 +4977,21 @@ function renderStyleManagerList(styles) {
       ? (style.name || `확정 그림체 #${style.id}`)
       : styleState.managerMode === "shared"
         ? (style.title || `공유 이미지 #${style.id}`)
-        : `생성 #${style.id}`;
+        : styleState.managerMode === "all_generated"
+          ? (style.source_type === "comparison"
+            ? (style.style_name || style.name || `비교 결과 #${style.id}`)
+            : `생성 #${style.id}`)
+          : `생성 #${style.id}`;
     const info = document.createElement("span");
     if (styleState.managerMode === "generated") {
       info.textContent = `작가 ${(style.artists || []).length}명${style.confirmed ? " · 확정됨" : ""}`;
     } else if (styleState.managerMode === "confirmed") {
       info.textContent = `${style.source_type === "manual" ? "직접 추가" : style.source_type === "shared" ? "공유에서 확정" : "제작에서 확정"}`;
+    } else if (styleState.managerMode === "all_generated") {
+      const sourceLabel = style.source_label || "출처 미상";
+      const sourceName = style.source_name && style.source_name !== sourceLabel ? ` · ${style.source_name}` : "";
+      const artist = style.source_artist_tag ? ` · ${style.source_artist_tag}` : "";
+      info.textContent = `${sourceLabel}${sourceName}${artist}`;
     } else {
       info.textContent = `${style.board_tab || "공유"}${style.confirmed ? " · 확정됨" : ""}`;
     }
@@ -4416,7 +5003,7 @@ function renderStyleManagerList(styles) {
       description.textContent = style.description || style.quality_prompt || style.base_prompt || style.prompt || "설명 없음";
       body.append(description);
     }
-    if (!styleState.managerDescriptions) {
+    if (!styleState.managerDescriptions && styleState.managerMode !== "all_generated") {
       button.classList.add("image-only");
       button.setAttribute("aria-label", title.textContent);
     } else {
@@ -4424,9 +5011,11 @@ function renderStyleManagerList(styles) {
     }
     button.addEventListener("click", () => {
       if (styleState.managerSelectionMode && styleState.managerMode !== "shared") {
-        styleState.selectedStyleIds = toggleSelectedStyleId(styleState.selectedStyleIds, style.id);
-        renderStyleManagerList(styleState.managerStyles);
-        syncStyleSelectionControls();
+        if (styleState.managerMode !== "all_generated") {
+          styleState.selectedStyleIds = toggleSelectedStyleId(styleState.selectedStyleIds, style.id);
+          renderStyleManagerList(styleState.managerStyles);
+          syncStyleSelectionControls();
+        }
       }
       renderStyleManagerDetail(style);
     });
@@ -4438,7 +5027,9 @@ function renderStyleManagerList(styles) {
 function syncStyleManagerDetailSelection() {
   const detailId = styleState.managerDetail?.id;
   document.querySelectorAll("#styleManagerList .style-manager-item").forEach((button) => {
-    const active = detailId !== undefined && String(button.dataset.styleManagerId) === String(detailId);
+    const active = detailId !== undefined
+      && String(button.dataset.styleManagerRecordKey || button.dataset.styleManagerId)
+        === styleManagerRecordKey(styleState.managerDetail);
     button.classList.toggle("detail-active", active);
     if (active) button.setAttribute("aria-current", "true");
     else button.removeAttribute("aria-current");
@@ -4457,7 +5048,7 @@ function syncStyleSelectionControls() {
   const begin = styleElement("beginStyleSelection");
   const remove = styleElement("deleteSelectedStyles");
   const cancel = styleElement("cancelStyleSelection");
-  const canDelete = styleState.managerMode !== "shared";
+  const canDelete = !["shared", "all_generated"].includes(styleState.managerMode);
   begin?.classList.toggle("hidden", !canDelete);
   styleElement("addConfirmedStyle")?.classList.toggle("hidden", styleState.managerMode !== "confirmed");
   begin?.classList.toggle("active", styleState.managerSelectionMode);
@@ -4476,6 +5067,7 @@ function syncStyleManagerFilterControls() {
     generated: [["all", "전체"], ["confirmed", "확정됨"], ["unconfirmed", "미확정"]],
     confirmed: [["all", "전체"], ["manual", "직접 추가"], ["generated", "제작에서 확정"], ["shared", "공유에서 확정"]],
     shared: [["all", "전체 게시판"], ["NAI", "NAI"], ["R18_NAI", "🔞 NAI"]],
+    all_generated: [["all", "전체"], ["style_maker", "그림체 제작"], ["nai_artist_test", "NAI 작가 테스트"], ["comparison", "비교군 관리"]],
   }[styleState.managerMode];
   if (scope) {
     scope.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
@@ -4525,21 +5117,21 @@ function setStyleManagerPage(page) {
 }
 
 function setStyleManagerMode(mode) {
-  if (!["generated", "confirmed", "shared"].includes(mode)) return;
+  if (!["generated", "confirmed", "shared", "all_generated"].includes(mode)) return;
   styleState.managerMode = mode;
   styleState.managerDirty = true;
   styleState.managerPage = 1;
+  document.querySelectorAll("[data-style-manager-mode]").forEach((tab) => {
+    const selected = tab.dataset.styleManagerMode === mode;
+    tab.classList.toggle("active", selected);
+    tab.setAttribute("aria-selected", String(selected));
+  });
+  const titles = { generated: "제작 기록", confirmed: "확정 그림체", shared: "공유 그림체", all_generated: "모든 제작 기록" };
+  const listTitle = styleElement("styleManagerListTitle");
+  if (listTitle) listTitle.textContent = titles[mode];
   syncStyleManagerFilterControls();
   setStyleSelectionMode(false);
   resetStyleManagerDetail();
-  document.querySelectorAll("[data-style-manager-mode]").forEach((button) => {
-    const active = button.dataset.styleManagerMode === mode;
-    button.classList.toggle("active", active);
-    button.setAttribute("aria-selected", String(active));
-  });
-  const titles = { generated: "제작 기록", confirmed: "확정 그림체", shared: "공유 그림체" };
-  const title = styleElement("styleManagerListTitle");
-  if (title) title.textContent = titles[mode];
   syncStyleSelectionControls();
   loadStyleManager();
 }
@@ -4555,7 +5147,7 @@ async function loadStyleManager() {
   const status = styleElement("styleManagerStatus");
   const requestedMode = styleState.managerMode;
   const requestToken = ++styleState.managerRequestToken;
-  const title = { generated: "제작 기록", confirmed: "확정 그림체", shared: "공유 그림체" }[requestedMode];
+  const title = { generated: "제작 기록", confirmed: "확정 그림체", shared: "공유 그림체", all_generated: "모든 제작 기록" }[requestedMode];
   styleState.managerImageLoadToken += 1;
   setStyleManagerLoadProgress({ label: `${title} 목록 정보를 가져오는 중`, indeterminate: true });
   try {
@@ -4566,6 +5158,8 @@ async function loadStyleManager() {
     } else if (styleState.managerMode === "shared") {
       sharedResult = await apiFetch(`/api/style-manager/shared?${styleManagerSharedQuery((styleState.managerPage - 1) * styleState.managerPageSize)}`);
       styles = sharedResult.items || [];
+    } else if (styleState.managerMode === "all_generated") {
+      styles = await apiFetch("/api/style-manager/all-generated");
     } else {
       styles = await apiFetch("/api/style-manager/generated");
     }
@@ -4637,6 +5231,7 @@ async function deleteManagedStyle(styleId) {
 }
 
 async function deleteSelectedManagedStyles() {
+  if (["shared", "all_generated"].includes(styleState.managerMode)) return;
   const styleIds = [...styleState.selectedStyleIds].sort((left, right) => left - right);
   if (!styleIds.length) return;
   if (!await globalThis.appDialog.confirm({
@@ -4881,7 +5476,9 @@ function renderStyleManagerDetail(item) {
     ? (item.name || `확정 그림체 #${item.id}`)
     : styleState.managerMode === "shared"
       ? (item.title || `공유 이미지 #${item.id}`)
-      : `생성 #${item.id}`;
+      : styleState.managerMode === "all_generated"
+        ? (item.title || item.name || `기록 #${item.record_key || item.id}`)
+        : `생성 #${item.id}`;
   const headActions = document.createElement("div");
   headActions.className = "style-manager-list-actions";
   if (styleState.managerMode === "confirmed") {
@@ -4895,7 +5492,7 @@ function renderStyleManagerDetail(item) {
     deleteButton.textContent = "삭제";
     deleteButton.addEventListener("click", () => deleteSingleManagerItem(item));
     headActions.append(editButton, deleteButton);
-  } else {
+  } else if (styleState.managerMode !== "all_generated") {
     const confirmButton = document.createElement("button");
     confirmButton.type = "button";
     confirmButton.className = "primary";
@@ -4962,6 +5559,12 @@ function renderStyleManagerDetail(item) {
   }
   const inspector = document.createElement("section");
   inspector.className = "manager-image-inspector";
+  if (styleState.managerMode === "all_generated") {
+    const sourceText = item.source_name && item.source_name !== item.source_label
+      ? `${item.source_label || "출처 미상"} · ${item.source_name}`
+      : (item.source_label || item.source_name || "출처 미상");
+    appendManagerPromptBlock(inspector, "출처", sourceText, "manager-source-block");
+  }
   const prompts = managerPromptParts(item);
   appendManagerPromptBlock(inspector, "작가 · 퀄리티", prompts.primary || "없음", "manager-primary-prompt");
   appendManagerPromptBlock(inspector, "캐릭터", managerCharacterText(item));
@@ -4992,6 +5595,7 @@ function renderStyleManagerDetail(item) {
 }
 
 async function deleteSingleManagerItem(item) {
+  if (styleState.managerMode === "all_generated") return;
   if (!await globalThis.appDialog.confirm({
     delete: true,
     delete_category: styleState.managerMode === "confirmed" ? "style" : "generated",
@@ -6377,7 +6981,7 @@ async function saveConfirmedStyleFromModal(saveAll = false) {
       if (status) status.textContent = "현재 그림체 묶음을 저장했습니다. 남은 묶음을 계속 확인할 수 있습니다.";
     } else {
       closeConfirmedStyleModal();
-      setStyleManagerMode("confirmed");
+      setStyleManagerMode("generated");
     }
     return result;
   } catch (error) {
@@ -6680,6 +7284,17 @@ function initializeStyleMaker() {
   styleElement("addRatingTagRule")?.addEventListener("click", addRatingTagRule);
   styleElement("addRatingTagExclusion")?.addEventListener("click", addRatingTagExclusion);
   styleElement("saveRatingTagRules")?.addEventListener("click", saveRatingTagRules);
+  styleElement("styleArtistSourceOpen")?.addEventListener("click", openArtistSourceModal);
+  styleElement("styleArtistSourceClose")?.addEventListener("click", closeArtistSourceModal);
+  styleElement("styleArtistSourceCancel")?.addEventListener("click", closeArtistSourceModal);
+  styleElement("styleArtistSourceApply")?.addEventListener("click", applyArtistSourceDraft);
+  styleElement("styleArtistSourceSearch")?.addEventListener("input", renderArtistSourceList);
+  styleElement("styleArtistSourceArtistSearch")?.addEventListener("input", (event) => {
+    styleState.artistSourceArtistSearchQuery = String(event.target.value || "").trim().toLocaleLowerCase();
+    renderArtistSourceDetail();
+  });
+  document.querySelectorAll("[data-close-style-artist-source]").forEach((item) => item.addEventListener("click", closeArtistSourceModal));
+  renderArtistSourceProjection();
   styleElement("addCharacterPrompt")?.addEventListener("click", () => {
     addCharacterPrompt();
     persistAndRenderPromptControls();
@@ -6702,14 +7317,22 @@ function initializeStyleMaker() {
     fixPromptPresetAfterManualEdit();
     persistAndRenderPromptControls();
   }));
-  styleElement("fixedPrompt")?.addEventListener("input", savePromptDraft);
-  ["basePrompt", "fixedPrompt", "negativePrompt"]
+  ["leadingPrompt", "fixedPrompt"].forEach((id) => styleElement(id)?.addEventListener("input", savePromptDraft));
+  ["leadingPrompt", "basePrompt", "fixedPrompt", "negativePrompt"]
     .forEach((id) => bindPromptTagAutocomplete(styleElement(id)));
   styleElement("openPromptPresetModal")?.addEventListener("click", openPromptPresetModal);
+  styleElement("promptPresetModelFilter")?.addEventListener("change", (event) => {
+    styleState.promptPresetModelFilter = normalizePromptPresetModelFilter(event.currentTarget.value);
+    event.currentTarget.value = styleState.promptPresetModelFilter;
+    styleState.lastPromptPresetArtistSignature = "";
+    savePromptPresetSettings();
+    void loadPromptPresets({ force: true });
+  });
   styleElement("closePromptPresetModal")?.addEventListener("click", closePromptPresetModal);
   styleElement("cancelPromptPresetModal")?.addEventListener("click", closePromptPresetModal);
   document.querySelectorAll("[data-close-prompt-preset]").forEach((item) => item.addEventListener("click", closePromptPresetModal));
   styleElement("promptPresetQualityEditor")?.addEventListener("input", updatePromptPresetFullPreview);
+  bindPromptTagAutocomplete(styleElement("promptPresetQualityEditor"));
   styleElement("saveAndApplyPromptPreset")?.addEventListener("click", saveAndApplyPromptPreset);
   styleElement("toggleGenerationParameters")?.addEventListener("click", () => {
     const panel = styleElement("generationParameters");
@@ -6818,12 +7441,16 @@ function initializeStyleMaker() {
   const storedPrompts = loadPromptDraft();
   const storedPreset = loadPromptPresetSettings();
   styleState.selectedPromptPresetKey = storedPreset.selected_key;
+  styleState.promptPresetModelFilter = storedPreset.model_filter;
+  const promptPresetModelFilter = styleElement("promptPresetModelFilter");
+  if (promptPresetModelFilter) promptPresetModelFilter.value = styleState.promptPresetModelFilter;
   styleState.promptGroups = storedPrompts.prompt_groups;
   applyGenerationSettings(storedPrompts.generation_settings);
   syncNovelAiModelControls();
   void loadNovelAiUsage({ silent: true });
   styleElement("basePrompt").value = storedPrompts.base_prompt;
   styleElement("fixedPrompt").value = storedPrompts.fixed_prompt;
+  styleElement("leadingPrompt").value = storedPrompts.leading_prompt;
   styleElement("negativePrompt").value = storedPrompts.negative_prompt;
   storedPrompts.character_prompts.forEach((value, index) => addCharacterPrompt(value, storedPrompts.character_prompt_ids[index]));
   styleState.promptGroups = cleanPromptGroups(styleState.promptGroups, storedPrompts);
@@ -6865,8 +7492,8 @@ if (typeof document !== "undefined") {
   styleElement("refreshNovelAiUsage")?.addEventListener("click", () => { void loadNovelAiUsage(); });
   styleElement("deleteNovelAiKey")?.addEventListener("click", deleteNovelAiKey);
   styleElement("refreshStyleManager")?.addEventListener("click", loadStyleManager);
-  document.querySelectorAll("[data-style-manager-mode]").forEach((button) => {
-    button.addEventListener("click", () => setStyleManagerMode(button.dataset.styleManagerMode));
+  document.querySelectorAll("[data-style-manager-mode]").forEach((tab) => {
+    tab.addEventListener("click", () => setStyleManagerMode(tab.dataset.styleManagerMode));
   });
   syncStyleManagerFilterControls();
   styleElement("styleManagerSearch")?.addEventListener("input", () => applyStyleManagerFilters({ delayed: true }));
@@ -6998,6 +7625,16 @@ if (typeof document !== "undefined") {
   styleElement("generatedImagePrev")?.addEventListener("click", () => moveGeneratedImage(-1));
   styleElement("generatedImageNext")?.addEventListener("click", () => moveGeneratedImage(1));
   document.addEventListener("keydown", (event) => {
+    const artistSourceModal = styleElement("styleArtistSourceModal");
+    if (artistSourceModal && !artistSourceModal.hidden) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeArtistSourceModal();
+      } else if (event.key === "Tab") {
+        trapArtistSourceFocus(event);
+      }
+      return;
+    }
     const sharedDependencyModal = styleElement("sharedDependencyReferenceModal");
     if (sharedDependencyModal && !sharedDependencyModal.classList.contains("hidden")) {
       if (event.key === "Escape") closeSharedDependencyReferenceModal();
@@ -7058,6 +7695,10 @@ if (typeof module !== "undefined" && module.exports) {
     STYLE_REQUEST_CONTROL_IDS,
     CUSTOM_RANGE_FIELDS,
     STYLE_FIXED_ARTISTS_STORAGE_KEY,
+    ARTIST_SOURCE_DEFAULT,
+    normalizeArtistSourceDescriptors,
+    cloneArtistSourceDescriptors,
+    artistSourceKey,
     normalizeSharedDependencyArtistPolicy,
     applyStyleRerollResult,
     buildStyleRequestPayload,
@@ -7095,6 +7736,8 @@ if (typeof module !== "undefined" && module.exports) {
     currentPromptTagFragment,
     replaceCurrentPromptTagFragment,
     formatPromptAutocompleteTag,
+    bindPromptTagAutocomplete,
+    hidePromptTagAutocomplete,
     parsePromptTokens,
     appendUniquePromptToken,
     removePromptToken,
@@ -7110,6 +7753,7 @@ if (typeof module !== "undefined" && module.exports) {
     confirmedArtistPromptSignature,
     groupConfirmedImportItems,
     attachConfirmedStyleSuspects,
+    styleManagerRecordKey,
     filterStyleManagerItems,
     paginateStyleManagerItems,
     normalizeStyleManagerPageSize,
@@ -7135,13 +7779,22 @@ if (typeof module !== "undefined" && module.exports) {
     clearSharedDependencyReference,
     setSharedDependencyReferenceFromArca,
     normalizeNovelAiModel,
+    normalizePromptPresetModelFilter,
     novelAiModelDefinition,
     novelAiModelDisplayName,
     novelAiModelBadgeClass,
     normalizeNovelAiComplexity,
     novelAiModelFilterMatches,
+    novelAiModelFilterMatchesItem,
     normalizeNovelAiUsage,
     formatNovelAiUsageCountdown,
     shouldRefreshNovelAiUsageAfterGeneration,
+    styleState,
+    openArtistSourceModal,
+    closeArtistSourceModal,
+    applyArtistSourceDraft,
+    toggleArtistSource,
+    renderArtistSourceList,
+    renderArtistSourceDetail,
   };
 }

@@ -57,6 +57,24 @@ class FrontendContractTest(unittest.TestCase):
         self.assertIn("cutoff_date: selectedCandidateCutoffDate()", source)
         self.assertIn("cutoff_date: state.candidateMeta.cutoff_date", source)
 
+    def test_candidate_skip_is_persisted_before_loading_next_artist_and_can_be_cleared(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn('id="skipArtist"', html)
+        self.assertIn('id="clearSkippedArtists"', html)
+        self.assertIn('id="skippedArtistsModal"', html)
+        self.assertIn('id="skippedArtistsList"', html)
+        self.assertIn('id="clearAllSkippedArtists"', html)
+        self.assertIn("async function skipCurrentArtist()", source)
+        self.assertIn('apiFetch("/api/skipped_artists", {', source)
+        self.assertIn("saved = true;", source)
+        self.assertIn("await showNextArtist();", source)
+        self.assertIn("async function clearSkippedArtists()", source)
+        self.assertIn("async function loadSkippedArtists()", source)
+        self.assertIn("async function restoreSkippedArtist", source)
+        self.assertIn("textContent = String(item.artist_tag", source)
+        self.assertIn("state.seenArtists.delete(artist);", source)
+
     def test_delete_confirmations_are_category_scoped(self):
         source = APP_JS.read_text(encoding="utf-8")
         html = INDEX_HTML.read_text(encoding="utf-8")
@@ -73,6 +91,14 @@ class FrontendContractTest(unittest.TestCase):
         source = APP_JS.read_text(encoding="utf-8")
         self.assertIn('queryInput.dataset.edit = "query-text"', source)
         self.assertIn('query_text: card.querySelector(\'[data-edit="query-text"]\').value', source)
+
+    def test_prompt_inputs_use_shared_autocomplete_for_static_and_dynamic_rating_fields(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        self.assertIn("function bindManualTagsAutocomplete()", source)
+        self.assertIn('window.addEventListener("load", bindManualTagsAutocomplete', source)
+        self.assertIn('queryField.className = "field inline-edit-query-field"', source)
+        self.assertIn('queryAutocomplete.className = "autocomplete prompt-tag-autocomplete hidden"', source)
+        self.assertIn("globalThis.promptTagAutocomplete?.bind(queryInput)", source)
 
     def test_rating_cards_offer_danbooru_search_and_sample_viewer(self):
         source = APP_JS.read_text(encoding="utf-8")
@@ -107,6 +133,12 @@ class FrontendContractTest(unittest.TestCase):
         self.assertIn(".thumb-button", css)
         self.assertIn("cursor: zoom-in", css)
         self.assertIn(".manual-preview-example-actions", css)
+
+    def test_unrated_rating_filter_is_exposed_to_api(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        html = INDEX_HTML.read_text(encoding="utf-8")
+        self.assertIn('data-filter="unrated"', html)
+        self.assertIn('params.set("rating_status", "unrated")', source)
 
     def test_manual_preview_actions_stay_in_header_and_viewer_uses_remaining_row(self):
         source = APP_JS.read_text(encoding="utf-8")

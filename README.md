@@ -10,6 +10,7 @@ Danbooru 작가를 평가하고, 평가 결과로 NovelAI용 그림체 프롬프
 - NovelAI 이미지 생성과 생성 결과 관리
 - 아카라이브 그림체 공유 게시글 기간 수집 및 링크 직접 추가
 - 이미지별 베이스·네거티브·캐릭터 프롬프트 비교
+- 평가 작가·NAI 작가 테스트의 작가 단위 출처를 기준 그림과 비교해 그림체 그룹으로 분류·관리
 - 추천·조회·게시일 기준 그림체 정렬
 
 ## NovelAI V5와 V4.5
@@ -53,6 +54,23 @@ ZIP 이미지는 사용자 DB의 변동 가능한 내부 행 번호가 아니라
 cd artist_rater
 python -m pip install -r requirements.txt
 python launcher.py
+```
+
+런처 창의 `데이터 폴더` 섹션에서 `폴더 추가`로 여러 폴더를 선택할 수
+있습니다. 목록에서 폴더를 선택한 뒤 `선택을 기준으로`를 누르면 설정·저장
+기준(primary)이 바뀌고, 서버 실행 중에는 이 구성을 변경할 수 없습니다.
+폴더 추가·제거·기준 변경은 기본 `data` 폴더의 `launcher_settings.json`에
+저장되어 다음 실행에도 복원되며, 섹션은 기본으로 접혀 있습니다.
+프로젝트 루트, `artist_rater` 폴더 또는 실제 `data` 폴더를 선택하면 내부의
+`artist_rater.sqlite` 위치를 자동으로 찾습니다.
+
+로컬 테스트에서 여러 `data` 폴더를 함께 보려면 `--data-dir`를 반복하고,
+쓰기·설정 기준 폴더를 `--primary-data-dir`로 지정합니다. primary는 첫 번째
+폴더로 기본 선택되며, 보조 폴더의 DB·이미지는 중복 제거 후 primary에 읽기
+전용 원본을 보존한 채 병합됩니다.
+
+```powershell
+python launcher.py --data-dir C:\work\data-a --data-dir C:\work\data-b --primary-data-dir C:\work\data-b
 ```
 
 ## EXE 빌드

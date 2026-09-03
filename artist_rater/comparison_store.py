@@ -63,8 +63,16 @@ def _decode(row):
     item = dict(row)
     for key, fallback in (("character_prompts_json", []), ("defaults_json", {}), ("selected_style_ids_json", []), ("settings_json", {})):
         if key in item:
-            try: item[key[:-5] if key.endswith("_json") else key] = json.loads(item.pop(key) or json.dumps(fallback))
-            except json.JSONDecodeError: item[key[:-5] if key.endswith("_json") else key] = fallback
+            decoded_key = key[:-5] if key.endswith("_json") else key
+            try: item[decoded_key] = json.loads(item.pop(key) or json.dumps(fallback))
+            except json.JSONDecodeError: item[decoded_key] = fallback
+    for key, decoded_key, fallback in (
+        ("group_character_prompts_json", "group_character_prompts", []),
+        ("group_defaults_json", "group_defaults", {}),
+    ):
+        if key in item:
+            try: item[decoded_key] = json.loads(item.pop(key) or json.dumps(fallback))
+            except json.JSONDecodeError: item[decoded_key] = fallback
     return item
 
 
@@ -74,6 +82,24 @@ def list_groups(db_path):
         for group in groups:
             group["results"] = [_decode(row) for row in connection.execute("SELECT * FROM comparison_results WHERE group_id=? ORDER BY id", (group["id"],))]
     return groups
+
+
+def list_comparison_results(db_path):
+    """List comparison images with their group context for unified history."""
+    with closing(_connect(db_path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT result.*, group_row.name AS group_name,
+                   group_row.width AS group_width, group_row.height AS group_height,
+                   group_row.fixed_prompt AS group_fixed_prompt,
+                   group_row.character_prompts_json AS group_character_prompts_json,
+                   group_row.defaults_json AS group_defaults_json
+            FROM comparison_results result
+            JOIN comparison_groups group_row ON group_row.id=result.group_id
+            ORDER BY result.created_at DESC, result.id DESC
+            """
+        ).fetchall()
+    return [_decode(row) for row in rows]
 
 
 def create_group(db_path, payload):

@@ -18,3 +18,33 @@ arca_login_profile/
 .env.*
 /AGENTS.md
 /.agents/
+
+# 로컬 실험용 그림체 가이드·장면 분석 자료
+/docs/assets/v5_style_guide/
+/docs/assets/v5_style_guide_v2/
+/docs/v5-style-guide/
+/docs/novelai_v5_style_beginner_guide.html
+/docs/superpowers/specs/2026-08-27-style-maker-artist-source-picker-design.md
+/artist_rater/generate_v5_style_guide_images.py
+/artist_rater/analyze_scene_clusters.py
+/artist_rater/analyze_scene_clusters_v3.py
+/artist_rater/analyze_v5_board_sample.py
+/artist_rater/analyze_v5_prompt_practices.py
+/artist_rater/annotate_scene_clusters.py
+/artist_rater/collect_v5_board_sample.py
+/artist_rater/collect_v5_shared_styles.py
+/artist_rater/export_scene_clusters_v3.py
+/artist_rater/export_scene_clusters_v3_1.py
+/artist_rater/scene_v3_roles.py
+/artist_rater/scene_analysis_requirements.txt
+/artist_rater/tests/test_analyze*
+/artist_rater/tests/test_annotate*
+/artist_rater/tests/test_collect_v5*
+/artist_rater/tests/test_scene_clusters_v3*
+/artist_rater/tests/test_v5_style_guide.py
+/analysis_outputs/
+/RELEASE_V5.txt
+
+# 로컬 릴리스 설명 초안 (GitHub Release 본문 게시용)
+/docs/release_notes_v0.1.8.md
+/docs/arca_patch_notes_v0.1.8.html

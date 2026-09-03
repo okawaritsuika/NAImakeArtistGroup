@@ -152,6 +152,27 @@ test("rating cards expose an encoded Danbooru search and accessible sample viewe
   assert.equal(card.querySelector('[data-action="find-thumbnail"]').textContent, "WebP 썸네일 갱신");
 });
 
+test("rating card query prompts use the shared field-level autocomplete hook", () => {
+  let boundInput = null;
+  globalThis.promptTagAutocomplete = { bind: (input) => { boundInput = input; } };
+  try {
+    const card = renderRatingCard({
+      id: 81,
+      artist_tag: "artist_name",
+      score: 3,
+      query_tags: ["solo"],
+      query_text: "solo",
+    });
+    const queryInput = card.querySelector('[data-edit="query-text"]');
+    const queryField = queryInput.parentNode || card.querySelector(".field");
+    assert.equal(boundInput, queryInput);
+    assert.ok(queryField.className.split(/\s+/).includes("field"));
+    assert.ok(queryField.querySelector(".prompt-tag-autocomplete"));
+  } finally {
+    delete globalThis.promptTagAutocomplete;
+  }
+});
+
 test("sample merging filters unsafe URLs and keeps the representative first", () => {
   const merged = mergePreviewSamples(
     [{ id: 1, preview_url: "https://example.test/representative.jpg" }],

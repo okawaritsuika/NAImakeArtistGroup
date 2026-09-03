@@ -16,6 +16,9 @@ from unittest.mock import Mock, patch
 
 import app
 import style_store
+from arca_style_collector import ArcaCollectorError
+from nai_artist_test_store import complete_item, create_test, save_direct_rating
+from style_group_store import create_group, record_style_group_artist_decision
 
 
 SECRET_KEY = "secret-key-value"
@@ -242,6 +245,162 @@ class StyleApiTest(unittest.TestCase):
             dump = "\n".join(conn.iterdump())
         self.assertNotIn(SECRET_KEY, dump)
 
+    def make_artist_source_fixture(self):
+        timestamp = app.now_text()
+        with closing(app.db()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO ratings
+                    (artist_tag, score, rating_status, mode, query_text, query_tags_json, created_at, updated_at)
+                VALUES (?, ?, 'rated', 'manual', ?, ?, ?, ?)
+                """,
+                ("same_artist", 2, "fixture query", '["portrait"]', timestamp, timestamp),
+            )
+        test = create_test(
+            app.DB_PATH,
+            "보완 NAI 테스트",
+            {
+                "base_prompt": "{{artist}}, watercolor",
+                "prompt_variants": [{"prompt": "{{artist}}, watercolor", "images_per_artist": 1}],
+                "model": "nai-diffusion-5-full",
+                "width": 832,
+                "height": 1216,
+                "sampler": "k_euler_ancestral",
+                "steps": 28,
+                "scale": 5.0,
+                "cfg_rescale": 0.4,
+            },
+            [
+                {"artist_tag": "same_artist"},
+                {"artist_tag": "unrated_direct"},
+            ],
+            1,
+            0,
+        )
+        save_direct_rating(app.DB_PATH, test["id"], "same_artist", 4)
+        group_dir = self.tmp / "style_group_images"
+        group = create_group(
+            app.DB_PATH,
+            group_dir,
+            "보완 그림체 그룹",
+            sources=[{"source_type": "nai_test", "source_id": str(test["id"]), "label": "연결 NAI"}],
+        )
+        record_style_group_artist_decision(
+            app.DB_PATH,
+            group_dir,
+            group["id"],
+            "same_artist",
+            True,
+            direct=True,
+        )
+        record_style_group_artist_decision(
+            app.DB_PATH,
+            group_dir,
+            group["id"],
+            "unrated_direct",
+            True,
+            direct=True,
+        )
+        return test, group
+
+    def style_artist_payload(self, **overrides):
+        payload = {
+            "count": 1,
+            "scores": [1, 2, 3, 4, 5],
+            "weight_mode": "random",
+            "min_weight": 1.0,
+            "max_weight": 1.0,
+            "rng_seed": 7,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_style_maker_artist_sources_validate_minimum_duplicate_and_type(self):
+        for source_value in (
+            [],
+            [
+                {"source_type": "nai_test", "source_id": "1"},
+                {"source_type": "nai_test", "source_id": "1"},
+            ],
+            [{"source_type": "unknown", "source_id": "1"}],
+        ):
+            with self.subTest(source_value=source_value):
+                response = self.client.post(
+                    "/api/style-maker/artists",
+                    json=self.style_artist_payload(artist_sources=source_value),
+                )
+                self.assertEqual(response.status_code, 400)
+
+    def test_style_maker_artist_source_list_contains_all_source_sections(self):
+        test, group = self.make_artist_source_fixture()
+
+        response = self.client.get("/api/style-maker/artist-sources")
+
+        self.assertEqual(response.status_code, 200)
+        sources = response.get_json()["sources"]
+        self.assertTrue({item["source_type"] for item in sources} >= {"rating_management", "nai_test", "style_group"})
+        self.assertIn({"source_type": "nai_test", "source_id": str(test["id"])}, [
+            {"source_type": item["source_type"], "source_id": item["source_id"]} for item in sources
+        ])
+        self.assertIn({"source_type": "style_group", "source_id": str(group["id"])}, [
+            {"source_type": item["source_type"], "source_id": item["source_id"]} for item in sources
+        ])
+
+    def test_style_maker_nai_artist_source_detail_contains_prompt_settings_and_scores(self):
+        test, _ = self.make_artist_source_fixture()
+
+        response = self.client.get(f"/api/style-maker/artist-sources/nai_test/{test['id']}")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        same = next(item for item in data["artists"] if item["artist_key"] == "same artist")
+        self.assertEqual(same["score"], 4.0)
+        self.assertEqual(same["score_bucket"], 4)
+        self.assertEqual(data["prompts"][0]["prompt"], "{{artist}}, watercolor")
+        self.assertEqual(data["settings"]["model"], "nai-diffusion-5-full")
+        self.assertEqual(data["settings"]["width"], 832)
+
+    def test_style_group_detail_shows_unscored_direct_artist_but_candidate_excludes_it(self):
+        _, group = self.make_artist_source_fixture()
+
+        detail = self.client.get(f"/api/style-maker/artist-sources/style_group/{group['id']}")
+        self.assertEqual(detail.status_code, 200)
+        unscored = next(item for item in detail.get_json()["artists"] if item["artist_key"] == "unrated direct")
+        self.assertIsNone(unscored["score"])
+        self.assertIsNone(unscored["score_bucket"])
+        self.assertEqual(unscored["score_sources"], [])
+
+        candidates = self.client.post(
+            "/api/style-maker/artists",
+            json=self.style_artist_payload(artist_sources=[{"source_type": "style_group", "source_id": str(group["id"])}]),
+        )
+        self.assertEqual(candidates.status_code, 200)
+        self.assertEqual([item["artist"] for item in candidates.get_json()["artists"]], ["same_artist"])
+
+    def test_style_maker_artist_sources_average_and_legacy_rating_source_fallback(self):
+        test, group = self.make_artist_source_fixture()
+        sources = [
+            {"source_type": "rating_management", "source_id": "all"},
+            {"source_type": "nai_test", "source_id": str(test["id"])},
+            {"source_type": "style_group", "source_id": str(group["id"])},
+        ]
+
+        averaged = self.client.post(
+            "/api/style-maker/artists",
+            json=self.style_artist_payload(artist_sources=sources, scores=[3]),
+        )
+        self.assertEqual(averaged.status_code, 200)
+        self.assertEqual(averaged.get_json()["artists"][0]["artist"], "same_artist")
+        self.assertEqual(averaged.get_json()["artists"][0]["score"], 3)
+
+        legacy = self.client.post(
+            "/api/style-maker/artists",
+            json=self.style_artist_payload(rating_source="danbooru", scores=[2]),
+        )
+        self.assertEqual(legacy.status_code, 200)
+        self.assertEqual(legacy.get_json()["artists"][0]["artist"], "same_artist")
+        self.assertEqual(legacy.get_json()["artists"][0]["score"], 2)
+
     def test_settings_round_trip_never_returns_or_stores_key_in_database(self):
         response = self.client.put(
             "/api/settings/novelai", json={"app_key": SECRET_KEY}
@@ -295,6 +454,28 @@ class StyleApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["ok"])
         get_presets.assert_called_once_with(app.DB_PATH, ["alpha"], 12)
+
+    @patch("app.get_style_maker_prompt_presets")
+    def test_style_maker_prompt_presets_pass_model_filter(self, get_presets):
+        get_presets.return_value = {"presets": [], "selected_artist_count": 1}
+
+        response = self.client.post(
+            "/api/style-maker/prompt-presets",
+            json={"artists": ["alpha"], "limit": 12, "model_filter": "v5"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        get_presets.assert_called_once_with(app.DB_PATH, ["alpha"], 12, "v5")
+
+    @patch("app.get_style_maker_prompt_presets", side_effect=ArcaCollectorError("모델 필터 값이 올바르지 않습니다."))
+    def test_style_maker_prompt_presets_returns_bad_request_for_invalid_model_filter(self, get_presets):
+        response = self.client.post(
+            "/api/style-maker/prompt-presets",
+            json={"artists": ["alpha"], "model_filter": "v3"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["ok"])
 
     @patch("app.get_style_maker_prompt_presets")
     def test_edited_prompt_preset_is_persisted_and_returned_on_later_load(self, get_presets):
@@ -439,9 +620,18 @@ class NovelAIGenerationTest(unittest.TestCase):
         from novelai import combine_base_prompt
 
         self.assertEqual(combine_base_prompt(" base ", " artist "), "artist, base")
+        self.assertEqual(combine_base_prompt("base", "artist", "leading"), "leading, artist, base")
+        self.assertEqual(combine_base_prompt("base", "artist", ""), "artist, base")
         self.assertEqual(combine_base_prompt("base", ""), "base")
         self.assertEqual(combine_base_prompt("", "artist"), "artist")
         self.assertEqual(combine_base_prompt("", ""), "")
+
+    def test_generation_normalizes_optional_leading_prompt(self):
+        from novelai import normalize_generation_data
+
+        normalized = normalize_generation_data(self.generation_data(leading_prompt="  style prefix  "))
+        self.assertEqual(normalized["leading_prompt"], "style prefix")
+        self.assertEqual(normalize_generation_data(self.generation_data())["leading_prompt"], "")
 
     def test_generation_normalizes_numeric_tag_closers(self):
         from novelai import build_generation_payload
@@ -712,6 +902,16 @@ class GenerationApiTest(StyleApiTest):
     def save_key(self):
         response = self.client.put("/api/settings/novelai", json={"app_key": SECRET_KEY})
         self.assertEqual(response.status_code, 200)
+
+    @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
+    def test_generation_request_passes_leading_prompt_to_novelai(self, generate):
+        self.save_key()
+        response = self.client.post(
+            "/api/style-maker/generate",
+            json=self.request_payload(leading_prompt="style prefix"),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(generate.call_args.args[1]["leading_prompt"], "style prefix")
 
     @patch("app.generate_novelai_png", return_value=(valid_png(), 123456))
     def test_generation_saves_png_and_complete_metadata(self, generate):
@@ -1688,6 +1888,143 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertTrue(confirmed_item["thumbnail_url"].startswith("/style-manager-thumbnails/confirmed/"))
         self.assertEqual(len(self.client.get("/api/style-manager/generated").get_json()), 2)
 
+    def test_style_manager_generated_and_all_history_sources(self):
+        original_comparison_dir = app.COMPARISON_IMAGE_DIR
+        app.COMPARISON_IMAGE_DIR = self.tmp / "comparison_images"
+        try:
+            common = {
+                "db_path": app.DB_PATH,
+                "generated_dir": app.GENERATED_DIR,
+                "artists": [{"artist": "history_artist", "weight": 1.0}],
+                "png_bytes": valid_png(64, 64),
+                "base_prompt": "very aesthetic, history fixture",
+                "quality_prompt": "very aesthetic",
+                "original_quality_prompt": "very aesthetic, masterpiece",
+                "excluded_quality_tags": [],
+                "fixed_prompt": "history fixture",
+                "negative_prompt": "lowres",
+                "character_prompts": [],
+                "combined_prompt": "artist:history artist, very aesthetic, history fixture",
+                "seed": 101,
+                "width": 64,
+                "height": 64,
+                "sampler": "k_euler_ancestral",
+                "noise_schedule": "karras",
+                "steps": 28,
+                "scale": 5.0,
+                "cfg_rescale": 0.2,
+                "variety_plus": True,
+                "skip_cfg_above_sigma": 59.04722600415217,
+                "model": "nai-diffusion-4-5-full",
+            }
+            style_maker_image = style_store.save_generated_result(
+                request_id="history-style-maker", **common
+            )
+            nai_test_image = style_store.save_generated_result(
+                request_id="history-nai-test", **common
+            )
+            nai_test = create_test(
+                app.DB_PATH,
+                "회귀 NAI 테스트",
+                {
+                    "base_prompt": "{{artist}}, history fixture",
+                    "prompt_variants": [
+                        {"prompt": "{{artist}}, history fixture", "images_per_artist": 1}
+                    ],
+                    "model": "nai-diffusion-4-5-full",
+                    "width": 64,
+                    "height": 64,
+                },
+                [{"artist_tag": "history_artist"}],
+                1,
+                0,
+            )
+            complete_item(
+                app.DB_PATH,
+                nai_test["id"],
+                nai_test["items"][0]["id"],
+                nai_test_image["image_id"],
+            )
+
+            comparison_group_id = app.create_group(
+                app.DB_PATH,
+                {
+                    "name": "회귀 비교군",
+                    "fixed_prompt": "그룹 고정 프롬프트",
+                    "character_prompts": ["comparison character"],
+                    "width": 64,
+                    "height": 64,
+                    "seed_mode": "none",
+                    "style_ids": [style_maker_image["style_id"]],
+                    "defaults": {"model": "nai-diffusion-4-5-full"},
+                },
+            )
+            app.save_result(
+                app.DB_PATH,
+                app.COMPARISON_IMAGE_DIR,
+                comparison_group_id,
+                style_maker_image["style_id"],
+                "회귀 비교 스타일",
+                valid_png(64, 64),
+                {"seed": 202, "steps": 24},
+            )
+            with closing(app.db()) as connection:
+                comparison_result_id = connection.execute(
+                    "SELECT id FROM comparison_results WHERE group_id=?",
+                    (comparison_group_id,),
+                ).fetchone()[0]
+
+            generated_response = self.client.get("/api/style-manager/generated")
+            self.assertEqual(generated_response.status_code, 200)
+            generated = generated_response.get_json()
+            self.assertEqual([item["id"] for item in generated], [style_maker_image["image_id"]])
+
+            all_response = self.client.get("/api/style-manager/all-generated")
+            self.assertEqual(all_response.status_code, 200)
+            records = all_response.get_json()
+            self.assertEqual(len(records), 3)
+            by_key = {item["record_key"]: item for item in records}
+            self.assertEqual(
+                set(by_key),
+                {
+                    f"generated:{style_maker_image['image_id']}",
+                    f"generated:{nai_test_image['image_id']}",
+                    f"comparison:{comparison_result_id}",
+                },
+            )
+            self.assertEqual(
+                {item["source_type"] for item in records},
+                {"style_maker", "nai_artist_test", "comparison"},
+            )
+            style_record = by_key[f"generated:{style_maker_image['image_id']}"]
+            nai_record = by_key[f"generated:{nai_test_image['image_id']}"]
+            comparison_record = by_key[f"comparison:{comparison_result_id}"]
+            self.assertEqual(
+                [item["record_key"] for item in records],
+                sorted(
+                    by_key,
+                    key=lambda key: (by_key[key]["created_at"], key),
+                    reverse=True,
+                ),
+            )
+            self.assertEqual(style_record["source_label"], "그림체 제작")
+            self.assertEqual(nai_record["source_label"], "NAI 작가 테스트")
+            self.assertIn("회귀 NAI 테스트", nai_record["source_name"])
+            self.assertEqual(comparison_record["source_label"], "비교군 관리")
+            self.assertIn("회귀 비교군", comparison_record["source_name"])
+            self.assertTrue(style_record["image_url"].startswith("/generated/"))
+            self.assertTrue(nai_record["image_url"].startswith("/generated/"))
+            self.assertTrue(comparison_record["image_url"].startswith("/comparison-images/"))
+            self.assertTrue(
+                comparison_record["thumbnail_url"].startswith(
+                    "/style-manager-thumbnails/comparison/"
+                )
+            )
+            self.assertEqual(comparison_record["model"], "nai-diffusion-4-5-full")
+            self.assertEqual(comparison_record["character_prompts"], ["comparison character"])
+        finally:
+            app.COMPARISON_IMAGE_DIR = original_comparison_dir
+
     def test_shared_gallery_flattens_images_from_the_same_post(self):
         app.ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
         (app.ARCA_STYLE_IMAGE_DIR / "one.png").write_bytes(valid_png(64, 64))
@@ -1787,6 +2124,39 @@ class ConfirmedStyleApiTest(unittest.TestCase):
         self.assertEqual(filtered["items"][0]["image_path"], "beta.png")
         ordered = self.client.get("/api/style-manager/shared?sort=posted_asc").get_json()
         self.assertEqual([item["image_path"] for item in ordered["items"]], ["alpha.png", "beta.png"])
+
+    def test_shared_gallery_v5_filter_keeps_canonical_and_source_build_images(self):
+        app.ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        for name in ("v5-full.png", "v5-curated.png", "v5-build.png", "v45-full.png"):
+            (app.ARCA_STYLE_IMAGE_DIR / name).write_bytes(valid_png(64, 64))
+        with closing(app.db()) as connection, connection:
+            item_id = connection.execute(
+                "INSERT INTO arca_style_items(source_url,title,board_tab,collected_at,updated_at) VALUES(?,?,?,?,?)",
+                ("https://arca.live/b/aiart/v5-models", "V5 그림체 공유", "NAI", app.now_text(), app.now_text()),
+            ).lastrowid
+            connection.executemany(
+                """
+                INSERT INTO arca_style_images(
+                    item_id,image_url,image_path,metadata_status,prompt,base_prompt,model,
+                    model_id,model_family,model_generation,model_variant,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (item_id, "https://image/v5-full", "v5-full.png", "ok", "artist:full", "artist:full", "nai-diffusion-5-full", "nai-diffusion-5-full", "v5", "v5", "full", app.now_text()),
+                    (item_id, "https://image/v5-curated", "v5-curated.png", "ok", "artist:curated", "artist:curated", "nai-diffusion-5-curated", "nai-diffusion-5-curated", "v5", "v5", "curated", app.now_text()),
+                    (item_id, "https://image/v5-build", "v5-build.png", "ok", "artist:build", "artist:build", "NovelAI Diffusion V5 4BDE2A90", "", "v5", "v5", "unknown", app.now_text()),
+                    (item_id, "https://image/v45-full", "v45-full.png", "ok", "artist:v45", "artist:v45", "nai-diffusion-4-5-full", "nai-diffusion-4-5-full", "v4.5", "v4.5", "full", app.now_text()),
+                ],
+            )
+
+        v5 = self.client.get("/api/style-manager/shared?model=v5").get_json()
+        self.assertEqual({item["image_path"] for item in v5["items"]}, {"v5-full.png", "v5-curated.png", "v5-build.png"})
+        self.assertEqual(
+            {item["model_family"] for item in v5["items"]},
+            {"v5"},
+        )
+        full = self.client.get("/api/style-manager/shared?model=nai-diffusion-5-full").get_json()
+        self.assertEqual([item["image_path"] for item in full["items"]], ["v5-full.png"])
 
 
 class VarietyPlusRequestTest(unittest.TestCase):

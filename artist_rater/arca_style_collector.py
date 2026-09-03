@@ -64,6 +64,9 @@ UNSUPPORTED_IMAGE_TYPES = {
     ".tiff": "image/tiff",
 }
 SUPPORTED_ARCHIVE_IMAGE_TYPES = {"image/png", "image/webp"}
+MODEL_COLUMN_BACKFILL_REVISION = "model-columns-v1"
+METADATA_VALIDATION_REVISION = "metadata-validation-v1"
+SEED_IMPORT_STATE_KEY = "arca_style_seed"
 
 
 class ArcaCollectorError(Exception):
@@ -307,6 +310,16 @@ def init_arca_style_tables(db_path):
         CREATE TABLE IF NOT EXISTS arca_seed_imports (
             seed_hash TEXT PRIMARY KEY, imported_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS arca_maintenance_state (
+            name TEXT PRIMARY KEY, revision TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS arca_seed_import_state (
+            name TEXT PRIMARY KEY, fast_fingerprint TEXT NOT NULL DEFAULT '',
+            logical_fingerprint TEXT NOT NULL DEFAULT '', seed_hash TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS arca_seed_metadata (
+            name TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
         """)
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(arca_collection_runs)")}
         if "search_scope" not in run_columns:
@@ -339,8 +352,25 @@ def init_arca_style_tables(db_path):
         _backfill_model_columns(conn)
 
 
-def _backfill_model_columns(conn):
+def _maintenance_state_matches(conn, name, revision):
+    row = conn.execute(
+        "SELECT revision FROM arca_maintenance_state WHERE name=?", (name,)
+    ).fetchone()
+    return row is not None and row[0] == revision
+
+
+def _record_maintenance_state(conn, name, revision):
+    conn.execute(
+        "INSERT INTO arca_maintenance_state(name,revision) VALUES(?,?) "
+        "ON CONFLICT(name) DO UPDATE SET revision=excluded.revision",
+        (name, revision),
+    )
+
+
+def _backfill_model_columns(conn, *, force=False):
     """Idempotently index model values in old databases without deleting data."""
+    if not force and _maintenance_state_matches(conn, "model_columns", MODEL_COLUMN_BACKFILL_REVISION):
+        return False
     for table in ("arca_style_images", "arca_style_items"):
         rows = conn.execute(f"SELECT id,model,raw_metadata_json,metadata_status FROM {table}").fetchall()
         for row in rows:
@@ -365,6 +395,8 @@ def _backfill_model_columns(conn):
                 f"UPDATE {table} SET model_id=?,model_family=?,model_generation=?,model_variant=?,complexity=?,quality_toggle=?,uc_preset=? WHERE id=?",
                 (fields["model_id"], fields["model_family"], fields["model_generation"], fields["model_variant"], complexity, quality_toggle, uc_preset, row[0]),
             )
+    _record_maintenance_state(conn, "model_columns", MODEL_COLUMN_BACKFILL_REVISION)
+    return True
 
 
 def _init_danbooru_seed_tables(conn):
@@ -372,7 +404,8 @@ def _init_danbooru_seed_tables(conn):
         CREATE TABLE IF NOT EXISTS ratings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             artist_tag TEXT NOT NULL UNIQUE,
-            score INTEGER NOT NULL,
+            score INTEGER,
+            rating_status TEXT NOT NULL DEFAULT 'rated',
             memo TEXT DEFAULT '',
             favorite INTEGER DEFAULT 0,
             blocked INTEGER DEFAULT 0,
@@ -395,6 +428,11 @@ def _init_danbooru_seed_tables(conn):
             updated_at TEXT NOT NULL
         );
         """)
+    # Existing seed/legacy tables are retained; add only the compatibility
+    # column needed by the current application schema.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(ratings)")}
+    if "rating_status" not in columns:
+        conn.execute("ALTER TABLE ratings ADD COLUMN rating_status TEXT NOT NULL DEFAULT 'rated'")
 
 
 def export_arca_style_seed(source_db, seed_db):
@@ -433,27 +471,77 @@ def export_arca_style_seed(source_db, seed_db):
             f"INSERT INTO arca_style_images ({','.join(image_columns)}) "
             f"SELECT {','.join(image_select)} FROM source.arca_style_images"
         )
-        _backfill_model_columns(conn)
+        _backfill_model_columns(conn, force=True)
+        # Keep only one completed run row per semantic coverage range. Long-lived
+        # local databases record the same search range repeatedly, and copying all
+        # of those rows plus their links can add millions of redundant records.
+        # The compact union still preserves coverage and delete/invalidation lookup
+        # while keeping local job history out of the distributable seed.
         run_columns = [
             row[1] for row in conn.execute("PRAGMA main.table_info(arca_collection_runs)")
             if row[1] != "job_id"
         ]
-        conn.execute(
-            f"INSERT INTO arca_collection_runs ({','.join(run_columns)}) "
-            f"SELECT {','.join(run_columns)} FROM source.arca_collection_runs WHERE status='completed'"
+        source_run_columns = {
+            row[1] for row in conn.execute("PRAGMA source.table_info(arca_collection_runs)")
+        }
+        run_key_columns = (
+            "keyword", "tabs", "start_date", "end_date",
+            "max_pages", "max_posts", "search_scope",
         )
-        conn.execute(
-            "INSERT INTO arca_collection_run_items(run_id,item_id) "
-            "SELECT ri.run_id,ri.item_id FROM source.arca_collection_run_items ri "
-            "JOIN arca_collection_runs run ON run.id=ri.run_id "
-            "JOIN arca_style_items item ON item.id=ri.item_id"
+        run_select = []
+        for name in run_columns:
+            if name in source_run_columns:
+                run_select.append(f"source_run.{name} AS {name}")
+            elif name == "search_scope":
+                run_select.append("'all' AS search_scope")
+            else:
+                run_select.append(f"NULL AS {name}")
+        run_map = {}
+        run_rows = conn.execute(
+            "SELECT source_run.id AS source_id," + ",".join(run_select) +
+            " FROM source.arca_collection_runs source_run "
+            "WHERE source_run.status='completed' "
+            "ORDER BY source_run.id DESC"
         )
+        for row in run_rows:
+            key = tuple(row[name] for name in run_key_columns)
+            if key in run_map:
+                continue
+            cursor = conn.execute(
+                f"INSERT INTO arca_collection_runs ({','.join(run_columns)}) "
+                f"VALUES ({','.join('?' for _ in run_columns)})",
+                tuple(row[name] for name in run_columns),
+            )
+            run_map[key] = cursor.lastrowid
+        if run_map and "arca_collection_run_items" in source_tables:
+            source_key = {
+                name: f"source_run.{name}" if name in source_run_columns else "'all'"
+                for name in run_key_columns
+            }
+            join_conditions = " AND ".join(
+                f"run.{name}={source_key[name]}" for name in run_key_columns
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO arca_collection_run_items(run_id,item_id) "
+                "SELECT run.id,target_item.id "
+                "FROM source.arca_collection_run_items link "
+                "JOIN source.arca_collection_runs source_run "
+                "ON source_run.id=link.run_id AND source_run.status='completed' "
+                "JOIN source.arca_style_items source_item ON source_item.id=link.item_id "
+                "JOIN arca_collection_runs run ON " + join_conditions + " "
+                "JOIN arca_style_items target_item ON target_item.source_url=source_item.source_url"
+            )
         conn.execute(
             "INSERT OR IGNORE INTO arca_collection_invalidations "
             "SELECT * FROM source.arca_collection_invalidations"
         )
         if "artist_cache" in source_tables:
             conn.execute("INSERT INTO artist_cache SELECT * FROM source.artist_cache")
+        conn.execute(
+            "INSERT INTO arca_seed_metadata(name,value) VALUES('logical_fingerprint',?) "
+            "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            (_logical_seed_fingerprint(conn),),
+        )
     with closing(sqlite3.connect(target)) as conn:
         conn.execute("VACUUM")
     return {
@@ -470,16 +558,101 @@ def _table_count(db_path, table):
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
+def _seed_fast_fingerprint(seed):
+    """Fingerprint a seed using only its SQLite header and file size."""
+
+    seed = Path(seed)
+    stat = seed.stat()
+    with seed.open("rb") as handle:
+        header = handle.read(4096)
+    return hashlib.sha256(
+        json.dumps(
+            {"size": stat.st_size, "header": hashlib.sha256(header).hexdigest()},
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _seed_logical_fingerprint(seed):
+    """Read the optional small metadata marker embedded by seed exporters."""
+
+    try:
+        uri = f"file:{Path(seed).resolve().as_posix()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            row = conn.execute(
+                "SELECT value FROM arca_seed_metadata "
+                "WHERE name='logical_fingerprint'"
+            ).fetchone()
+            return row[0] if row else ""
+    except (OSError, sqlite3.Error):
+        return ""
+
+
+def _seed_content_hash(seed):
+    digest = hashlib.sha256()
+    with Path(seed).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _logical_seed_fingerprint(conn):
+    """Build a deterministic seed marker; used during seed export only."""
+
+    digest = hashlib.sha256()
+    for table in (
+        "ratings", "artist_cache", "arca_style_items", "arca_style_images",
+        "arca_collection_runs", "arca_collection_run_items",
+        "arca_collection_invalidations",
+    ):
+        columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+        if not columns:
+            continue
+        digest.update(table.encode("utf-8"))
+        digest.update(b"\0")
+        for row in conn.execute(
+            f"SELECT {','.join(columns)} FROM {table} ORDER BY rowid"
+        ):
+            digest.update(
+                json.dumps(list(row), ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8")
+            )
+            digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _record_seed_import_state(conn, fast_fingerprint, logical_fingerprint, seed_hash):
+    conn.execute(
+        "INSERT INTO arca_seed_import_state "
+        "(name,fast_fingerprint,logical_fingerprint,seed_hash) VALUES(?,?,?,?) "
+        "ON CONFLICT(name) DO UPDATE SET fast_fingerprint=excluded.fast_fingerprint, "
+        "logical_fingerprint=excluded.logical_fingerprint,seed_hash=excluded.seed_hash",
+        (SEED_IMPORT_STATE_KEY, fast_fingerprint, logical_fingerprint, seed_hash),
+    )
+
+
 def import_arca_style_seed(db_path, seed_db):
     """Merge a bundled metadata-only seed once, preserving existing local rows and image files."""
     seed = Path(seed_db)
     if not seed.is_file():
         return {"imported": False, "items": 0, "images": 0}
-    seed_hash = hashlib.sha256(seed.read_bytes()).hexdigest()
+    fast_fingerprint = _seed_fast_fingerprint(seed)
+    logical_fingerprint = _seed_logical_fingerprint(seed)
     init_arca_style_tables(db_path)
     with closing(_connect(db_path)) as conn, conn:
         _init_danbooru_seed_tables(conn)
+        state = conn.execute(
+            "SELECT fast_fingerprint,logical_fingerprint FROM arca_seed_import_state "
+            "WHERE name=?",
+            (SEED_IMPORT_STATE_KEY,),
+        ).fetchone()
+        if state is not None and (
+            (logical_fingerprint and state["logical_fingerprint"] == logical_fingerprint)
+            or (not logical_fingerprint and state["fast_fingerprint"] == fast_fingerprint)
+        ):
+            return {"imported": False, "items": 0, "images": 0}
+        seed_hash = _seed_content_hash(seed)
         if conn.execute("SELECT 1 FROM arca_seed_imports WHERE seed_hash=?", (seed_hash,)).fetchone():
+            _record_seed_import_state(conn, fast_fingerprint, logical_fingerprint, seed_hash)
             return {"imported": False, "items": 0, "images": 0}
         before_items = conn.execute("SELECT COUNT(*) FROM arca_style_items").fetchone()[0]
         before_images = conn.execute("SELECT COUNT(*) FROM arca_style_images").fetchone()[0]
@@ -488,12 +661,23 @@ def import_arca_style_seed(db_path, seed_db):
             row[0] for row in conn.execute("SELECT name FROM seed.sqlite_master WHERE type='table'")
         }
         if "ratings" in seed_tables:
-            rating_columns = [
-                row[1] for row in conn.execute("PRAGMA main.table_info(ratings)") if row[1] != "id"
-            ]
+            main_info = [row for row in conn.execute("PRAGMA main.table_info(ratings)") if row[1] != "id"]
+            rating_columns = [row[1] for row in main_info]
+            seed_columns = {row[1] for row in conn.execute("PRAGMA seed.table_info(ratings)")}
+            rating_select = []
+            for row in main_info:
+                name = row[1]
+                if name in seed_columns:
+                    rating_select.append(name)
+                elif name == "rating_status":
+                    rating_select.append("'rated'")
+                elif row[4] is not None:
+                    rating_select.append(str(row[4]))
+                else:
+                    rating_select.append("NULL")
             conn.execute(
                 f"INSERT OR IGNORE INTO ratings ({','.join(rating_columns)}) "
-                f"SELECT {','.join(rating_columns)} FROM seed.ratings"
+                f"SELECT {','.join(rating_select)} FROM seed.ratings"
             )
         if "artist_cache" in seed_tables:
             conn.execute("INSERT OR IGNORE INTO artist_cache SELECT * FROM seed.artist_cache")
@@ -547,11 +731,12 @@ def import_arca_style_seed(db_path, seed_db):
             "INSERT OR IGNORE INTO arca_collection_invalidations "
             "SELECT * FROM seed.arca_collection_invalidations"
         )
-        _backfill_model_columns(conn)
+        _backfill_model_columns(conn, force=True)
         conn.execute(
             "INSERT INTO arca_seed_imports(seed_hash,imported_at) VALUES(?,?)",
             (seed_hash, datetime.now().isoformat(timespec="seconds")),
         )
+        _record_seed_import_state(conn, fast_fingerprint, logical_fingerprint, seed_hash)
         items = conn.execute("SELECT COUNT(*) FROM arca_style_items").fetchone()[0] - before_items
         images = conn.execute("SELECT COUNT(*) FROM arca_style_images").fetchone()[0] - before_images
     return {"imported": True, "items": items, "images": images}
@@ -564,7 +749,7 @@ def _iso_date(value, name):
         raise ArcaCollectorError(f"{name} 형식은 YYYY-MM-DD여야 합니다.")
 
 
-def normalize_collect_payload(payload):
+def normalize_collect_payload(payload, *, allow_empty_keyword=False):
     payload = payload if isinstance(payload, dict) else {}
     today = date.today()
     start = _iso_date(payload.get("start_date", today.isoformat()), "start_date")
@@ -580,8 +765,12 @@ def normalize_collect_payload(payload):
         raise ArcaCollectorError("페이지와 글 수는 숫자여야 합니다.")
     if not 0 <= max_pages <= MAX_ARCHIVE_SEARCH_PAGE or max_posts < 0:
         raise ArcaCollectorError("페이지 또는 글 수 제한이 범위를 벗어났습니다.")
-    keyword = str(payload.get("keyword") or DEFAULT_KEYWORD).strip()
-    if not keyword or len(keyword) > 200:
+    raw_keyword = payload.get("keyword")
+    if allow_empty_keyword and raw_keyword is not None and not str(raw_keyword).strip():
+        keyword = ""
+    else:
+        keyword = str(raw_keyword or DEFAULT_KEYWORD).strip()
+    if (not keyword and not allow_empty_keyword) or len(keyword) > 200:
         raise ArcaCollectorError("검색어를 확인해 주세요.")
     return {"keyword": keyword, "tabs": tabs, "start_date": start.isoformat(), "end_date": end.isoformat(), "max_pages": max_pages, "max_posts": max_posts}
 
@@ -1747,8 +1936,14 @@ def extract_novelai_metadata(image_bytes, content_type=""):
     return base
 
 
-def revalidate_stored_metadata(db_path):
+def revalidate_stored_metadata(db_path, *, revision=METADATA_VALIDATION_REVISION):
     with closing(_connect(db_path)) as conn, conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS arca_maintenance_state "
+            "(name TEXT PRIMARY KEY, revision TEXT NOT NULL)"
+        )
+        if _maintenance_state_matches(conn, "stored_metadata", revision):
+            return False
         for table in ("arca_style_images", "arca_style_items"):
             rows = conn.execute(f"SELECT id,raw_metadata_json FROM {table} WHERE metadata_status='ok'").fetchall()
             for row in rows:
@@ -1776,6 +1971,8 @@ def revalidate_stored_metadata(db_path):
                         "UPDATE arca_style_items SET prompt=?,negative_prompt=?,model_id=?,model_family=?,model_generation=?,model_variant=?,complexity=?,quality_toggle=?,uc_preset=? WHERE id=?",
                         (prompt, negative, model_fields["model_id"], model_fields["model_family"], model_fields["model_generation"], model_fields["model_variant"], complexity, quality_toggle, uc_preset, row["id"]),
                     )
+        _record_maintenance_state(conn, "stored_metadata", revision)
+    return True
 
 
 def parse_body_prompt_fallback(text):
@@ -1827,6 +2024,10 @@ QUALITY_TAG_ALIASES = {
     "extremely detailed": "extremely detailed",
     "high detail": "high detail",
     "hyper detail": "hyper detail",
+    "best illustration": "best illustration",
+    "novel illustration": "novel illustration",
+    "simple illustration": "simple illustration",
+    "commission": "commission",
 }
 CHARACTER_CONTENT_TAGS = {
     "solo", "solo focus", "group", "couple", "multiple girls", "multiple boys",
@@ -2602,6 +2803,7 @@ def get_arca_image_gallery_page(db_path, offset=0, limit=60, image_dir=None, fil
                    image.content_type,image.metadata_status,image.prompt,image.base_prompt,
                    image.negative_prompt,image.character_prompts_json,image.seed,image.sampler,
                    image.steps,image.scale,image.cfg_rescale,image.noise_schedule,image.model,
+                   image.model_id,image.model_family,image.model_generation,image.model_variant,
                    image.width,image.height,image.raw_metadata_json,image.created_at,
                    item.title,item.source_url,item.board_tab,item.posted_at,
                    EXISTS(
@@ -2799,8 +3001,11 @@ def _prompt_preset_source_hash(row):
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def _indexed_prompt_preset_rows(db_path):
-    source_rows = _statistics_image_rows(db_path)
+def _indexed_prompt_preset_rows(db_path, filters=None):
+    filters = filters or {}
+    source_rows = _statistics_image_rows(db_path, filters)
+    model_filter = _requested_model_filter(filters)
+    model_filter_active = model_filter not in (None, "", "all")
     indexed_rows = []
     with closing(_connect(db_path)) as conn, conn:
         existing = {
@@ -2845,6 +3050,11 @@ def _indexed_prompt_preset_rows(db_path):
                 "excluded_tags": excluded_tags,
                 "parsed_artists": set(parsed_artists),
                 "recommendation_count": row["recommendation_count"],
+                "model": row["model"] or "",
+                "model_id": row["model_id"] or "",
+                "model_family": row["model_family"] or "unknown",
+                "model_generation": row["model_generation"] or "unknown",
+                "model_variant": row["model_variant"] or "unknown",
             })
         if upserts:
             conn.executemany(
@@ -2857,7 +3067,7 @@ def _indexed_prompt_preset_rows(db_path):
                     artists_json=excluded.artists_json,recommendation_count=excluded.recommendation_count""",
                 upserts,
             )
-        if existing:
+        if existing and not model_filter_active:
             conn.executemany(
                 "DELETE FROM arca_prompt_preset_index WHERE image_id=?",
                 ((image_id,) for image_id in existing),
@@ -2939,7 +3149,7 @@ def get_shared_style_dependency_images(db_path):
     return candidates
 
 
-def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
+def get_style_maker_prompt_presets(db_path, artists=None, limit=30, model_filter="all"):
     if not isinstance(artists, (list, tuple)):
         raise ArcaCollectorError("작가 목록을 확인해 주세요.")
     try:
@@ -2956,7 +3166,8 @@ def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
             selected_artists.add(canonical)
 
     grouped = {}
-    for row in _indexed_prompt_preset_rows(db_path):
+    filter_value = model_filter if model_filter not in (None, "") else "all"
+    for row in _indexed_prompt_preset_rows(db_path, {"model_filter": filter_value}):
         negative_prompt = row["negative_prompt"]
         base_prompt = row["base_prompt"]
         excluded_tags = row["excluded_tags"]
@@ -2980,6 +3191,11 @@ def get_style_maker_prompt_presets(db_path, artists=None, limit=30):
                 "remote_image_url": row["remote_image_url"],
                 "title": row["title"],
                 "source_url": row["source_url"],
+                "model": row["model"],
+                "model_id": row["model_id"],
+                "model_family": row["model_family"],
+                "model_generation": row["model_generation"],
+                "model_variant": row["model_variant"],
             },
         })
         entry["sample_count"] += 1
@@ -3281,8 +3497,18 @@ def delete_arca_style(db_path, image_dir, item_id):
     return {"deleted": True, "recollect_date": posted_at}
 
 
-def collect_arca_styles(db_path, image_dir, payload, job_id=None):
-    params = normalize_collect_payload(payload); init_arca_style_tables(db_path)
+def collect_arca_styles(
+    db_path,
+    image_dir,
+    payload,
+    job_id=None,
+    *,
+    allow_empty_keyword=False,
+    search_item_filter=None,
+):
+    if search_item_filter is not None and not callable(search_item_filter):
+        raise ArcaCollectorError("검색 결과 필터가 올바르지 않습니다.")
+    params = normalize_collect_payload(payload, allow_empty_keyword=allow_empty_keyword); init_arca_style_tables(db_path)
     start, end = date.fromisoformat(params["start_date"]), date.fromisoformat(params["end_date"])
     uncovered = uncovered_date_intervals(start, end, get_completed_coverage(db_path, params))
     if not uncovered:
@@ -3355,6 +3581,8 @@ def collect_arca_styles(db_path, image_dir, payload, job_id=None):
                             continue
                         posted_at = _search_item_date(search_item)
                         if posted_at and not interval_start <= posted_at <= interval_end:
+                            continue
+                        if search_item_filter is not None and not search_item_filter(search_item):
                             continue
                         seen.add(article_url)
                         search_items.append(search_item)

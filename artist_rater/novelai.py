@@ -80,9 +80,10 @@ def _http_error_detail(exc, app_key):
     return detail
 
 
-def combine_base_prompt(base_prompt, artist_prompt):
+def combine_base_prompt(base_prompt, artist_prompt, leading_prompt=""):
     return ", ".join(
         part for part in (
+            normalize_numeric_prompt_closers(leading_prompt).strip(),
             normalize_numeric_prompt_closers(artist_prompt).strip(),
             normalize_numeric_prompt_closers(base_prompt).strip(),
         ) if part
@@ -195,6 +196,7 @@ def normalize_generation_data(data):
     normalized.update(
         {
             "base_prompt": normalize_numeric_prompt_closers(_prompt_string(data, "base_prompt")),
+            "leading_prompt": normalize_numeric_prompt_closers(_prompt_string(data, "leading_prompt")),
             "quality_prompt": normalize_numeric_prompt_closers(_prompt_string(data, "quality_prompt")),
             "original_quality_prompt": normalize_numeric_prompt_closers(_prompt_string(data, "original_quality_prompt")),
             "fixed_prompt": normalize_numeric_prompt_closers(_prompt_string(data, "fixed_prompt")),
@@ -221,7 +223,7 @@ def normalize_generation_data(data):
 
 
 def combine_generation_prompt(data, artist_prompt):
-    combined = combine_base_prompt(data["base_prompt"], artist_prompt)
+    combined = combine_base_prompt(data["base_prompt"], artist_prompt, data.get("leading_prompt", ""))
     complexity_tag = COMPLEXITY_TAGS.get(data.get("complexity", ""), "")
     if complexity_tag:
         combined = ", ".join(part for part in (combined, complexity_tag) if part)

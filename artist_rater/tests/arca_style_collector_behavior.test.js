@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const {
   normalizeArcaPayload, arcaSummaryText, collectionProgress, durationText,
   etaText, collectionCountsText, groupTitle, promptSection,
@@ -33,6 +35,8 @@ const {
   hasArcaDependencyArtists,
   normalizeArcaModel,
   arcaModelDisplayName,
+  shouldOpenArcaCollectionPanel,
+  imageGenerationSettingsText,
   arcaStyleDetailQuery,
 } = require("../static/arca_style_collector.js");
 
@@ -45,6 +49,15 @@ test("Arca list query sends image-model filters without changing the all default
   assert.equal(arcaStyleDetailQuery("unknown").get("model"), "unknown");
   assert.equal(normalizeArcaModel("NovelAI Diffusion V5 Full"), "nai-diffusion-5-full");
   assert.equal(arcaModelDisplayName("nai-diffusion-5-curated"), "V5 Curated");
+});
+
+test("Arca model badges collapse NovelAI source build suffixes without mixing generations", () => {
+  assert.equal(normalizeArcaModel("NovelAI Diffusion V4.5 4BDE2A90"), "nai-diffusion-4-5-full");
+  assert.equal(normalizeArcaModel("NovelAI Diffusion V4.5 Curated 4BDE2A90"), "nai-diffusion-4-5-curated");
+  assert.equal(normalizeArcaModel("NovelAI Diffusion V5 4BDE2A90"), "nai-diffusion-5-full");
+  assert.equal(normalizeArcaModel("NovelAI Diffusion V5 Curated 4BDE2A90"), "nai-diffusion-5-curated");
+  assert.notEqual(normalizeArcaModel("NovelAI Diffusion V4.5 4BDE2A90"), "nai-diffusion-5-full");
+  assert.notEqual(normalizeArcaModel("NovelAI Diffusion V5 4BDE2A90"), "nai-diffusion-4-5-full");
 });
 
 test("empty collection dates default to the local calendar day", () => {
@@ -93,11 +106,12 @@ test("list query keeps paging size and minimum recommendations", () => {
   assert.equal(arcaListQuery({}).toString(), "q=&metadata=all&sort=posted_desc&page=1&per_page=50");
 });
 
-test("coverage query keeps repeated tabs and explains completed ranges", () => {
+test("coverage query keeps the selected keyword and repeated tabs", () => {
   const query = arcaCoverageQuery({
-    tabs: ["NAI", "R18_NAI"], start_date: "2026-07-01", end_date: "2026-07-12",
+    keyword: "  artist style ", tabs: ["NAI", "R18_NAI"], start_date: "2026-07-01", end_date: "2026-07-12",
     max_pages: 5, max_posts: 80,
   });
+  assert.equal(query.get("keyword"), "artist style");
   assert.deepEqual(query.getAll("tabs"), ["NAI", "R18_NAI"]);
   assert.equal(query.get("start_date"), "2026-07-01");
   assert.equal(arcaCoverageText({ coverage: [] }), "이 조건으로 완료한 수집 기록이 없습니다.");
@@ -168,6 +182,14 @@ test("statistics recommendation filters and sorting keep direct ranges", () => {
   assert.deepEqual(rows.map((entry) => entry.tag), ["artist:popular", "artist:common"]);
 });
 
+test("statistics model filters are omitted for all and passed to every statistics detail query", () => {
+  assert.equal(arcaStatisticsQuery({ model: "all" }).has("model"), false);
+  assert.equal(arcaStatisticsQuery({ model: "v5" }).get("model"), "v5");
+  assert.equal(arcaStatisticsQuery({ model: "v4.5" }).get("model"), "v4.5");
+  assert.equal(arcaTagDetailQuery("artist", "artist:foo", 12, { model: "v5" }).get("model"), "v5");
+  assert.equal(arcaSequenceDetailQuery(["masterpiece"], 30, { model: "v4.5" }).get("model"), "v4.5");
+});
+
 test("quality sequence detail query preserves tag order", () => {
   const query = arcaSequenceDetailQuery(["masterpiece", "best quality"], 30);
   assert.deepEqual(query.getAll("tag"), ["masterpiece", "best quality"]);
@@ -209,6 +231,12 @@ test("selected image projects into three readable prompt fields", () => {
   });
 });
 
+test("selected image generation settings stay readable when metadata is incomplete", () => {
+  assert.equal(imageGenerationSettingsText({ sampler: "k_euler_ancestral", steps: 28, scale: 5, cfg_rescale: 0.3 }), "Sampler: k_euler_ancestral · Steps: 28 · CFG Scale: 5 · CFG Rescale: 0.3");
+  assert.equal(imageGenerationSettingsText({ sampler: "", steps: null, scale: null, cfg_rescale: "" }), "Sampler: Unknown · Steps: ? · CFG Scale: ? · CFG Rescale: ?");
+  assert.equal(imageGenerationSettingsText({ sampler: "euler", steps: 0, scale: 0, cfg_rescale: 0 }), "Sampler: euler · Steps: 0 · CFG Scale: 0 · CFG Rescale: 0");
+});
+
 test("direct URL payload trims one article link", () => {
   assert.deepEqual(normalizeArcaUrlPayload("  https://arca.live/b/aiart/174457459  "), {
     source_url: "https://arca.live/b/aiart/174457459",
@@ -220,10 +248,12 @@ test("summary explains when an existing search was skipped", () => {
   assert.equal(arcaSummaryText({ error: "partial collection" }), "partial collection");
 });
 
-test("collection payload keeps fixed search without page or post limits", () => {
+test("collection payload defaults and preserves the user search without page or post limits", () => {
   assert.deepEqual(normalizeArcaPayload({ tabs: ["NAI"], start_date: "2026-01-01", end_date: "2026-01-02" }), {
     keyword: "그림체 공유", tabs: ["NAI"], start_date: "2026-01-01", end_date: "2026-01-02", max_pages: 0, max_posts: 0,
   });
+  assert.equal(normalizeArcaPayload({ keyword: "  artist style ", tabs: ["NAI"] }).keyword, "artist style");
+  assert.equal(normalizeArcaPayload({ keyword: "   ", tabs: ["NAI"] }).keyword, "그림체 공유");
 });
 
 test("collection progress handles known and unknown totals", () => {
@@ -246,6 +276,22 @@ test("collection progress handles known and unknown totals", () => {
   assert.equal(collectionCountsText({ job_type: "image_archive", stage: "downloading_archive", progress: { bytes: [1024, 2048], posts: [0, 1687] } }), "ZIP 다운로드 1.00 KB/2.00 KB");
   assert.equal(collectionCountsText({ job_type: "image_archive", stage: "extracting_archive", progress: { posts: [500, 1687], images: 499 } }), "압축 해제 500/1687 · 준비 499장");
   assert.equal(arcaSummaryText({ job_type: "image_archive", downloaded_images: 1687 }), "공유 그림체 이미지 1687장을 ZIP에서 설치했습니다.");
+});
+
+test("collection panel stays open while active and can close after completion", () => {
+  for (const status of ["queued", "running", "pause_requested", "paused", "stop_requested"]) {
+    assert.equal(shouldOpenArcaCollectionPanel(status), true);
+  }
+  for (const status of ["completed", "failed", "interrupted", "stopped", "idle"]) {
+    assert.equal(shouldOpenArcaCollectionPanel(status), false);
+  }
+});
+
+test("Arca prompt editors bind only editable prompt fields to the shared autocomplete", () => {
+  const source = fs.readFileSync(path.join(__dirname, "../static/arca_style_collector.js"), "utf8");
+  assert.ok(source.includes('["arcaEditPrompt", "arcaEditNegativePrompt"]'));
+  assert.ok(source.includes("globalThis.promptTagAutocomplete?.bind?.(input)"));
+  assert.ok(source.includes("globalThis.promptTagAutocomplete?.hide?.()"));
 });
 
 test("style group helpers separate prompt sections", () => {

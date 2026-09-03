@@ -16,9 +16,10 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
             'id="arcaImageArchiveFile"', 'id="arcaImageArchiveStatus"',
             'id="confirmRestoreArcaImages"', 'id="cancelRestoreArcaImages"',
             'id="arcaSearchCoverage"', 'id="arcaStyleList"',
+            'id="arcaCollectorPanel"', 'id="arcaKeyword"',
             'id="arcaStyleDialog"', 'id="saveArcaStyle"', 'id="deleteArcaStyle"',
             'id="arcaStyleSourceLink"',
-            'id="arcaCollectionState"', 'id="arcaCollectionProgress"',
+            'id="arcaCollectionProgressPanel"', 'id="arcaCollectionState"', 'id="arcaCollectionProgress"',
             'id="arcaCollectionCounts"', 'id="arcaCollectionElapsed"', 'id="arcaCollectionEta"',
             'id="pauseArcaCollection"', 'id="resumeArcaCollection"', 'id="stopArcaCollection"',
             'id="arcaDirectUrl"', 'id="collectArcaUrl"',
@@ -33,6 +34,7 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
             'id="arcaStyleStatisticsStatus"',
             'id="arcaRecommendationPreset"', 'id="arcaRecommendationMin"',
             'id="arcaRecommendationMax"', 'id="applyArcaRecommendationFilter"',
+            'id="arcaStatisticsModelFilter"', 'value="v5"', 'value="v4.5"',
             'id="arcaArtistStatisticsRows"', 'id="arcaQualityStatisticsRows"',
             'id="arcaArtistWeightRange"', 'id="arcaArtistStatisticsPageSize"',
             'id="arcaQualityWeightRange"', 'id="arcaQualityStatisticsPageSize"',
@@ -53,7 +55,8 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
             "arca_style_collector.js",
         ):
             self.assertIn(marker, html)
-        self.assertNotIn('id="arcaKeyword"', html)
+        self.assertIn('value="그림체 공유"', html)
+        self.assertIn("입력한 검색어가 포함된 제목만 검색합니다.", html)
         self.assertNotIn('id="arcaMaxPages"', html)
         self.assertNotIn('id="arcaMaxPosts"', html)
         self.assertIn("먼저 아래 버튼으로 필요한 용량과 시간을 확인하세요", html)
@@ -61,6 +64,10 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
         self.assertIn(".arca-collector-panel", css)
         self.assertIn("overflow-y: auto", css)
+        self.assertIn(".arca-collector-panel-body", css)
+        self.assertIn(".arca-collector-panel:not([open]) { width: fit-content", css)
+        self.assertIn(".arca-collector-panel:not([open]) > summary { overflow-wrap: anywhere; font-size: 0; }", css)
+        self.assertIn(".arca-collector-panel:not([open]) > summary::marker { font-size: 1rem; }", css)
 
     def test_archive_script_uses_safe_dom_and_required_operations(self):
         source = (ROOT / "static" / "arca_style_collector.js").read_text(encoding="utf-8")
@@ -74,9 +81,12 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
             "loadArcaBrowserSession", "importArcaBrowserSession",
             "setupArcaSessionBridge", "loadArcaSearchCoverage", "loadArcaStyleStatistics",
             "renderArcaPagination", "applyArcaCardSize", "goToArcaPage",
+            "shouldOpenArcaCollectionPanel",
         ):
             self.assertIn(f"function {marker}", source)
         self.assertIn("arca-image-prompt-card", source)
+        self.assertIn("arca-style-thumb-button", source)
+        self.assertIn("openArcaStyle(item.id)", source)
         self.assertIn("베이스", source)
         self.assertIn("네거티브", source)
         self.assertIn("캐릭터", source)
@@ -104,6 +114,8 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertNotIn("data-arca-tag-view", html)
         self.assertIn("randomArcaStatisticsSamples", source)
         self.assertIn("arcaStatisticsQuery", source)
+        self.assertIn('model: arcaEl("arcaStatisticsModelFilter")?.value', source)
+        self.assertIn('arcaEl("arcaStatisticsModelFilter")?.addEventListener("change"', source)
         self.assertIn("recommendation_desc", source + html)
         self.assertIn("loadCurrentArcaCollectionJob", source)
         self.assertIn("controlArcaCollection", source)
@@ -131,6 +143,8 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn(".arca-statistics-sample-gallery", css)
         self.assertIn(".arca-statistics-content", css)
         self.assertIn(".arca-recommendation-filter", css)
+        self.assertIn("grid-template-columns: minmax(180px, 1.35fr) repeat(3, minmax(140px, 1fr)) auto", css)
+        self.assertIn("@media (max-width: 700px) { .arca-recommendation-filter { grid-template-columns: 1fr 1fr; }", css)
         self.assertIn(".arca-statistics-sort-button", css)
         self.assertIn(".arca-statistic-inline-image", css)
         self.assertIn("grid-template-columns: 92px", css)
@@ -145,9 +159,31 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn(".arca-collection-control-actions", css)
         self.assertIn("--arca-card-height: 220px", css)
         self.assertIn('.arca-style-list[data-card-size="small"] .arca-style-card', css)
-        self.assertIn("aspect-ratio: 1 / 1", css)
+        self.assertIn("aspect-ratio: auto", css)
+        self.assertIn(".arca-style-list[data-card-size=\"small\"] .arca-style-actions button", css)
+        self.assertIn(".arca-style-collector-view.active:has(.arca-collector-panel:not([open]))", css)
         self.assertIn(".arca-style-pagination", css)
         self.assertNotIn(".arca-style-list-scroll { overflow: visible;", css)
+
+    def test_collection_search_keyword_and_coverage_actions_have_separate_contracts(self):
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<details id="arcaCollectorPanel" class="arca-collector-panel panel" open>', html)
+        self.assertIn("<summary>그림체 수집</summary>", html)
+        self.assertIn('<div class="arca-collector-panel-body">', html)
+        self.assertIn('<div id="arcaSearchCoverage" class="status arca-search-coverage"></div>', html)
+        self.assertIn('<div class="arca-collection-actions">', html)
+
+        source = (ROOT / "static" / "arca_style_collector.js").read_text(encoding="utf-8")
+        self.assertIn('keyword: arcaEl("arcaKeyword")?.value', source)
+        self.assertIn('arcaEl("arcaKeyword")?.addEventListener("input", scheduleArcaSearchCoverage)', source)
+        self.assertIn('keyword: String(value.keyword || "그림체 공유").trim() || "그림체 공유"', source)
+
+    def test_arca_edit_prompts_use_shared_autocomplete_and_close_hides_it(self):
+        source = (ROOT / "static" / "arca_style_collector.js").read_text(encoding="utf-8")
+        self.assertIn('"arcaEditPrompt", "arcaEditNegativePrompt"', source)
+        self.assertIn("globalThis.promptTagAutocomplete?.bind?.(input)", source)
+        self.assertIn("globalThis.promptTagAutocomplete?.hide?.()", source)
+        self.assertNotIn('"arcaEditMemo"', source[source.index('"arcaEditPrompt", "arcaEditNegativePrompt"'):source.index('"arcaEditPrompt", "arcaEditNegativePrompt"') + 100])
 
     def test_image_level_model_filter_contract(self):
         html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
@@ -167,6 +203,19 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
             self.assertIn(marker, source)
         css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
         self.assertIn(".arca-image-choice .model-badge", css)
+
+    def test_collection_filters_and_progress_can_collapse_compactly(self):
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<details id="arcaStyleFilters" class="panel arca-style-filters" open>', html)
+        self.assertIn("<summary>목록 검색과 필터</summary>", html)
+        self.assertIn('<div class="arca-style-filter-fields">', html)
+        css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+        self.assertIn("grid-template-columns: minmax(180px, 2fr) repeat(6, minmax(90px, 1fr))", css)
+        self.assertIn(".arca-collection-progress:not([open])", css)
+        self.assertIn("padding: 5px 10px", css)
+        self.assertIn("--arca-card-height: 190px", css)
+        self.assertIn("--arca-card-height: 170px", css)
+        self.assertIn("--arca-card-height: 220px", css)
 
 
 if __name__ == "__main__":

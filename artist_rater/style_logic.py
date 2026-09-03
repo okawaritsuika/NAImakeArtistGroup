@@ -70,6 +70,141 @@ def exact_score(value, error_message="평점은 1부터 5 사이의 정수여야
     return score
 
 
+def normalize_artist_key(value):
+    """Return the existing artist-tag matching form used by source stores."""
+    return " ".join(str(value or "").replace("_", " ").split()).casefold()
+
+
+def score_bucket(value):
+    """Apply the style maker's historical half-up 1~5 score bucket."""
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise ValueError("평점은 유한한 숫자여야 합니다.")
+    return max(1, min(5, int(math.floor(numeric + 0.5))))
+
+
+def _valid_score(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return numeric if math.isfinite(numeric) and 1 <= numeric <= 5 else None
+
+
+def merge_artist_sources(sources):
+    """Merge source memberships and score contributions without database access.
+
+    Each source is a mapping with ``source_type``, ``source_id`` and an
+    ``artists`` list.  An artist may provide a direct ``score`` or an explicit
+    ``contributions`` list.  Explicit contributions are used by style groups
+    so their connected rating/NAI sources, rather than the group itself, are
+    recorded as provenance.
+    """
+    buckets = {}
+    source_priority = {"rating_management": 0, "nai_test": 1, "style_group": 2}
+
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        source_type = str(source.get("source_type") or "").strip().lower()
+        source_id = str(source.get("source_id") or "").strip()
+        source_label = str(source.get("label") or "").strip()
+        priority = source_priority.get(source_type, 99)
+        for artist in source.get("artists") or []:
+            if not isinstance(artist, dict):
+                continue
+            display = str(
+                artist.get("artist_tag") or artist.get("artist") or artist.get("artist_key") or ""
+            ).strip()
+            key = normalize_artist_key(artist.get("artist_key") or display)
+            if not key:
+                continue
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "artist_key": key,
+                    "artist": display or key,
+                    "artist_tag": display or key,
+                    "_display_priority": priority,
+                    "_contributions": {},
+                    "_metadata": {},
+                    "_image_count": 0,
+                },
+            )
+            if display and priority < bucket["_display_priority"]:
+                bucket["artist"] = display
+                bucket["artist_tag"] = display
+                bucket["_display_priority"] = priority
+            image_count = artist.get("image_count")
+            if isinstance(image_count, (int, float)) and not isinstance(image_count, bool) and math.isfinite(float(image_count)):
+                bucket["_image_count"] = max(bucket["_image_count"], int(image_count))
+            metadata = artist.get("metadata")
+            if isinstance(metadata, dict) and priority < bucket.get("_metadata_priority", 99):
+                bucket["_metadata"] = dict(metadata)
+                bucket["_metadata_priority"] = priority
+
+            contributions = artist.get("contributions")
+            if contributions is None:
+                contributions = []
+                if source_type != "style_group" and "score" in artist:
+                    contributions.append({
+                        "origin_type": source_type,
+                        "origin_id": source_id,
+                        "label": source_label,
+                        "score": artist.get("score"),
+                    })
+            for contribution in contributions:
+                if not isinstance(contribution, dict):
+                    continue
+                origin_type = str(contribution.get("origin_type", contribution.get("source_type", source_type)) or "").strip().lower()
+                origin_id = str(contribution.get("origin_id", contribution.get("source_id", source_id)) or "").strip()
+                provenance = (origin_type, origin_id, key)
+                numeric = _valid_score(contribution.get("score"))
+                if numeric is None or provenance in bucket["_contributions"]:
+                    continue
+                bucket["_contributions"][provenance] = {
+                    "score": numeric,
+                    "source_type": origin_type,
+                    "source_id": origin_id,
+                    "label": str(contribution.get("label") or source_label).strip(),
+                }
+
+    result = []
+    for key in sorted(buckets):
+        bucket = buckets[key]
+        contributions = list(bucket["_contributions"].values())
+        if not contributions:
+            continue
+        raw_score = sum(item["score"] for item in contributions) / len(contributions)
+        item = {
+            "artist_key": key,
+            "artist": bucket["artist"],
+            "artist_tag": bucket["artist_tag"],
+            "score": score_bucket(raw_score),
+            "score_bucket": score_bucket(raw_score),
+            "raw_score": raw_score,
+            "image_count": bucket["_image_count"],
+            "score_sources": [
+                {
+                    "source_type": contribution["source_type"],
+                    "source_id": contribution["source_id"],
+                    "label": contribution["label"],
+                }
+                for contribution in contributions
+            ],
+        }
+        item.update(bucket["_metadata"])
+        result.append(item)
+    return result
+
+
+# Descriptive aliases keep the pure API discoverable to callers and tests.
+merge_style_artist_sources = merge_artist_sources
+artist_score_bucket = score_bucket
+
+
 def select_artists(pool, count, allowed_scores, rng_seed=None):
     try:
         requested_count = _integer_value(count, "선택 가능한 작가 수를 확인하세요.")

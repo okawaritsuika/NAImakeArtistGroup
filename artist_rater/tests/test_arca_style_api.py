@@ -9,17 +9,38 @@ import app
 class ArcaStyleApiTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.old_db = app.DB_PATH
-        self.old_images = app.ARCA_STYLE_IMAGE_DIR
-        app.DB_PATH = Path(self.temp.name) / "test.sqlite"
-        app.ARCA_STYLE_IMAGE_DIR = Path(self.temp.name) / "images"
+        self.data_dir = Path(self.temp.name)
+        self.old_testing = app.app.config.get("TESTING")
+        self.originals = {
+            name: getattr(app, name)
+            for name in (
+                "DATA_DIR", "THUMBNAIL_DIR", "GENERATED_DIR",
+                "CONFIRMED_STYLE_IMAGE_DIR", "COMPARISON_IMAGE_DIR",
+                "ARCA_STYLE_IMAGE_DIR", "SETTINGS_JSON_PATH", "DB_PATH",
+                "ARCA_STYLE_SEED_PATH", "MERGE_SOURCE_DIRS",
+            )
+        }
+        app.DATA_DIR = self.data_dir
+        app.THUMBNAIL_DIR = self.data_dir / "thumbnails"
+        app.GENERATED_DIR = self.data_dir / "generated"
+        app.CONFIRMED_STYLE_IMAGE_DIR = self.data_dir / "confirmed_style_images"
+        app.COMPARISON_IMAGE_DIR = self.data_dir / "comparison_images"
+        app.ARCA_STYLE_IMAGE_DIR = self.data_dir / "arca_style_images"
+        app.SETTINGS_JSON_PATH = self.data_dir / "settings.json"
+        app.DB_PATH = self.data_dir / "test.sqlite"
+        app.ARCA_STYLE_SEED_PATH = self.data_dir / "missing-seed.sqlite"
+        app.MERGE_SOURCE_DIRS = []
         app.init_db()
         app.app.config["TESTING"] = True
         self.client = app.app.test_client()
 
     def tearDown(self):
-        app.DB_PATH = self.old_db
-        app.ARCA_STYLE_IMAGE_DIR = self.old_images
+        for name, value in self.originals.items():
+            setattr(app, name, value)
+        if self.old_testing is None:
+            app.app.config.pop("TESTING", None)
+        else:
+            app.app.config["TESTING"] = self.old_testing
         self.temp.cleanup()
 
     @patch("app.start_collection_job")

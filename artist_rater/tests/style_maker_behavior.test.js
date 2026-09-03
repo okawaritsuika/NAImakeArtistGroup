@@ -31,6 +31,8 @@ const {
   currentPromptTagFragment,
   replaceCurrentPromptTagFragment,
   formatPromptAutocompleteTag,
+  bindPromptTagAutocomplete,
+  hidePromptTagAutocomplete,
   parsePromptTokens,
   appendUniquePromptToken,
   removePromptToken,
@@ -86,9 +88,11 @@ const {
   novelAiModelBadgeClass,
   normalizeNovelAiComplexity,
   novelAiModelFilterMatches,
+  novelAiModelFilterMatchesItem,
   normalizeNovelAiUsage,
   formatNovelAiUsageCountdown,
   shouldRefreshNovelAiUsageAfterGeneration,
+  normalizeArtistSourceDescriptors,
 } = require("../static/style_maker.js");
 
 test("NovelAI model definitions keep V5/V4.5 limits and complexity capability", () => {
@@ -109,6 +113,25 @@ test("model filters distinguish exact, family, and unknown records", () => {
   assert.equal(novelAiModelFilterMatches("nai-diffusion-3", "v4.5"), false);
   assert.equal(novelAiModelFilterMatches("old-model", "unknown"), true);
   assert.equal(novelAiModelFilterMatches("nai-diffusion-5-full", "nai-diffusion-5-curated"), false);
+});
+
+test("shared style manager uses normalized DB generation for V5 source builds", () => {
+  const sourceBuild = {
+    model: "NovelAI Diffusion V5 4BDE2A90",
+    model_id: "",
+    model_family: "v5",
+    model_generation: "v5",
+    model_variant: "unknown",
+  };
+  assert.equal(novelAiModelFilterMatchesItem(sourceBuild, "v5"), true);
+  assert.equal(novelAiModelFilterMatchesItem(sourceBuild, "nai-diffusion-5-full"), false);
+  assert.equal(
+    novelAiModelFilterMatchesItem(
+      { ...sourceBuild, model_id: "nai-diffusion-5-curated", model_variant: "curated" },
+      "nai-diffusion-5-curated",
+    ),
+    true,
+  );
 });
 
 test("model switching preserves V5 complexity while omitting it for V4.5 requests", () => {
@@ -638,6 +661,7 @@ test("prompt storage keeps one normalized snapshot", () => {
     {
       base_prompt: " base ",
       fixed_prompt: "",
+      leading_prompt: "",
       negative_prompt: " negative ",
       character_prompts: [" char one ", "", " char two "],
       character_prompt_ids: ["character-1", "character-2", "character-3"],
@@ -650,6 +674,7 @@ test("prompt storage keeps one normalized snapshot", () => {
     {
       base_prompt: "base",
       fixed_prompt: "",
+      leading_prompt: "",
       negative_prompt: "neg",
       character_prompts: ["a", "b"],
       character_prompt_ids: ["character-1", "character-2"],
@@ -660,6 +685,7 @@ test("prompt storage keeps one normalized snapshot", () => {
   assert.deepEqual(normalizeStoredPrompts(null), {
     base_prompt: "",
     fixed_prompt: "",
+    leading_prompt: "",
     negative_prompt: "",
     character_prompts: [""],
     character_prompt_ids: ["character-1"],
@@ -688,6 +714,60 @@ test("fixed prompt tags persist separately and follow quality tags", () => {
   assert.equal(combinePromptSections("", "white sheet"), "white sheet");
 });
 
+test("artist source descriptors reject empty, duplicate, and unknown sources", () => {
+  assert.deepEqual(
+    normalizeArtistSourceDescriptors([], { allowEmpty: true }),
+    [],
+  );
+  assert.throws(
+    () => normalizeArtistSourceDescriptors([]),
+    /하나 이상/,
+  );
+  assert.throws(
+    () => normalizeArtistSourceDescriptors([
+      { source_type: "nai_test", source_id: "12" },
+      { source_type: "nai_test", source_id: "12" },
+    ]),
+    /중복/,
+  );
+  assert.throws(
+    () => normalizeArtistSourceDescriptors([{ source_type: "unknown", source_id: "1" }]),
+    /확인/,
+  );
+});
+
+test("style maker request payload carries artist source descriptors", () => {
+  const artistSources = [
+    { source_type: "rating_management", source_id: "all" },
+    { source_type: "style_group", source_id: "4" },
+  ];
+  const payload = buildStyleRequestPayload(
+    { count: 1, artist_sources: artistSources },
+    [],
+    "all",
+  );
+
+  assert.deepEqual(payload.artist_sources, artistSources);
+});
+
+test("toggling a source loads its focused detail through the cached loader", () => {
+  const start = styleMakerSource.indexOf("function toggleArtistSource");
+  const end = styleMakerSource.indexOf("function focusArtistSource", start);
+  const toggleSource = styleMakerSource.slice(start, end);
+  assert.match(toggleSource, /loadArtistSourceDetail\(source\)/);
+  assert.match(
+    styleMakerSource.slice(end, styleMakerSource.indexOf("function renderArtistSourceList", end)),
+    /if \(load\) void loadArtistSourceDetail\(source\)/,
+  );
+});
+
+test("leading prompt persists and is placed before artist and base sections", () => {
+  const stored = promptStoragePayload("quality", "negative", ["character"], [], [], {}, "fixed", "style prefix");
+  assert.equal(stored.leading_prompt, "style prefix");
+  assert.equal(normalizeStoredPrompts({ base_prompt: "quality" }).leading_prompt, "");
+  assert.ok(styleMakerSource.includes("leading_prompt: leadingPrompt"));
+});
+
 test("fixed prompt autocomplete searches and replaces only the tag at the caret", () => {
   assert.equal(currentPromptTagFragment("upper_body, white sh", 20), "white_sh");
   assert.equal(currentPromptTagFragment("upper_body, wh sheet, solo", 14), "wh");
@@ -707,6 +787,14 @@ test("prompt autocomplete prefixes artist tags only in prompt fields", () => {
   assert.equal(formatPromptAutocompleteTag({ name: "white_sheet", category: 0 }), "white sheet");
   assert.equal(formatPromptAutocompleteTag({ name: "some_character", category: 4 }), "some character");
   assert.equal(formatPromptAutocompleteTag({ name: "some_artist", category: 1 }, false), "some artist");
+});
+
+test("prompt autocomplete exposes a reusable global API and category-aware query path", () => {
+  assert.equal(globalThis.promptTagAutocomplete.bind, bindPromptTagAutocomplete);
+  assert.equal(globalThis.promptTagAutocomplete.hide, hidePromptTagAutocomplete);
+  assert.match(styleMakerSource, /input\.dataset\.autocompleteCategory/);
+  assert.match(styleMakerSource, /\$\{categoryQuery\}/);
+  assert.ok(styleMakerSource.includes("/^\\{\\{\\s*artist\\s*\\}\\}$/i"));
 });
 
 test("prompt storage preserves generation settings from the website", () => {

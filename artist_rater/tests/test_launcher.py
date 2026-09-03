@@ -38,8 +38,101 @@ class FakeResponse:
 
 
 class LauncherControllerTest(unittest.TestCase):
+    def test_data_directory_options_allow_repeated_sources_and_primary_selection(self):
+        data_dirs, primary = launcher.parse_data_directory_options(
+            ["--data-dir", "C:/one", "--data-dir", "C:/two", "--primary-data-dir", "C:/two"]
+        )
+        self.assertEqual(data_dirs, [Path("C:/one").resolve(), Path("C:/two").resolve()])
+        self.assertEqual(primary, Path("C:/two").resolve())
+        self.assertTrue(
+            launcher.has_data_directory_options(
+                ["--data-dir=C:/one", "--primary-data-dir=C:/two"]
+            )
+        )
+
+    def test_source_launcher_command_passes_selected_data_directories_to_server(self):
+        launched = []
+        controller = launcher.LauncherController(
+            app_dir=Path("C:/App"),
+            data_dirs=[Path("C:/one"), Path("C:/two")],
+            primary_data_dir=Path("C:/two"),
+            popen=lambda command, **kwargs: launched.append(command) or FakeProcess(),
+        )
+        controller.start_server()
+        self.assertEqual(
+            launched[0][2:],
+            ["--data-dir", str(Path("C:/one").resolve()), "--data-dir", str(Path("C:/two").resolve()), "--primary-data-dir", str(Path("C:/two").resolve())],
+        )
+
+    def test_data_directory_controller_adds_without_duplicates_and_sets_primary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = launcher.LauncherController(
+                data_dirs=[Path("C:/one"), Path("C:/two")],
+                primary_data_dir=Path("C:/one"),
+                launcher_settings_dir=Path(temp_dir),
+            )
+
+            self.assertFalse(controller.add_data_directory("C:/ONE"))
+            self.assertTrue(controller.add_data_directory("C:/three"))
+            self.assertTrue(controller.set_primary_data_directory("C:/three"))
+            self.assertEqual(controller.data_dir, Path("C:/three").resolve())
+            self.assertEqual(controller.primary_data_dir, Path("C:/three").resolve())
+            self.assertEqual(len(controller.data_dirs), 3)
+
+    def test_data_directory_controller_removes_primary_by_promoting_another(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = launcher.LauncherController(
+                data_dirs=[Path("C:/one"), Path("C:/two")],
+                primary_data_dir=Path("C:/one"),
+                launcher_settings_dir=Path(temp_dir),
+            )
+
+            self.assertTrue(controller.remove_data_directory("C:/one"))
+            self.assertEqual(controller.data_dirs, [Path("C:/two").resolve()])
+            self.assertEqual(controller.primary_data_dir, Path("C:/two").resolve())
+            self.assertEqual(controller.data_dir, Path("C:/two").resolve())
+            with self.assertRaises(ValueError):
+                controller.remove_data_directory("C:/two")
+
+    def test_data_directory_mutations_roll_back_when_settings_save_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = launcher.LauncherController(
+                data_dirs=[Path("C:/one"), Path("C:/two")],
+                primary_data_dir=Path("C:/one"),
+                launcher_settings_dir=Path(temp_dir),
+            )
+            controller._save_data_configuration = lambda: (_ for _ in ()).throw(OSError("read-only"))
+
+            with self.assertRaises(OSError):
+                controller.add_data_directory("C:/three")
+            self.assertEqual(controller.data_dirs, [Path("C:/one").resolve(), Path("C:/two").resolve()])
+
+            with self.assertRaises(OSError):
+                controller.set_primary_data_directory("C:/two")
+            self.assertEqual(controller.primary_data_dir, Path("C:/one").resolve())
+
+            with self.assertRaises(OSError):
+                controller.remove_data_directory("C:/two")
+            self.assertEqual(controller.data_dirs, [Path("C:/one").resolve(), Path("C:/two").resolve()])
+
+    def test_data_directory_controller_blocks_changes_while_server_runs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            controller = launcher.LauncherController(
+                data_dirs=[Path("C:/one")],
+                launcher_settings_dir=Path(temp_dir),
+                popen=lambda command, **kwargs: FakeProcess(),
+            )
+            controller.start_server()
+
+            with self.assertRaises(RuntimeError):
+                controller.add_data_directory("C:/two")
+            with self.assertRaises(RuntimeError):
+                controller.set_primary_data_directory("C:/one")
+            with self.assertRaises(RuntimeError):
+                controller.remove_data_directory("C:/one")
+
     def test_packaged_version_matches_next_release(self):
-        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.7")
+        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.8")
 
     def test_independent_frozen_environment_removes_parent_bootloader_state(self):
         env = launcher.independent_frozen_environment({
@@ -146,6 +239,83 @@ class LauncherControllerTest(unittest.TestCase):
             self.assertEqual(controller.load_settings(), {"auto_open_site": True})
             self.assertEqual(json.loads((data_dir / launcher.LAUNCHER_SETTINGS_NAME).read_text(encoding="utf-8")), {"auto_open_site": True})
 
+    def test_data_configuration_roundtrip_keeps_auto_open_setting(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings_dir = root / "default-data"
+            first = root / "one"
+            second = root / "two"
+            controller = launcher.LauncherController(
+                data_dir=first,
+                launcher_settings_dir=settings_dir,
+            )
+
+            controller.set_auto_open_site(True)
+            self.assertTrue(controller.add_data_directory(second))
+            self.assertTrue(controller.set_primary_data_directory(second))
+
+            saved = json.loads((settings_dir / launcher.LAUNCHER_SETTINGS_NAME).read_text(encoding="utf-8"))
+            self.assertEqual(saved["auto_open_site"], True)
+            self.assertEqual(saved["data_dirs"], [str(first.resolve()), str(second.resolve())])
+            self.assertEqual(saved["primary_data_dir"], str(second.resolve()))
+
+            restarted = launcher.LauncherController(launcher_settings_dir=settings_dir)
+            self.assertEqual(restarted.data_dirs, [first.resolve(), second.resolve()])
+            self.assertEqual(restarted.primary_data_dir, second.resolve())
+            self.assertTrue(restarted.load_settings()["auto_open_site"])
+
+    def test_explicit_cli_style_configuration_takes_precedence_over_saved_configuration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings_dir = root / "default-data"
+            saved = root / "saved"
+            override = root / "override"
+            settings_dir.mkdir()
+            (settings_dir / launcher.LAUNCHER_SETTINGS_NAME).write_text(
+                json.dumps({
+                    "auto_open_site": True,
+                    "data_dirs": [str(saved)],
+                    "primary_data_dir": str(saved),
+                }),
+                encoding="utf-8",
+            )
+            data_dirs, primary = launcher.parse_data_directory_options(
+                ["--data-dir", str(override), "--primary-data-dir", str(override)],
+                default_data_dir=settings_dir,
+            )
+            controller = launcher.LauncherController(
+                data_dirs=data_dirs,
+                primary_data_dir=primary,
+                launcher_settings_dir=settings_dir,
+            )
+            self.assertEqual(controller.data_dirs, [override.resolve()])
+            self.assertEqual(controller.primary_data_dir, override.resolve())
+
+    def test_invalid_saved_data_configuration_falls_back_to_default_without_deleting_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            settings_dir = root / "default-data"
+            settings_dir.mkdir()
+            settings_path = settings_dir / launcher.LAUNCHER_SETTINGS_NAME
+            settings_path.write_text(
+                json.dumps({
+                    "auto_open_site": True,
+                    "data_dirs": [str(root / "missing"), str(root / "missing")],
+                    "primary_data_dir": str(root / "other"),
+                }),
+                encoding="utf-8",
+            )
+            controller = launcher.LauncherController(launcher_settings_dir=settings_dir)
+            self.assertEqual(controller.data_dirs, [settings_dir.resolve()])
+            self.assertEqual(controller.primary_data_dir, settings_dir.resolve())
+            self.assertTrue(settings_path.exists())
+
+    def test_data_directory_ui_is_collapsed_by_default_and_has_toggle(self):
+        source = Path(launcher.__file__).read_text(encoding="utf-8")
+        self.assertIn('self.data_card_expanded = False', source)
+        self.assertIn('text="펼치기"', source)
+        self.assertIn('def toggle_data_directory_card(self):', source)
+
     def test_wait_for_server_uses_local_app_url(self):
         requested = []
 
@@ -154,8 +324,38 @@ class LauncherControllerTest(unittest.TestCase):
             return FakeResponse(b"ok")
 
         controller = launcher.LauncherController(urlopen=open_local)
-        self.assertTrue(controller.wait_for_server(timeout_seconds=1))
+        controller.process = FakeProcess()
+        self.assertTrue(controller.wait_for_server())
         self.assertEqual(requested, [launcher.APP_URL])
+
+    def test_wait_for_server_retries_until_server_is_ready(self):
+        attempts = []
+
+        def open_local(request, timeout=0):
+            attempts.append(request.full_url)
+            if len(attempts) < 3:
+                raise OSError("server is still starting")
+            return FakeResponse(b"ok")
+
+        controller = launcher.LauncherController(urlopen=open_local)
+        controller.process = FakeProcess()
+        self.assertTrue(controller.wait_for_server(interval_seconds=0))
+        self.assertEqual(attempts, [launcher.APP_URL, launcher.APP_URL, launcher.APP_URL])
+
+    def test_wait_for_server_stops_retrying_when_server_process_exits(self):
+        attempts = []
+        process = FakeProcess()
+
+        def open_local(request, timeout=0):
+            attempts.append(request.full_url)
+            process.returncode = 1
+            raise OSError("server stopped while starting")
+
+        controller = launcher.LauncherController(urlopen=open_local)
+        controller.process = process
+
+        self.assertFalse(controller.wait_for_server(interval_seconds=0))
+        self.assertEqual(attempts, [launcher.APP_URL])
 
     def test_window_close_stops_server_before_destroying_root(self):
         events = []

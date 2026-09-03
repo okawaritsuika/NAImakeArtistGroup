@@ -75,6 +75,7 @@ from arca_style_collector import (
     collect_arca_style_url,
     collect_arca_styles,
     export_arca_style_seed,
+    DEFAULT_KEYWORD,
 )
 
 
@@ -230,6 +231,22 @@ class ArcaCollectorTest(unittest.TestCase):
         with closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_collection_runs").fetchone()[0], 0)
 
+    def test_empty_keyword_collection_keeps_r18_session_guard(self):
+        with self.assertRaises(ArcaBrowserSessionRequired):
+            collect_arca_styles(
+                self.db_path,
+                Path(self.temp.name) / "images",
+                {
+                    "keyword": "",
+                    "start_date": "2026-06-20",
+                    "end_date": "2026-06-21",
+                    "tabs": ["R18_NAI"],
+                },
+                allow_empty_keyword=True,
+            )
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_collection_runs").fetchone()[0], 0)
+
     def test_schema_and_payload_validation(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -267,6 +284,14 @@ class ArcaCollectorTest(unittest.TestCase):
                 "INSERT INTO arca_style_images(item_id,image_url,image_path,metadata_status,prompt,base_prompt,created_at) VALUES(?,?,?,?,?,?,?)",
                 (item_id, "https://img/1.png", "adult.png", "ok", "artist:foo", "artist:foo", "now"),
             )
+            run_id = conn.execute(
+                "INSERT INTO arca_collection_runs(keyword,tabs,start_date,end_date,max_pages,max_posts,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("그림체 공유", "NAI", "2026-01-01", "2026-01-02", 1, 10, "completed", "now", "now"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_collection_run_items(run_id,item_id) VALUES(?,?)",
+                (run_id, item_id),
+            )
             conn.execute(
                 "INSERT INTO ratings(artist_tag,score,mode,representative_thumbnail_path,created_at,updated_at) VALUES(?,?,?,?,?,?)",
                 ("danbooru_artist", 5, "manual", "thumbnail.jpg", "now", "now"),
@@ -285,6 +310,8 @@ class ArcaCollectorTest(unittest.TestCase):
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertEqual(conn.execute("SELECT representative_image_path FROM arca_style_items").fetchone()[0], "")
             self.assertEqual(conn.execute("SELECT image_path FROM arca_style_images").fetchone()[0], "")
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_collection_runs").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_collection_run_items").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM ratings").fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache").fetchone()[0], 1234)
             self.assertNotIn("settings", tables)
@@ -294,12 +321,88 @@ class ArcaCollectorTest(unittest.TestCase):
         destination = Path(self.temp.name) / "destination.sqlite"
         init_arca_style_tables(destination)
         first = import_arca_style_seed(destination, seed)
-        second = import_arca_style_seed(destination, seed)
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("unchanged seed must not be read wholesale")):
+            second = import_arca_style_seed(destination, seed)
         self.assertEqual(first, {"imported": True, "items": 1, "images": 1})
         self.assertEqual(second, {"imported": False, "items": 0, "images": 0})
         with closing(sqlite3.connect(destination)) as conn:
             self.assertIsNone(conn.execute("SELECT artist_tag,score FROM ratings").fetchone())
             self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache").fetchone()[0], 1234)
+
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            added_item = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at) VALUES(?,?,?)",
+                ("https://arca.live/b/aiart/2", "now", "now"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,created_at) VALUES(?,?,?)",
+                (added_item, "https://img/2.png", "now"),
+            )
+        changed_seed = Path(self.temp.name) / "changed-seed.sqlite"
+        export_arca_style_seed(self.db_path, changed_seed)
+        changed = import_arca_style_seed(destination, changed_seed)
+        self.assertEqual(changed, {"imported": True, "items": 1, "images": 1})
+
+    def test_metadata_seed_compacts_duplicate_collection_runs_and_preserves_coverage_links(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_ids = []
+            for suffix in ("one", "two"):
+                item_ids.append(conn.execute(
+                    "INSERT INTO arca_style_items(source_url,collected_at,updated_at,prompt) VALUES(?,?,?,?)",
+                    (f"https://arca.live/b/aiart/{suffix}", "now", "now", "artist:foo"),
+                ).lastrowid)
+            run_ids = []
+            for start, end in (("2026-01-01", "2026-01-03"), ("2026-01-01", "2026-01-03"), ("2026-01-04", "2026-01-05")):
+                run_ids.append(conn.execute(
+                    "INSERT INTO arca_collection_runs(keyword,tabs,start_date,end_date,max_pages,max_posts,status,search_scope,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    ("그림체 공유", "NAI", start, end, 1, 10, "completed", SEARCH_SCOPE, "now", "now"),
+                ).lastrowid)
+            conn.executemany(
+                "INSERT INTO arca_collection_run_items(run_id,item_id) VALUES(?,?)",
+                [(run_ids[0], item_ids[0]), (run_ids[1], item_ids[0]), (run_ids[1], item_ids[1]), (run_ids[2], item_ids[1])],
+            )
+        seed = Path(self.temp.name) / "compact-seed.sqlite"
+        exported = export_arca_style_seed(self.db_path, seed)
+        self.assertEqual((exported["items"], exported["images"]), (2, 0))
+        with closing(sqlite3.connect(seed)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_collection_runs").fetchone()[0], 2)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM arca_collection_run_items").fetchone()[0], 3)
+            self.assertEqual(conn.execute("SELECT COUNT(DISTINCT run_id) FROM arca_collection_run_items").fetchone()[0], 2)
+
+        destination = Path(self.temp.name) / "compact-destination.sqlite"
+        init_arca_style_tables(destination)
+        self.assertTrue(import_arca_style_seed(destination, seed)["imported"])
+        self.assertEqual(
+            get_completed_coverage(destination, {
+                "keyword": "그림체 공유", "tabs": ["NAI"],
+                "max_pages": 1, "max_posts": 10,
+            }),
+            [(date(2026, 1, 1), date(2026, 1, 5))],
+        )
+
+    def test_revalidation_runs_once_per_revision_and_reruns_after_bump(self):
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at) VALUES(?,?,?)",
+                ("https://arca.live/b/aiart/revision", "now", "now"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,metadata_status,raw_metadata_json,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (item_id, "https://img/revision.png", "ok", json.dumps({"prompt": "artist:one", "seed": 1, "sampler": "k_euler"}), "now"),
+            )
+
+        self.assertTrue(revalidate_stored_metadata(self.db_path, revision="revision-1"))
+        with patch.object(collector_module, "_extract_prompt_parts", side_effect=AssertionError("same revision must skip")):
+            self.assertFalse(revalidate_stored_metadata(self.db_path, revision="revision-1"))
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            conn.execute(
+                "UPDATE arca_style_images SET raw_metadata_json=? WHERE item_id=?",
+                (json.dumps({"prompt": "artist:two", "seed": 2, "sampler": "k_euler"}), item_id),
+            )
+        self.assertTrue(revalidate_stored_metadata(self.db_path, revision="revision-2"))
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            self.assertEqual(conn.execute("SELECT prompt FROM arca_style_images WHERE item_id=?", (item_id,)).fetchone()[0], "artist:two")
 
     def test_image_restore_refreshes_each_fixed_post_before_downloading(self):
         image_dir = Path(self.temp.name) / "images"
@@ -640,6 +743,30 @@ class ArcaCollectorTest(unittest.TestCase):
     def test_search_is_limited_to_titles(self):
         url = build_search_urls("그림체 공유", ["NAI"], 1)[0]
         self.assertIn("target=title", url)
+
+    def test_empty_keyword_requires_explicit_opt_in(self):
+        self.assertEqual(normalize_collect_payload({"keyword": ""})["keyword"], DEFAULT_KEYWORD)
+        self.assertEqual(
+            normalize_collect_payload({"keyword": ""}, allow_empty_keyword=True)["keyword"],
+            "",
+        )
+
+    def test_empty_keyword_builds_unfiltered_search_results_for_allowed_tabs(self):
+        url = build_search_urls("", ["NAI"], 1)[0]
+        self.assertIn("keyword=", url)
+        html = """
+        <a class="vrow column" href="/b/aiart/101"><span class="badge">NAI</span><span class="title">일반 게시글</span></a>
+        <a class="vrow column" href="/b/aiart/102"><span class="badge">🔞 NAI</span><span class="title">성인 게시글</span></a>
+        <a class="vrow column" href="/b/aiart/103"><span class="badge">정보·자료</span><span class="title">자료 게시글</span></a>
+        """
+        results = extract_search_results(html, "https://arca.live", "")
+        self.assertEqual(
+            [(item["source_url"], item["board_tab"]) for item in results],
+            [
+                ("https://arca.live/b/aiart/101", "NAI"),
+                ("https://arca.live/b/aiart/102", "R18_NAI"),
+            ],
+        )
 
     def test_list_hides_items_without_prompts(self):
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
@@ -1275,6 +1402,36 @@ class ArcaCollectorTest(unittest.TestCase):
 
         self.assertTrue(any(item["base_prompt"] == "masterpiece, best quality" for item in presets))
         self.assertTrue(any(item["negative_prompt"] == "lowres, bad hands" for item in presets))
+
+    def test_prompt_presets_filter_models_per_image_and_reject_invalid_filter(self):
+        rows = (
+            ("v5", "nai-diffusion-5-full", "v5", "v5", "full", "v5 negative"),
+            ("v4.5", "nai-diffusion-4-5-full", "v4.5", "v4.5", "full", "v4.5 negative"),
+            ("", "", "unknown", "unknown", "unknown", "unknown negative"),
+        )
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            for index, (model, model_id, model_family, generation, variant, negative) in enumerate(rows, 1):
+                prompt = f"artist:alpha, quality {index}"
+                item_id = conn.execute(
+                    "INSERT INTO arca_style_items(source_url,title,board_tab,metadata_status,prompt,collected_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (f"https://arca.live/b/aiart/model-{index}", "그림체 공유", "NAI", "ok", prompt, "now", "now"),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO arca_style_images(item_id,image_url,metadata_status,prompt,base_prompt,negative_prompt,model,model_id,model_family,model_generation,model_variant,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (item_id, f"https://img/model-{index}.png", "ok", prompt, prompt, negative, model, model_id, model_family, generation, variant, "now"),
+                )
+
+        def negative_prompts(model_filter):
+            return {
+                preset["negative_prompt"]
+                for preset in get_style_maker_prompt_presets(self.db_path, ["alpha"], model_filter=model_filter)["presets"]
+            }
+
+        self.assertEqual(negative_prompts("v5"), {"v5 negative"})
+        self.assertEqual(negative_prompts("nai-diffusion-4-5-full"), {"v4.5 negative"})
+        self.assertEqual(negative_prompts("unknown"), {"unknown negative"})
+        with self.assertRaises(ArcaCollectorError):
+            get_style_maker_prompt_presets(self.db_path, ["alpha"], model_filter="v3")
 
     def test_namu_cdn_candidates_request_original_image_bytes(self):
         candidates = extract_image_candidates(

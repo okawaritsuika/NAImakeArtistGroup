@@ -1,4 +1,5 @@
 import io
+import gc
 import sqlite3
 import tempfile
 import unittest
@@ -11,12 +12,39 @@ from PIL import Image
 
 class CandidateFlowTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.temp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.temp.name)
+        self.originals = {
+            name: getattr(app, name)
+            for name in (
+                "DATA_DIR", "THUMBNAIL_DIR", "GENERATED_DIR",
+                "CONFIRMED_STYLE_IMAGE_DIR", "COMPARISON_IMAGE_DIR",
+                "ARCA_STYLE_IMAGE_DIR", "SETTINGS_JSON_PATH", "DB_PATH",
+                "ARCA_STYLE_SEED_PATH", "MERGE_SOURCE_DIRS",
+            )
+        }
+        self.original_danbooru_last_request_started = app._danbooru_last_request_started
         app.DATA_DIR = self.tmp
         app.THUMBNAIL_DIR = self.tmp / "thumbnails"
+        app.GENERATED_DIR = self.tmp / "generated"
+        app.CONFIRMED_STYLE_IMAGE_DIR = self.tmp / "confirmed_style_images"
+        app.COMPARISON_IMAGE_DIR = self.tmp / "comparison_images"
+        app.ARCA_STYLE_IMAGE_DIR = self.tmp / "arca_style_images"
+        app.SETTINGS_JSON_PATH = self.tmp / "settings.json"
         app.DB_PATH = self.tmp / "artist_rater.sqlite"
+        app.ARCA_STYLE_SEED_PATH = self.tmp / "missing-seed.sqlite"
+        app.MERGE_SOURCE_DIRS = []
+        app._danbooru_last_request_started = None
         app.init_db()
         self.client = app.app.test_client()
+
+    def tearDown(self):
+        for name, value in self.originals.items():
+            setattr(app, name, value)
+        app._danbooru_last_request_started = self.original_danbooru_last_request_started
+        self.client = None
+        gc.collect()
+        self.temp.cleanup()
 
     def _fake_thumbnail(self, url, artist_tag, post_id):
         filename = app.thumbnail_filename(artist_tag, post_id)
@@ -42,6 +70,136 @@ class CandidateFlowTest(unittest.TestCase):
             results = app.autocomplete_tags("test")
 
         self.assertEqual([item["name"] for item in results], ["large", "medium", "small"])
+
+    def test_danbooru_get_retries_connection_errors_with_exponential_delays(self):
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"name": "ok"}]
+
+        with patch("app.requests.get", side_effect=[app.requests.ConnectionError("reset"), app.requests.Timeout("slow"), Response()]) as get, patch(
+            "app.time.monotonic", side_effect=[0, 2, 4]
+        ), patch("app.time.sleep") as sleep:
+            self.assertEqual(app.danbooru_get("/tags.json", {}), [{"name": "ok"}])
+
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_danbooru_get_honors_retry_after_and_does_not_retry_other_4xx(self):
+        class Response:
+            def __init__(self, status_code, headers=None):
+                self.status_code = status_code
+                self.headers = headers or {}
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise app.requests.HTTPError(f"HTTP {self.status_code}")
+
+            def json(self):
+                return {"ok": True}
+
+        with patch("app.requests.get", side_effect=[Response(429, {"Retry-After": "7"}), Response(200)]) as get, patch(
+            "app.time.monotonic", side_effect=[0, 8]
+        ), patch("app.time.sleep") as sleep:
+            self.assertEqual(app.danbooru_get("/posts.json", {}), {"ok": True})
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [7])
+
+        app._danbooru_last_request_started = None
+        with patch("app.requests.get", return_value=Response(404)) as get, patch("app.time.sleep") as sleep:
+            with self.assertRaises(app.requests.HTTPError):
+                app.danbooru_get("/posts.json", {})
+        get.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_danbooru_get_enforces_start_interval_between_requests(self):
+        class Response:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return []
+
+        with patch("app.requests.get", return_value=Response()) as get, patch(
+            "app.time.monotonic", side_effect=[0, 0.1, 0.4]
+        ), patch("app.time.sleep") as sleep:
+            app.danbooru_get("/posts.json", {})
+            app.danbooru_get("/posts.json", {})
+        self.assertEqual(get.call_count, 2)
+        self.assertAlmostEqual(sleep.call_args.args[0], app.DANBOORU_REQUEST_INTERVAL - 0.1)
+
+    def test_danbooru_get_retries_5xx_four_times_then_raises_last_error(self):
+        class Response:
+            status_code = 503
+            headers = {}
+
+            def raise_for_status(self):
+                raise app.requests.HTTPError("service unavailable")
+
+        with patch("app.requests.get", side_effect=[Response() for _ in range(5)]) as get, patch(
+            "app.time.monotonic", side_effect=[0, 2, 4, 6, 8]
+        ), patch("app.time.sleep") as sleep:
+            with self.assertRaises(app.requests.HTTPError):
+                app.danbooru_get("/posts.json", {})
+        self.assertEqual(get.call_count, 5)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2, 4, 8])
+
+    def test_artist_post_count_does_not_cache_network_failure(self):
+        with patch("app.danbooru_get", side_effect=app.requests.ConnectionError("offline")):
+            with self.assertRaises(app.requests.ConnectionError):
+                app.get_artist_post_count("offline_artist")
+        with sqlite3.connect(app.DB_PATH) as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM artist_cache WHERE artist_tag = ?", ("offline_artist",)).fetchone())
+
+        with patch("app.danbooru_get", return_value=[]):
+            self.assertEqual(app.get_artist_post_count("empty_artist"), 0)
+        with sqlite3.connect(app.DB_PATH) as conn:
+            self.assertEqual(conn.execute("SELECT artist_post_count FROM artist_cache WHERE artist_tag = ?", ("empty_artist",)).fetchone()[0], 0)
+
+    def test_skipped_artists_are_persisted_permanently_listed_and_restored(self):
+        candidates = [
+            {"artist_tag": "skip_me", "matched_post_count": 3, "artist_post_count": 2000},
+            {"artist_tag": "keep_me", "matched_post_count": 3, "artist_post_count": 2000},
+        ]
+        with patch("app.global_artist_candidates", return_value=candidates):
+            response = self.client.post("/api/skipped_artists", json={"artist_tag": "skip_me"})
+            self.assertEqual(response.status_code, 200)
+            pool = self.client.post("/api/candidates", json={"candidate_limit": 12, "random_mode": "uniform"}).get_json()
+        self.assertEqual([item["artist"] for item in pool["candidates"]], ["keep_me"])
+
+        with sqlite3.connect(app.DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO skipped_artists (artist_tag, skipped_at) VALUES (?, ?)",
+                ("old_skipped_artist", "2000-01-01T00:00:00+00:00"),
+            )
+        self.assertIn("old_skipped_artist", app.get_skipped_artist_set())
+        listed = self.client.get("/api/skipped_artists")
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(
+            {item["artist_tag"] for item in listed.get_json()["skipped_artists"]},
+            {"skip_me", "old_skipped_artist"},
+        )
+        restored = self.client.delete("/api/skipped_artists", json={"artist_tag": "skip_me"})
+        self.assertEqual(restored.status_code, 200)
+        self.assertTrue(restored.get_json()["restored"])
+        self.assertNotIn("skip_me", app.get_skipped_artist_set())
+        cleared = self.client.delete("/api/skipped_artists")
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(cleared.get_json()["cleared_count"], 1)
+
+    def test_rating_removes_skip_record(self):
+        self.assertEqual(self.client.post("/api/skipped_artists", json={"artist_tag": "rate_me"}).status_code, 200)
+        self.assertEqual(self.client.post("/api/ratings", json={"artist_tag": "rate_me", "score": 4}).status_code, 200)
+        with sqlite3.connect(app.DB_PATH) as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM skipped_artists WHERE artist_tag = ?", ("rate_me",)).fetchone())
 
     def test_artist_autocomplete_only_returns_artist_category(self):
         tags = [
@@ -274,6 +432,35 @@ class CandidateFlowTest(unittest.TestCase):
         self.assertEqual(data["filter_stats"]["unique_artist_count"], 2)
         self.assertEqual(data["filter_stats"]["final_candidate_count"], 2)
 
+    def test_unrated_rating_is_still_known_and_not_proposed_again(self):
+        response = self.client.post(
+            "/api/ratings",
+            json={"artist_tag": "already_unrated", "rating_status": "unrated"},
+        )
+        self.assertEqual(response.status_code, 200)
+        candidates = [
+            {"artist_tag": "already_unrated", "matched_post_count": 3, "artist_post_count": 2000},
+            {"artist_tag": "fresh_artist", "matched_post_count": 3, "artist_post_count": 2000},
+        ]
+        with patch("app.global_artist_candidates", return_value=candidates):
+            data = self.client.post(
+                "/api/candidates",
+                json={"candidate_limit": 12, "random_mode": "uniform"},
+            ).get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual([item["artist"] for item in data["candidates"]], ["fresh_artist"])
+
+    def test_rating_status_filter_returns_unrated_only_and_score_filters_stay_rated(self):
+        self.assertEqual(
+            self.client.post("/api/ratings", json={"artist_tag": "unrated_only", "rating_status": "unrated"}).status_code,
+            200,
+        )
+        self._create_rating("rated_only")
+        unrated = self.client.get("/api/ratings?rating_status=unrated").get_json()
+        self.assertEqual([item["artist_tag"] for item in unrated], ["unrated_only"])
+        scored = self.client.get("/api/ratings?score_min=4").get_json()
+        self.assertEqual([item["artist_tag"] for item in scored], ["rated_only"])
+
     def test_candidates_endpoint_excludes_artists_seen_in_current_session(self):
         with patch("app.search_posts") as search_posts, patch("app.get_artist_post_count") as post_count:
             search_posts.return_value = [
@@ -335,6 +522,47 @@ class CandidateFlowTest(unittest.TestCase):
         self.assertEqual([item["artist"] for item in data["candidates"]], ["artist_b"])
         self.assertEqual(data["exclude_query_tags"], ["ai-generated"])
         self.assertEqual(data["filter_stats"]["exclude_prompt_filtered_count"], 1)
+
+    def test_tag_candidate_pages_are_distributed_without_extra_search_requests(self):
+        posts = [
+            {
+                "id": 1,
+                "created_at": "2025-01-01T00:00:00+00:00",
+                "tag_string_artist": "artist_a",
+            }
+        ]
+        with patch("app.search_posts", return_value=posts) as search_posts, patch(
+            "app.get_artist_post_count", return_value=2000
+        ):
+            response = self.client.post(
+                "/api/candidates",
+                json={
+                    "query_text": "school_uniform",
+                    "min_artist_post_count": 1000,
+                    "min_match_count": 1,
+                    "fetch_pages": 5,
+                    "candidate_limit": 1,
+                    "random_mode": "uniform",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        pages = search_posts.call_args.kwargs["fetch_pages"]
+        self.assertEqual(len(pages), 5)
+        self.assertEqual(pages[0], 1)
+        self.assertEqual(len(set(pages)), 5)
+        self.assertLessEqual(len(pages), 10)
+        self.assertEqual(data["filter_stats"]["candidate_pages"], pages)
+
+    def test_global_candidate_pages_keep_requested_api_call_limit(self):
+        with patch("app.danbooru_get", return_value=[]) as danbooru_get:
+            app.global_artist_candidates(1000, 10)
+        self.assertEqual(danbooru_get.call_count, 10)
+        pages = [call.args[1]["page"] for call in danbooru_get.call_args_list]
+        self.assertEqual(pages[0], 1)
+        self.assertEqual(len(set(pages)), 10)
+        self.assertTrue(all(1 <= page <= app.DANBOORU_MAX_SEARCH_PAGE for page in pages))
 
     def test_artist_samples_endpoint_fetches_images_for_one_artist(self):
         sample = {

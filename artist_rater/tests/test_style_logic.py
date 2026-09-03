@@ -13,6 +13,7 @@ import app
 from style_logic import (
     assign_weights,
     build_artist_prompt,
+    merge_artist_sources,
     normalize_numeric_prompt_closers,
     normalize_style_artists,
     random_weight,
@@ -174,6 +175,98 @@ class StyleIdentityTest(unittest.TestCase):
         ):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize_style_artists(invalid)
+
+
+class ArtistSourceMergeTest(unittest.TestCase):
+    def test_merges_scores_by_average_and_uses_half_up_bucket(self):
+        merged = merge_artist_sources([
+            {
+                "source_type": "rating_management",
+                "source_id": "all",
+                "label": "평가 관리 전체",
+                "artists": [{"artist_tag": "same_artist", "score": 4.0}],
+            },
+            {
+                "source_type": "nai_test",
+                "source_id": "12",
+                "label": "NAI 테스트",
+                "artists": [{"artist_tag": "same artist", "score": 5.0}],
+            },
+        ])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["raw_score"], 4.5)
+        self.assertEqual(merged[0]["score_bucket"], 5)
+        self.assertEqual(merged[0]["score"], 5)
+
+    def test_excludes_invalid_nonfinite_out_of_range_and_unscored_artists(self):
+        merged = merge_artist_sources([{
+            "source_type": "nai_test",
+            "source_id": "12",
+            "artists": [
+                {"artist_tag": "nan", "score": float("nan")},
+                {"artist_tag": "infinite", "score": float("inf")},
+                {"artist_tag": "low", "score": 0},
+                {"artist_tag": "high", "score": 6},
+                {"artist_tag": "missing", "score": None},
+                {"artist_tag": "valid", "score": 4.5},
+            ],
+        }])
+
+        self.assertEqual([item["artist_key"] for item in merged], ["valid"])
+
+    def test_deduplicates_direct_nai_and_group_provenance(self):
+        merged = merge_artist_sources([
+            {
+                "source_type": "nai_test",
+                "source_id": "12",
+                "label": "직접 테스트",
+                "artists": [{"artist_tag": "same_artist", "score": 4}],
+            },
+            {
+                "source_type": "style_group",
+                "source_id": "4",
+                "label": "그림체 그룹",
+                "artists": [{
+                    "artist_tag": "same artist",
+                    "contributions": [{
+                        "origin_type": "nai_test",
+                        "origin_id": "12",
+                        "label": "연결 테스트",
+                        "score": 4,
+                    }],
+                }],
+            },
+        ])
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["raw_score"], 4.0)
+        self.assertEqual(len(merged[0]["score_sources"]), 1)
+        self.assertEqual(merged[0]["score_sources"][0]["source_id"], "12")
+
+    def test_source_selection_order_does_not_change_scores(self):
+        sources = [
+            {
+                "source_type": "rating_management",
+                "source_id": "all",
+                "artists": [{"artist_tag": "alpha", "score": 2}],
+            },
+            {
+                "source_type": "nai_test",
+                "source_id": "12",
+                "artists": [{"artist_tag": "alpha", "score": 4}],
+            },
+        ]
+        forward = {
+            item["artist_key"]: (item["raw_score"], item["score_bucket"])
+            for item in merge_artist_sources(sources)
+        }
+        reverse = {
+            item["artist_key"]: (item["raw_score"], item["score_bucket"])
+            for item in merge_artist_sources(list(reversed(sources)))
+        }
+
+        self.assertEqual(forward, reverse)
 
 
 class ArtistSelectionTest(unittest.TestCase):
@@ -1464,7 +1557,7 @@ class StyleStoreIntegrationTest(unittest.TestCase):
         self.assertEqual(style["representative_image_path"], first["image_path"])
         self.assertTrue((self.generated_dir / first["image_path"]).is_file())
 
-    def test_reconcile_removes_stale_temp_and_unreferenced_png(self):
+    def test_reconcile_removes_stale_temp_but_preserves_unreferenced_png(self):
         saved = save_generated_result(
             self.db_path,
             self.generated_dir,
@@ -1483,7 +1576,7 @@ class StyleStoreIntegrationTest(unittest.TestCase):
         app.init_db()
 
         self.assertFalse(stale_temp.exists())
-        self.assertFalse(orphan.exists())
+        self.assertTrue(orphan.is_file())
         self.assertTrue((self.generated_dir / saved["image_path"]).is_file())
 
     def test_reconcile_keeps_fresh_unreferenced_files(self):

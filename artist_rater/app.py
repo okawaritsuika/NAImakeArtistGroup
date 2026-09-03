@@ -7,8 +7,10 @@ import random
 import re
 import sqlite3
 import sys
+import threading
+import time
 from contextlib import closing
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -87,6 +89,7 @@ from style_store import (
     DELETE_CONFIRMATION_CATEGORIES,
     default_delete_confirmation_preferences,
     get_style_detail,
+    list_all_generated_images,
     list_generated_images,
     list_styles,
     load_app_key,
@@ -119,11 +122,66 @@ from comparison_store import (
     delete_result,
     get_group,
     init_comparison_tables,
+    list_comparison_results,
     list_groups,
     remove_group_results,
     save_result,
     set_group_seed,
     update_group_style_ids,
+)
+from data_merge import merge_data_directories, normalize_data_dirs
+from nai_artist_test_store import (
+    MARKER as NAI_ARTIST_MARKER,
+    append_test_items as append_nai_artist_test_items,
+    claim_next_item as claim_nai_artist_test_item,
+    claim_specific_item as claim_specific_nai_artist_test_item,
+    complete_item as complete_nai_artist_test_item,
+    create_test as create_nai_artist_test,
+    delete_test as delete_nai_artist_test,
+    fail_item as fail_nai_artist_test_item,
+    get_test as get_nai_artist_test,
+    get_test_artist_source,
+    init_nai_artist_test_tables,
+    list_generated_image_sources,
+    latest_direct_rating_map,
+    list_tests as list_nai_artist_tests,
+    list_artist_history as list_nai_artist_history,
+    normalize_prompt_variants,
+    prepare_test_artist_item as prepare_nai_artist_test_item,
+    recover_processing_items as recover_nai_artist_test_items,
+    save_item_rating as save_nai_artist_item_rating,
+    save_direct_rating as save_nai_artist_direct_rating,
+    set_status as set_nai_artist_test_status,
+    validate_delay_seconds,
+    validate_images_per_artist,
+    validate_test_config,
+)
+from style_group_store import (
+    add_uploaded_image,
+    add_sources as add_style_group_sources,
+    create_group as create_style_group,
+    delete_group as delete_style_group,
+    get_group as get_style_group,
+    init_style_group_tables,
+    list_candidates as list_style_group_candidates,
+    list_groups as list_style_groups,
+    record_decision as record_style_group_decision,
+    remove_image as remove_style_group_image,
+    update_group as update_style_group,
+    add_style_group_direct_artist,
+    add_style_group_sources_modern,
+    create_author_group,
+    get_style_group_artist_gallery,
+    list_style_group_artist_review,
+    list_style_group_source_gallery,
+    list_style_group_targets,
+    normalize_artist_tag as normalize_style_group_artist_tag,
+    reconsider_style_group_artist,
+    record_style_group_artist_decision,
+    remove_style_group_artist,
+    select_style_group_reference,
+    set_style_group_base_source,
+    sync_style_group_generated_image,
 )
 
 from style_logic import (
@@ -131,7 +189,10 @@ from style_logic import (
     assign_weights,
     build_artist_prompt,
     exact_score,
+    merge_artist_sources,
+    normalize_artist_key,
     normalize_style_artists,
+    score_bucket,
     select_artists,
     style_hash,
 )
@@ -160,19 +221,51 @@ GENERATED_DIR = DATA_DIR / "generated"
 CONFIRMED_STYLE_IMAGE_DIR = DATA_DIR / "confirmed_style_images"
 COMPARISON_IMAGE_DIR = DATA_DIR / "comparison_images"
 ARCA_STYLE_IMAGE_DIR = DATA_DIR / "arca_style_images"
+STYLE_GROUP_IMAGE_DIR = DATA_DIR / "style_group_images"
 ARCA_STYLE_SEED_PATH = RESOURCE_DIR / "arca_style_seed.sqlite"
 SETTINGS_JSON_PATH = DATA_DIR / "settings.json"
 DB_PATH = DATA_DIR / "artist_rater.sqlite"
+MERGE_SOURCE_DIRS = []
 ARCA_SESSION_BRIDGE_SOURCE_DIR = RESOURCE_DIR / "static" / "arca_session_bridge"
 DANBOORU_BASE_URL = "https://danbooru.donmai.us"
 DEFAULT_CUTOFF_DATE = "2025-01-31"
 REQUEST_TIMEOUT = 12
 USER_AGENT = "DanbooruArtistRater/1.0 (local personal tool)"
+DANBOORU_REQUEST_INTERVAL = 1.0
+DANBOORU_MAX_ATTEMPTS = 5
+DANBOORU_RETRY_AFTER_MAX = 60
+DANBOORU_MAX_SEARCH_PAGE = 29
+_danbooru_request_lock = threading.Lock()
+_danbooru_last_request_started = None
 
 ARCA_LOGIN_MANAGER = ArcaLoginWindowManager(
     DATA_DIR / "arca_login_profile",
     lambda jar: connect_arca_cookie_jar(jar, "전용 Chrome"),
 )
+
+
+def configure_data_directories(data_dirs, primary_data_dir=None):
+    """Select a writable primary data directory and optional read-only sources."""
+
+    global DATA_DIR, THUMBNAIL_DIR, GENERATED_DIR, CONFIRMED_STYLE_IMAGE_DIR
+    global COMPARISON_IMAGE_DIR, ARCA_STYLE_IMAGE_DIR, STYLE_GROUP_IMAGE_DIR, SETTINGS_JSON_PATH, DB_PATH
+    global ARCA_LOGIN_MANAGER, MERGE_SOURCE_DIRS
+    primary, sources = normalize_data_dirs(data_dirs, primary_data_dir)
+    DATA_DIR = primary
+    MERGE_SOURCE_DIRS = sources
+    THUMBNAIL_DIR = DATA_DIR / "thumbnails"
+    GENERATED_DIR = DATA_DIR / "generated"
+    CONFIRMED_STYLE_IMAGE_DIR = DATA_DIR / "confirmed_style_images"
+    COMPARISON_IMAGE_DIR = DATA_DIR / "comparison_images"
+    ARCA_STYLE_IMAGE_DIR = DATA_DIR / "arca_style_images"
+    STYLE_GROUP_IMAGE_DIR = DATA_DIR / "style_group_images"
+    SETTINGS_JSON_PATH = DATA_DIR / "settings.json"
+    DB_PATH = DATA_DIR / "artist_rater.sqlite"
+    ARCA_LOGIN_MANAGER = ArcaLoginWindowManager(
+        DATA_DIR / "arca_login_profile",
+        lambda jar: connect_arca_cookie_jar(jar, "전용 Chrome"),
+    )
+    return DATA_DIR, list(MERGE_SOURCE_DIRS)
 
 app = Flask(
     __name__,
@@ -191,18 +284,64 @@ def json_response(payload, status=200):
     )
 
 
+def _migrate_ratings_score_nullable(conn):
+    """Rebuild legacy ratings tables whose score column was NOT NULL.
+
+    Unrated authors are represented by a real NULL score.  Rebuilding is
+    limited to this one table and keeps every existing column/value; the
+    foreign-key check at the end catches an incomplete migration before the
+    surrounding transaction can commit.
+    """
+    columns = conn.execute("PRAGMA table_info(ratings)").fetchall()
+    score = next((row for row in columns if row[1] == "score"), None)
+    if score is None or not score[3]:
+        return
+    names = [row[1] for row in columns]
+    definitions = []
+    for row in columns:
+        name, column_type, not_null, default_value, primary_key = row[1:]
+        quoted = '"' + name.replace('"', '""') + '"'
+        if primary_key:
+            definition = f"{quoted} INTEGER PRIMARY KEY AUTOINCREMENT"
+        else:
+            definition = f"{quoted} {column_type or 'TEXT'}"
+            if not (name == "score") and not_null:
+                definition += " NOT NULL"
+            if default_value is not None:
+                definition += " DEFAULT " + str(default_value)
+        definitions.append(definition)
+    if "artist_tag" in names:
+        definitions.append('UNIQUE("artist_tag")')
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("ALTER TABLE ratings RENAME TO ratings_legacy_nullable_migration")
+    conn.execute("CREATE TABLE ratings (" + ",".join(definitions) + ")")
+    quoted_names = ",".join('"' + name.replace('"', '""') + '"' for name in names)
+    conn.execute(f"INSERT INTO ratings ({quoted_names}) SELECT {quoted_names} FROM ratings_legacy_nullable_migration")
+    conn.execute("DROP TABLE ratings_legacy_nullable_migration")
+    conn.execute("PRAGMA foreign_keys=ON")
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise sqlite3.IntegrityError("ratings 마이그레이션 후 외래 키 검증에 실패했습니다.")
+
+
 def init_db():
+    global STYLE_GROUP_IMAGE_DIR
+    # Keep tests and callers that replace DATA_DIR directly in sync with the
+    # dedicated group-image root; configure_data_directories already assigns
+    # the same value for normal launcher startup.
+    STYLE_GROUP_IMAGE_DIR = DATA_DIR / "style_group_images"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     ARCA_STYLE_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    STYLE_GROUP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ratings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 artist_tag TEXT NOT NULL UNIQUE,
-                score INTEGER NOT NULL,
+                score INTEGER,
                 memo TEXT DEFAULT '',
                 favorite INTEGER DEFAULT 0,
                 blocked INTEGER DEFAULT 0,
@@ -243,12 +382,28 @@ def init_db():
             )
             """
         )
+        rating_columns = {row[1] for row in conn.execute("PRAGMA table_info(ratings)")}
+        _migrate_ratings_score_nullable(conn)
+        rating_columns = {row[1] for row in conn.execute("PRAGMA table_info(ratings)")}
+        if "rating_status" not in rating_columns:
+            conn.execute("ALTER TABLE ratings ADD COLUMN rating_status TEXT NOT NULL DEFAULT 'rated'")
+        conn.execute(
+            "UPDATE ratings SET rating_status='unrated',score=NULL WHERE score=0 OR (rating_status IS NULL OR rating_status='') AND score IS NULL"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS artist_cache (
                 artist_tag TEXT PRIMARY KEY,
                 artist_post_count INTEGER DEFAULT 0,
                 updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skipped_artists (
+                artist_tag TEXT PRIMARY KEY,
+                skipped_at TEXT NOT NULL
             )
             """
         )
@@ -340,10 +495,15 @@ def init_db():
     reconcile_generated_storage(DB_PATH, GENERATED_DIR)
     init_confirmed_style_tables(DB_PATH)
     init_comparison_tables(DB_PATH)
+    init_nai_artist_test_tables(DB_PATH)
+    init_style_group_tables(DB_PATH)
     init_arca_style_tables(DB_PATH)
     import_arca_style_seed(DB_PATH, ARCA_STYLE_SEED_PATH)
+    if MERGE_SOURCE_DIRS:
+        merge_data_directories(DATA_DIR, MERGE_SOURCE_DIRS)
     revalidate_stored_metadata(DB_PATH)
     mark_interrupted_collection_jobs(DB_PATH)
+    recover_nai_artist_test_items(DB_PATH)
 
 
 def db():
@@ -388,7 +548,7 @@ def normalize_cutoff_date(value):
 
 def cutoff_datetime(cutoff_date=DEFAULT_CUTOFF_DATE):
     normalized = normalize_cutoff_date(cutoff_date)
-    cutoff = datetime.combine(date.fromisoformat(normalized), time(23, 59, 59))
+    cutoff = datetime.combine(date.fromisoformat(normalized), datetime_time(23, 59, 59))
     return cutoff.replace(tzinfo=timezone.utc)
 
 
@@ -412,14 +572,55 @@ def is_before_cutoff(post, cutoff_date=DEFAULT_CUTOFF_DATE):
 
 def danbooru_get(path, params):
     url = f"{DANBOORU_BASE_URL}{path}"
-    response = requests.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": USER_AGENT},
-    )
-    response.raise_for_status()
-    return response.json()
+    global _danbooru_last_request_started
+
+    def wait_for_request_slot():
+        global _danbooru_last_request_started
+        with _danbooru_request_lock:
+            now = time.monotonic()
+            if _danbooru_last_request_started is not None:
+                wait_seconds = DANBOORU_REQUEST_INTERVAL - (now - _danbooru_last_request_started)
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                    now += wait_seconds
+            _danbooru_last_request_started = now
+
+    def retry_delay(attempt, response=None):
+        if response is not None and getattr(response, "status_code", None) == 429:
+            retry_after = (getattr(response, "headers", {}) or {}).get("Retry-After")
+            try:
+                retry_after = float(retry_after)
+                if retry_after >= 0 and retry_after != float("inf") and retry_after == retry_after:
+                    return min(retry_after, DANBOORU_RETRY_AFTER_MAX)
+            except (TypeError, ValueError):
+                pass
+        return min(2**attempt, DANBOORU_RETRY_AFTER_MAX)
+
+    for attempt in range(DANBOORU_MAX_ATTEMPTS):
+        wait_for_request_slot()
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+                headers={"User-Agent": USER_AGENT},
+            )
+            status_code = getattr(response, "status_code", None)
+            retryable_status = status_code == 429 or bool(status_code and 500 <= status_code <= 599)
+            if retryable_status:
+                if attempt >= DANBOORU_MAX_ATTEMPTS - 1:
+                    response.raise_for_status()
+                time.sleep(retry_delay(attempt, response))
+                continue
+            response.raise_for_status()
+            return response.json()
+        except (requests.ConnectionError, requests.Timeout, ConnectionResetError) as exc:
+            if attempt >= DANBOORU_MAX_ATTEMPTS - 1:
+                if isinstance(exc, ConnectionResetError):
+                    raise requests.ConnectionError(str(exc)) from exc
+                raise
+            time.sleep(retry_delay(attempt))
+    raise RuntimeError("Danbooru 요청이 완료되지 않았습니다.")
 
 
 def post_image_url(post):
@@ -447,12 +648,24 @@ def post_to_sample(post):
 
 
 def search_posts(tags, fetch_pages=1, limit=100, cutoff_date=DEFAULT_CUTOFF_DATE):
-    pages = max(1, min(int(fetch_pages or 1), 10))
+    if isinstance(fetch_pages, (list, tuple)):
+        page_numbers = []
+        for value in fetch_pages:
+            try:
+                page = max(1, min(int(value), DANBOORU_MAX_SEARCH_PAGE))
+            except (TypeError, ValueError):
+                continue
+            if page not in page_numbers:
+                page_numbers.append(page)
+        page_numbers = page_numbers[:10] or [1]
+    else:
+        pages = max(1, min(int(fetch_pages or 1), 10))
+        page_numbers = list(range(1, pages + 1))
     limit = max(1, min(int(limit or 100), 100))
     cutoff_date = normalize_cutoff_date(cutoff_date)
     query = " ".join([tag for tag in tags if tag] + [f"date:<={cutoff_date}"])
     posts = []
-    for page in range(1, pages + 1):
+    for page in page_numbers:
         data = danbooru_get("/posts.json", {"tags": query, "limit": limit, "page": page})
         if not isinstance(data, list):
             break
@@ -502,20 +715,17 @@ def get_artist_post_count(artist_tag):
         ).fetchone()
         if cached:
             return int(cached["artist_post_count"] or 0)
-    try:
-        data = danbooru_get(
-            "/tags.json",
-            {
-                "search[name]": artist_tag,
-                "search[category]": 1,
-                "limit": 1,
-            },
-        )
-        count = 0
-        if isinstance(data, list) and data:
-            count = int(data[0].get("post_count") or 0)
-    except requests.RequestException:
-        count = 0
+    data = danbooru_get(
+        "/tags.json",
+        {
+            "search[name]": artist_tag,
+            "search[category]": 1,
+            "limit": 1,
+        },
+    )
+    count = 0
+    if isinstance(data, list) and data:
+        count = int(data[0].get("post_count") or 0)
     with db() as conn:
         conn.execute(
             """
@@ -532,8 +742,31 @@ def get_artist_post_count(artist_tag):
 
 def get_rated_artist_set():
     with db() as conn:
+        # Candidate generation must remember every artist already entered in
+        # rating management, including an unrated placeholder.  Consumers
+        # that need a numeric score keep their explicit rated/score filters.
         rows = conn.execute("SELECT artist_tag FROM ratings").fetchall()
     return {row["artist_tag"] for row in rows}
+
+
+def get_skipped_artist_set():
+    with db() as conn:
+        rows = conn.execute("SELECT artist_tag FROM skipped_artists").fetchall()
+    return {row["artist_tag"] for row in rows}
+
+
+def skipped_artists_payload():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT artist_tag, skipped_at FROM skipped_artists ORDER BY skipped_at DESC, artist_tag COLLATE NOCASE"
+        ).fetchall()
+    return {
+        "ok": True,
+        "skipped_artists": [
+            {"artist_tag": row["artist_tag"], "skipped_at": row["skipped_at"]}
+            for row in rows
+        ],
+    }
 
 
 def normalize_rating_tag_filter(value):
@@ -695,7 +928,7 @@ def remove_unreferenced_thumbnail_paths(filenames):
 
 
 def rating_examples_payload(rating_id):
-    with db() as conn:
+    with closing(db()) as conn:
         rating = conn.execute(
             "SELECT id,artist_tag,representative_post_id,representative_thumbnail_path,representative_preview_url FROM ratings WHERE id = ?",
             (rating_id,),
@@ -772,6 +1005,15 @@ def search_posts_for_cutoff(tags, fetch_pages=1, limit=100, cutoff_date=DEFAULT_
     return search_posts(tags, **kwargs)
 
 
+def randomized_candidate_pages(fetch_pages):
+    """Choose varied candidate pages while retaining page one for narrow searches."""
+    pages = max(1, min(int(fetch_pages or 1), 10))
+    if pages == 1:
+        return [1]
+    coverage = min(DANBOORU_MAX_SEARCH_PAGE, max(10, pages * 3))
+    return [1, *random.sample(range(2, coverage + 1), pages - 1)]
+
+
 def fetch_artist_samples(artist_tag, query_tags, sample_limit, latest_first=False, cutoff_date=DEFAULT_CUTOFF_DATE):
     sample_limit = max(1, min(int(sample_limit or 12), 30))
     if latest_first:
@@ -829,10 +1071,18 @@ def candidate_payload(candidate):
     }
 
 
+def randomized_global_candidate_pages(pages_to_try):
+    """Spread global tag-page reads while anchoring page one for strict filters."""
+    pages = max(1, min(int(pages_to_try or 5), 10))
+    if pages == 1:
+        return [1]
+    return [1, *random.sample(range(2, DANBOORU_MAX_SEARCH_PAGE + 1), pages - 1)]
+
+
 def global_artist_candidates(min_artist_post_count, pages_to_try, cutoff_date=DEFAULT_CUTOFF_DATE):
     min_artist_post_count = max(0, int(min_artist_post_count or 0))
     pages_to_try = max(1, min(int(pages_to_try or 5), 10))
-    pages = random.sample(range(1, 30), k=min(pages_to_try, 29))
+    pages = randomized_global_candidate_pages(pages_to_try)
     candidates = []
     for page in pages:
         data = danbooru_get(
@@ -874,11 +1124,12 @@ def build_candidate_pool(payload):
     random_mode = random_mode if random_mode in {"uniform", "weighted", "soft_weighted"} else "soft_weighted"
     cutoff_date = normalize_cutoff_date(payload.get("cutoff_date"))
     rated = get_rated_artist_set()
+    skipped = get_skipped_artist_set()
     excluded_artists = rated | {
         str(artist).strip()
         for artist in payload.get("exclude_artist_tags", [])
         if str(artist).strip()
-    }
+    } | skipped
     filter_stats = {
         "requested_count": candidate_limit,
         "excluded_artist_count": len(excluded_artists),
@@ -889,6 +1140,7 @@ def build_candidate_pool(payload):
         "post_count_filtered_count": 0,
         "exclude_prompt_filtered_count": 0,
         "final_candidate_count": 0,
+        "candidate_pages": [],
     }
 
     if not query_tags:
@@ -904,7 +1156,9 @@ def build_candidate_pool(payload):
         filter_stats["post_count_filtered_count"] = len(raw_candidates) - len(candidates)
     else:
         mode = "tag_filtered_random"
-        posts = search_posts_for_cutoff(query_tags, fetch_pages=fetch_pages, cutoff_date=cutoff_date)
+        candidate_pages = randomized_candidate_pages(fetch_pages)
+        filter_stats["candidate_pages"] = candidate_pages
+        posts = search_posts_for_cutoff(query_tags, fetch_pages=candidate_pages, cutoff_date=cutoff_date)
         filter_stats["fetched_post_count"] = len(posts)
         artist_posts = {}
         for post in posts:
@@ -1042,6 +1296,59 @@ def api_candidates():
         return json_response({"ok": False, "error": f"처리 오류: {exc}"}, 400)
 
 
+@app.route("/api/skipped_artists", methods=["GET", "POST", "DELETE"])
+def api_skipped_artists():
+    if request.method == "GET":
+        return json_response(skipped_artists_payload())
+
+    if request.method == "DELETE":
+        payload = request.get_json(silent=True)
+        artist_value = payload.get("artist_tag") if isinstance(payload, dict) else None
+        if artist_value is None and isinstance(payload, dict):
+            artist_value = payload.get("artist")
+        if artist_value is not None:
+            if not isinstance(artist_value, str):
+                return json_response({"ok": False, "error": "artist_tag는 문자열이어야 합니다."}, 400)
+            artist_tag = artist_value.strip()
+            if not artist_tag:
+                return json_response({"ok": False, "error": "artist_tag가 필요합니다."}, 400)
+            with db() as conn:
+                cursor = conn.execute("DELETE FROM skipped_artists WHERE artist_tag = ?", (artist_tag,))
+            return json_response(
+                {
+                    "ok": True,
+                    "artist_tag": artist_tag,
+                    "restored": cursor.rowcount > 0,
+                    "cleared_count": cursor.rowcount,
+                }
+            )
+        with db() as conn:
+            cursor = conn.execute("DELETE FROM skipped_artists")
+        return json_response({"ok": True, "cleared_count": cursor.rowcount})
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response({"ok": False, "error": "JSON 객체가 필요합니다."}, 400)
+    artist_value = payload.get("artist_tag")
+    if artist_value is None:
+        artist_value = payload.get("artist")
+    if not isinstance(artist_value, str):
+        return json_response({"ok": False, "error": "artist_tag는 문자열이어야 합니다."}, 400)
+    artist_tag = artist_value.strip()
+    if not artist_tag:
+        return json_response({"ok": False, "error": "artist_tag가 필요합니다."}, 400)
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO skipped_artists (artist_tag, skipped_at)
+            VALUES (?, ?)
+            ON CONFLICT(artist_tag) DO UPDATE SET skipped_at = excluded.skipped_at
+            """,
+            (artist_tag, now_text()),
+        )
+    return json_response({"ok": True, "artist_tag": artist_tag})
+
+
 @app.route("/api/artist_samples", methods=["POST"])
 def api_artist_samples():
     payload = request.get_json(silent=True) or {}
@@ -1103,11 +1410,15 @@ def api_create_rating():
     score = payload.get("score")
     if not artist_tag:
         return json_response({"ok": False, "error": "artist_tag가 필요합니다."}, 400)
-    if score is None:
-        return json_response({"ok": False, "error": "score가 필요합니다."}, 400)
-    score = int(score)
-    if score < 1 or score > 5:
-        return json_response({"ok": False, "error": "score는 1~5여야 합니다."}, 400)
+    unrated = payload.get("rating_status") == "unrated" or payload.get("unrated") is True
+    if unrated:
+        score = None
+    else:
+        if score is None:
+            return json_response({"ok": False, "error": "score가 필요합니다."}, 400)
+        score = int(score)
+        if score < 1 or score > 5:
+            return json_response({"ok": False, "error": "score는 1~5여야 합니다."}, 400)
 
     representative_post_id = payload.get("representative_post_id")
     representative_preview_url = payload.get("representative_preview_url") or ""
@@ -1118,17 +1429,18 @@ def api_create_rating():
             conn.execute(
                 """
                 INSERT INTO ratings (
-                    artist_tag, score, memo, mode, query_text,
+                    artist_tag, score, rating_status, memo, mode, query_text,
                     query_tags_json, matched_post_count, artist_post_count,
                     representative_post_id, representative_thumbnail_path,
                     representative_preview_url, sample_post_ids_json, prompt_text,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artist_tag,
                     score,
+                    "unrated" if unrated else "rated",
                     payload.get("memo") or "",
                     payload.get("mode") or "tag_filtered_random",
                     payload.get("query_text") or "",
@@ -1144,6 +1456,7 @@ def api_create_rating():
                     created_at,
                 ),
             )
+            conn.execute("DELETE FROM skipped_artists WHERE artist_tag = ?", (artist_tag,))
     except sqlite3.IntegrityError:
         return json_response({"ok": False, "error": "이미 평가한 작가입니다."}, 409)
     return json_response({"ok": True})
@@ -1153,12 +1466,22 @@ def api_create_rating():
 def api_list_ratings():
     conditions = []
     params = []
+    rating_status = request.args.get("rating_status")
+    if rating_status not in {None, "rated", "unrated"}:
+        return json_response({"error": "rating_status는 rated 또는 unrated여야 합니다."}, 400)
+    if rating_status:
+        conditions.append("rating_status=?")
+        params.append(rating_status)
     score_min = request.args.get("score_min")
     score_max = request.args.get("score_max")
     if score_min:
+        if "rating_status='rated'" not in conditions and rating_status != "unrated":
+            conditions.append("rating_status='rated'")
         conditions.append("score >= ?")
         params.append(int(score_min))
     if score_max:
+        if "rating_status='rated'" not in conditions and rating_status != "unrated":
+            conditions.append("rating_status='rated'")
         conditions.append("score <= ?")
         params.append(int(score_max))
     q = (request.args.get("q") or "").strip()
@@ -1181,6 +1504,8 @@ def api_list_ratings():
     items = []
     for row in rows:
         item = dict(row)
+        if item.get("rating_status") == "unrated" or int(item.get("score") or 0) == 0:
+            item["score"] = None
         item.pop("favorite", None)
         item.pop("blocked", None)
         filename = item.get("representative_thumbnail_path") or ""
@@ -1193,6 +1518,1324 @@ def api_list_ratings():
             item["sample_post_ids"] = []
         items.append(item)
     return json_response(items)
+
+
+@app.route("/api/nai-artist-tests/artists")
+def api_nai_artist_test_artists():
+    """List Danbooru-rated artists with their latest independent NAI score."""
+    try:
+        score_min = request.args.get("score_min")
+        score_max = request.args.get("score_max")
+        if score_min is not None and (type(score_min) is not str or not score_min.isdigit() or not 1 <= int(score_min) <= 5):
+            raise ValueError("score_min은 1~5여야 합니다.")
+        if score_max is not None and (type(score_max) is not str or not score_max.isdigit() or not 1 <= int(score_max) <= 5):
+            raise ValueError("score_max는 1~5여야 합니다.")
+        score_min = int(score_min) if score_min is not None else 1
+        score_max = int(score_max) if score_max is not None else 5
+        if score_min > score_max:
+            raise ValueError("최소 평점은 최대 평점보다 클 수 없습니다.")
+        q = (request.args.get("q") or "").strip().casefold()
+        sort = request.args.get("sort") or "recent"
+        sort_sql = {
+            "recent": "updated_at DESC, id DESC",
+            "score_desc": "score DESC, updated_at DESC, id DESC",
+            "score_asc": "score ASC, updated_at DESC, id DESC",
+            "artist": "artist_tag COLLATE NOCASE ASC, id ASC",
+        }.get(sort)
+        if sort_sql is None:
+            raise ValueError("정렬 기준을 확인하세요.")
+        with closing(db()) as conn:
+            rating_columns = {row[1] for row in conn.execute("PRAGMA table_info(ratings)")}
+            # Legacy databases predate rating_status. Their valid 1~5
+            # scores are equivalent to rated rows until init_db migrates them.
+            rated_clause = (
+                "rating_status='rated' AND score IS NOT NULL AND score BETWEEN ? AND ?"
+                if "rating_status" in rating_columns
+                else "score IS NOT NULL AND score BETWEEN ? AND ?"
+            )
+            rows = conn.execute(
+                f"SELECT id AS rating_id, artist_tag, score, memo, representative_thumbnail_path, updated_at FROM ratings WHERE {rated_clause} ORDER BY {sort_sql}",
+                (score_min, score_max),
+            ).fetchall()
+        direct = latest_direct_rating_map(DB_PATH)
+        items = []
+        for row in rows:
+            if q and q not in row["artist_tag"].casefold() and q not in (row["memo"] or "").casefold():
+                continue
+            item = {
+                "rating_id": row["rating_id"],
+                "artist_tag": row["artist_tag"],
+                "danbooru_score": row["score"],
+                "score": row["score"],
+                "memo": row["memo"] or "",
+                "updated_at": row["updated_at"] or "",
+                "thumbnail_url": f"/thumbnails/{row['representative_thumbnail_path']}" if row["representative_thumbnail_path"] else "",
+            }
+            latest = direct.get(row["artist_tag"].replace("_", " ").casefold())
+            item["nai_direct_score"] = latest["score"] if latest else None
+            item["nai_direct_score_updated_at"] = latest["updated_at"] if latest else None
+            items.append(item)
+        return json_response(items)
+    except ValueError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+def _nai_artist_test_config(payload):
+    supplied = payload.get("config") if isinstance(payload.get("config"), dict) else payload
+    config = dict(supplied or {})
+    legacy_images_per_artist = payload.get("images_per_artist", config.get("images_per_artist", 1))
+    supplied_variants = payload.get("prompt_variants", config.get("prompt_variants"))
+    # A batch owns generation settings, not the request bookkeeping fields.
+    for key in ("name", "artists", "images_per_artist", "delay_seconds", "config"):
+        config.pop(key, None)
+    variants = normalize_prompt_variants(config, legacy_images_per_artist, supplied_variants)
+    config["base_prompt"] = variants[0]["prompt"]
+    config["prompt_variants"] = [{"prompt": item["prompt"], "images_per_artist": item["images_per_artist"]} for item in variants]
+    validate_test_config(config)
+    seed_provided = "seed" in config
+    normalized = normalize_generation_data(config)
+    # An omitted seed means a fresh random seed for every item.  Do not bake
+    # normalize_generation_data's generated convenience seed into the batch.
+    if not seed_provided:
+        normalized.pop("seed", None)
+    return normalized
+
+
+@app.route("/api/nai-artist-tests", methods=["GET", "POST"])
+def api_nai_artist_tests():
+    if request.method == "GET":
+        return json_response(list_nai_artist_tests(DB_PATH))
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return json_response({"error": "Request body must be an object."}, 400)
+    try:
+        config = _nai_artist_test_config(payload)
+        artists = payload.get("artists")
+        if not isinstance(artists, list) or not artists:
+            raise ValueError("대상 작가를 하나 이상 선택하세요.")
+        # Do not allow a stale or hand-written artist score to become the
+        # source of truth: every target must still exist in ratings.
+        with db() as conn:
+            rated = {
+                row["artist_tag"]: row["score"]
+                for row in conn.execute(
+                    "SELECT artist_tag, score FROM ratings WHERE rating_status='rated' AND score IS NOT NULL AND score BETWEEN 1 AND 5"
+                ).fetchall()
+            }
+        normalized_artists = []
+        for artist in artists:
+            if not isinstance(artist, dict):
+                raise ValueError("작가 목록 형식을 확인하세요.")
+            tag = str(artist.get("artist_tag", artist.get("artist", "")) or "").strip()
+            if tag not in rated:
+                raise ValueError(f"평가 목록에서 작가를 찾을 수 없습니다: {tag}")
+            normalized_artists.append({"artist_tag": tag, "danbooru_score": rated[tag]})
+        test = create_nai_artist_test(
+            DB_PATH,
+            payload.get("name") or "NAI 작가 테스트",
+            config,
+            normalized_artists,
+            payload.get("images_per_artist", (config.get("prompt_variants") or [{"images_per_artist": 1}])[0].get("images_per_artist", 1)),
+            payload.get("delay_seconds", 2.0),
+        )
+        return json_response(test, 201)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+    except sqlite3.Error:
+        return json_response({"error": "NAI 작가 테스트를 저장하지 못했습니다."}, 500)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>", methods=["GET", "DELETE"])
+def api_nai_artist_test_detail(test_id):
+    if request.method == "DELETE":
+        try:
+            deleted = delete_nai_artist_test(DB_PATH, test_id)
+        except RuntimeError as exc:
+            return json_response({"error": str(exc)}, 409)
+        except sqlite3.Error:
+            return json_response({"error": "NAI 작가 테스트를 삭제하지 못했습니다."}, 500)
+        if not deleted:
+            return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
+        return json_response({"deleted": True, "test_id": test_id})
+    test = get_nai_artist_test(DB_PATH, test_id)
+    if test is None:
+        return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
+    return json_response(test)
+
+
+@app.route("/api/nai-artist-tests/artist-history")
+@app.route("/api/nai-artist-tests/artists/history")
+def api_nai_artist_test_artist_history():
+    try:
+        return json_response(list_nai_artist_history(DB_PATH, request.args.get("q", "")))
+    except sqlite3.Error:
+        return json_response({"error": "NAI 작가 테스트 기록을 불러오지 못했습니다."}, 500)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>/start", methods=["POST"])
+@app.route("/api/nai-artist-tests/<int:test_id>/resume", methods=["POST"])
+def api_start_nai_artist_test(test_id):
+    test = set_nai_artist_test_status(DB_PATH, test_id, "running")
+    if test is None:
+        return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
+    return json_response(test)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>/pause", methods=["POST"])
+def api_pause_nai_artist_test(test_id):
+    test = set_nai_artist_test_status(DB_PATH, test_id, "paused")
+    if test is None:
+        return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
+    return json_response(test)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>/cancel", methods=["POST"])
+def api_cancel_nai_artist_test(test_id):
+    test = set_nai_artist_test_status(DB_PATH, test_id, "cancelled")
+    if test is None:
+        return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
+    return json_response(test)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>/ratings", methods=["POST"])
+def api_save_nai_artist_test_rating(test_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        test = save_nai_artist_direct_rating(
+            DB_PATH,
+            test_id,
+            payload.get("artist_tag", payload.get("artist")),
+            payload.get("score"),
+        )
+        if test is None:
+            return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
+        return json_response(test)
+    except (TypeError, ValueError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>/append", methods=["POST"])
+def api_append_nai_artist_test_items(test_id):
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return json_response({"error": "Request body must be an object."}, 400)
+    try:
+        variants = payload.get("prompt_variants")
+        if not isinstance(variants, list):
+            raise ValueError("prompt_variants must be a list.")
+        scope = payload.get("target_scope", payload.get("scope", "all"))
+        return json_response(append_nai_artist_test_items(DB_PATH, test_id, variants, scope))
+    except LookupError as exc:
+        return json_response({"error": str(exc)}, 404)
+    except RuntimeError as exc:
+        return json_response({"error": str(exc)}, 409)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>/items/<int:item_id>/rating", methods=["POST"])
+def api_save_nai_artist_test_item_rating(test_id, item_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        test = save_nai_artist_item_rating(DB_PATH, test_id, item_id, payload.get("score"))
+        return json_response(test)
+    except LookupError as exc:
+        return json_response({"error": str(exc)}, 404)
+    except RuntimeError as exc:
+        return json_response({"error": str(exc)}, 409)
+    except (TypeError, ValueError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/nai-artist-tests/<int:test_id>/generate-next", methods=["POST"])
+@app.route("/api/nai-artist-tests/<int:test_id>/next", methods=["POST"])
+def api_generate_next_nai_artist_test_item(test_id):
+    """Generate exactly one pending item; the browser controls the delay."""
+    item, state = claim_nai_artist_test_item(DB_PATH, test_id)
+    if state == "missing":
+        return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
+    if state in {"paused", "cancelled"}:
+        return json_response({"error": "테스트가 중단된 상태입니다.", "status": state}, 409)
+    if state == "awaiting_rating":
+        return json_response({
+            "done": False,
+            "waiting_for_rating": True,
+            "test_id": test_id,
+            "item_id": item["id"],
+            "artist_tag": item["artist_tag"],
+            "test": get_nai_artist_test(DB_PATH, test_id),
+        })
+    if state == "completed":
+        return json_response({"done": True, "test": get_nai_artist_test(DB_PATH, test_id)})
+    test = get_nai_artist_test(DB_PATH, test_id)
+    config = dict(test["config"])
+    artist_prompt = build_artist_prompt([{"artist": item["artist_tag"], "weight": 1.0}])
+    prompt_template = item.get("prompt_template") or config.get("base_prompt", "")
+    config["base_prompt"] = prompt_template.replace(NAI_ARTIST_MARKER, artist_prompt)
+    config["request_id"] = item["request_id"]
+    config["artists"] = [{"artist": item["artist_tag"], "weight": 1.0}]
+    reserved = False
+    try:
+        data = _validate_generation_request(config)
+        payload_hash = _generation_payload_hash(data)
+        reservation, existing = reserve_generation_request(DB_PATH, item["request_id"], payload_hash)
+        if reservation == "mismatch":
+            raise ValueError("request_id was already used with a different payload.")
+        if reservation == "complete":
+            result = existing
+        elif reservation == "processing":
+            return json_response({"error": "Generation request is already processing."}, 409)
+        else:
+            reserved = True
+            app_key = load_app_key(SETTINGS_JSON_PATH, DATA_DIR)
+            if not app_key:
+                raise ValueError("No NovelAI App Key is configured.")
+            # The artist tag is already at the user's marker position in
+            # ``base_prompt``.  Passing it again as the separate artist
+            # section would duplicate the tag at the beginning of input.
+            combined_prompt = combine_generation_prompt(data, "")
+            png_bytes, actual_seed = generate_novelai_png(app_key, data, "", None, data["model"])
+            result = save_generated_result(
+                DB_PATH, GENERATED_DIR, request_id=item["request_id"], artists=data["artists"], png_bytes=png_bytes,
+                base_prompt=data["base_prompt"], quality_prompt=data["quality_prompt"],
+                original_quality_prompt=data["original_quality_prompt"], excluded_quality_tags=data["excluded_quality_tags"],
+                fixed_prompt=data["fixed_prompt"], negative_prompt=data["negative_prompt"], character_prompts=data["character_prompts"],
+                combined_prompt=combined_prompt, seed=actual_seed, width=data["width"], height=data["height"], sampler=data["sampler"],
+                noise_schedule=data["noise_schedule"], steps=data["steps"], scale=data["scale"], cfg_rescale=data["cfg_rescale"],
+                variety_plus=data["variety_plus"], skip_cfg_above_sigma=data["skip_cfg_above_sigma"], model=data["model"],
+                complexity=data["complexity"], quality_toggle=data["quality_toggle"], uc_preset=data["uc_preset"],
+            )
+        result_test = complete_nai_artist_test_item(DB_PATH, test_id, item["id"], result["image_id"])
+        sync_style_group_generated_image(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, test_id, item["artist_tag"],
+            generated_image_id=result["image_id"], image_path=result.get("image_path"),
+        )
+        response = _generation_response(result)
+        response.update({"done": result_test["status"] == "completed", "test_id": test_id, "item_id": item["id"], "artist_tag": item["artist_tag"], "test": result_test})
+        return json_response(response)
+    except SettingsError:
+        if reserved:
+            release_generation_request(DB_PATH, item["request_id"])
+        fail_nai_artist_test_item(DB_PATH, test_id, item["id"], "Settings file is invalid or unsafe.")
+        return json_response({"error": "Settings file is invalid or unsafe."}, 409)
+    except NovelAIError as exc:
+        if reserved:
+            release_generation_request(DB_PATH, item["request_id"])
+        fail_nai_artist_test_item(DB_PATH, test_id, item["id"], exc.public_message)
+        return json_response({"error": exc.public_message}, exc.status_code)
+    except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+        if reserved:
+            release_generation_request(DB_PATH, item["request_id"])
+        fail_nai_artist_test_item(DB_PATH, test_id, item["id"], str(exc))
+        return json_response({"error": str(exc)}, 400 if isinstance(exc, ValueError) else 500)
+
+
+def _generate_claimed_nai_artist_item(test_id, item):
+    """Generate one already-claimed item; used by next and group actions."""
+    test = get_nai_artist_test(DB_PATH, test_id)
+    config = dict(test["config"])
+    artist_prompt = build_artist_prompt([{"artist": item["artist_tag"], "weight": 1.0}])
+    prompt_template = item.get("prompt_template") or config.get("base_prompt", "")
+    config["base_prompt"] = prompt_template.replace(NAI_ARTIST_MARKER, artist_prompt)
+    config["request_id"] = item["request_id"]
+    config["artists"] = [{"artist": item["artist_tag"], "weight": 1.0}]
+    reserved = False
+    try:
+        data = _validate_generation_request(config)
+        payload_hash = _generation_payload_hash(data)
+        reservation, existing = reserve_generation_request(DB_PATH, item["request_id"], payload_hash)
+        if reservation == "mismatch":
+            raise ValueError("request_id was already used with a different payload.")
+        if reservation == "complete":
+            result = existing
+        elif reservation == "processing":
+            return json_response({"error": "Generation request is already processing."}, 409)
+        else:
+            reserved = True
+            app_key = load_app_key(SETTINGS_JSON_PATH, DATA_DIR)
+            if not app_key:
+                raise ValueError("No NovelAI App Key is configured.")
+            combined_prompt = combine_generation_prompt(data, "")
+            png_bytes, actual_seed = generate_novelai_png(app_key, data, "", None, data["model"])
+            result = save_generated_result(
+                DB_PATH, GENERATED_DIR, request_id=item["request_id"], artists=data["artists"], png_bytes=png_bytes,
+                base_prompt=data["base_prompt"], quality_prompt=data["quality_prompt"],
+                original_quality_prompt=data["original_quality_prompt"], excluded_quality_tags=data["excluded_quality_tags"],
+                fixed_prompt=data["fixed_prompt"], negative_prompt=data["negative_prompt"], character_prompts=data["character_prompts"],
+                combined_prompt=combined_prompt, seed=actual_seed, width=data["width"], height=data["height"], sampler=data["sampler"],
+                noise_schedule=data["noise_schedule"], steps=data["steps"], scale=data["scale"], cfg_rescale=data["cfg_rescale"],
+                variety_plus=data["variety_plus"], skip_cfg_above_sigma=data["skip_cfg_above_sigma"], model=data["model"],
+                complexity=data["complexity"], quality_toggle=data["quality_toggle"], uc_preset=data["uc_preset"],
+            )
+        result_test = complete_nai_artist_test_item(DB_PATH, test_id, item["id"], result["image_id"])
+        sync_style_group_generated_image(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, test_id, item["artist_tag"],
+            generated_image_id=result["image_id"], image_path=result.get("image_path"),
+        )
+        response = _generation_response(result)
+        response.update({"done": result_test["status"] == "completed", "test_id": test_id,
+                         "item_id": item["id"], "artist_tag": item["artist_tag"], "test": result_test})
+        return json_response(response)
+    except SettingsError:
+        if reserved:
+            release_generation_request(DB_PATH, item["request_id"])
+        fail_nai_artist_test_item(DB_PATH, test_id, item["id"], "Settings file is invalid or unsafe.")
+        return json_response({"error": "Settings file is invalid or unsafe."}, 409)
+    except NovelAIError as exc:
+        if reserved:
+            release_generation_request(DB_PATH, item["request_id"])
+        fail_nai_artist_test_item(DB_PATH, test_id, item["id"], exc.public_message)
+        return json_response({"error": exc.public_message}, exc.status_code)
+    except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError) as exc:
+        if reserved:
+            release_generation_request(DB_PATH, item["request_id"])
+        fail_nai_artist_test_item(DB_PATH, test_id, item["id"], str(exc))
+        return json_response({"error": str(exc)}, 400 if isinstance(exc, ValueError) else 500)
+
+
+@app.route("/api/style-groups/<int:group_id>/nai-tests/<int:test_id>/generate-first", methods=["POST"])
+def api_style_group_generate_first_nai_artist(group_id, test_id):
+    payload = request.get_json(silent=True) or {}
+    artist_tag = str(payload.get("artist_tag") or payload.get("artist") or "").strip()
+    if not artist_tag:
+        return json_response({"error": "artist_tag가 필요합니다."}, 400)
+    try:
+        group = get_style_group(DB_PATH, group_id)
+        if group is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        base = group.get("base_source") or {}
+        if base.get("source_type") != "nai_test" or str(base.get("source_id")) != str(test_id):
+            return json_response({"error": "기본 대상이 아닌 NAI 테스트에서는 이 기능을 사용할 수 없습니다."}, 409)
+        with closing(sqlite3.connect(DB_PATH)) as connection:
+            connection.row_factory = sqlite3.Row
+            rating = connection.execute(
+                "SELECT score FROM ratings WHERE artist_tag=? AND rating_status='rated'",
+                (artist_tag,),
+            ).fetchone()
+        prepared = prepare_nai_artist_test_item(DB_PATH, test_id, artist_tag, rating[0] if rating else None)
+        item, state = claim_specific_nai_artist_test_item(DB_PATH, test_id, prepared["first_item_id"])
+        if state != "claimed":
+            return json_response({"error": "추가한 작가의 첫 생성 항목을 준비하지 못했습니다."}, 409)
+        return _generate_claimed_nai_artist_item(test_id, item)
+    except LookupError as exc:
+        return json_response({"error": str(exc)}, 404)
+    except RuntimeError as exc:
+        return json_response({"error": str(exc)}, 409)
+    except (TypeError, ValueError, OverflowError, sqlite3.Error) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+STYLE_ARTIST_SOURCE_TYPES = {"rating_management", "nai_test", "style_group"}
+STYLE_ARTIST_SOURCE_SECTIONS = ("rating_management", "nai_test", "style_group")
+STYLE_ARTIST_SOURCE_SETTING_KEYS = (
+    "model", "width", "height", "sampler", "noise_schedule", "steps",
+    "scale", "cfg_rescale", "variety_plus", "skip_cfg_above_sigma",
+    "quality_toggle", "uc_preset", "complexity",
+)
+
+
+def _nai_direct_score_bucket(value):
+    """Convert an image-score average to the existing integer style bucket."""
+    return score_bucket(value)
+
+
+def _style_source_id(source_type, value):
+    if source_type == "rating_management":
+        if str(value or "").strip() != "all":
+            raise ValueError("평가 관리 출처 ID는 all이어야 합니다.")
+        return "all"
+    if isinstance(value, bool) or value in (None, ""):
+        raise ValueError("출처 ID를 확인하세요.")
+    raw = str(value).strip()
+    if not re.fullmatch(r"[0-9]+", raw) or int(raw) < 1:
+        raise ValueError("출처 ID는 양의 정수여야 합니다.")
+    return str(int(raw))
+
+
+def _normalize_style_source_descriptor(value):
+    if not isinstance(value, dict):
+        raise ValueError("작가 출처는 객체여야 합니다.")
+    source_type = str(value.get("source_type") or "").strip().lower()
+    if source_type not in STYLE_ARTIST_SOURCE_TYPES:
+        raise ValueError("알 수 없는 작가 출처 유형입니다.")
+    source_id = _style_source_id(source_type, value.get("source_id"))
+    return {"source_type": source_type, "source_id": source_id}
+
+
+def _style_source_score(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return numeric if math.isfinite(numeric) and 1 <= numeric <= 5 else None
+
+
+def _rating_management_source():
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT * FROM ratings ORDER BY id").fetchall()
+        example_counts = {}
+        try:
+            example_rows = conn.execute(
+                "SELECT rating_id,COUNT(*) AS image_count FROM rating_examples GROUP BY rating_id"
+            ).fetchall()
+            example_counts = {row["rating_id"]: int(row["image_count"] or 0) for row in example_rows}
+        except sqlite3.OperationalError:
+            pass
+    artists = []
+    for row in rows:
+        item = dict(row)
+        artist_tag = str(item.get("artist_tag") or "").strip()
+        if not artist_tag:
+            continue
+        status = item.get("rating_status", "rated")
+        score = item.get("score") if status != "unrated" else None
+        artists.append({
+            "artist_key": normalize_artist_key(artist_tag),
+            "artist_tag": artist_tag,
+            "score": score,
+            "image_count": example_counts.get(item.get("id"), 0) + bool(item.get("representative_thumbnail_path")),
+            "metadata": {
+                "query_text": item.get("query_text") or "",
+                "query_tags_json": item.get("query_tags_json") or "[]",
+                "memo": item.get("memo") or "",
+                "rating_status": status,
+                "updated_at": item.get("updated_at") or "",
+                "danbooru_score": score,
+            },
+        })
+    updated_at = max((item["metadata"]["updated_at"] for item in artists), default="")
+    return {
+        "source_type": "rating_management",
+        "source_id": "all",
+        "label": "평가 관리 전체",
+        "name": "평가 관리 전체",
+        "status": "available",
+        "updated_at": updated_at,
+        "artists": artists,
+    }
+
+
+def _test_source_payload(test_id):
+    source = get_test_artist_source(DB_PATH, test_id)
+    if source is None:
+        raise LookupError("NAI 작가 테스트를 찾을 수 없습니다.")
+    return source
+
+
+def _score_map_for_source(source):
+    return {
+        normalize_artist_key(item.get("artist_key") or item.get("artist_tag")): item.get("score")
+        for item in source.get("artists", [])
+        if normalize_artist_key(item.get("artist_key") or item.get("artist_tag"))
+    }
+
+
+def _group_source_payload(group_id):
+    group = get_style_group(DB_PATH, group_id)
+    if group is None:
+        raise LookupError("그림체 그룹을 찾을 수 없습니다.")
+    connected = []
+    for raw in group.get("sources", []):
+        source_type = str(raw.get("source_type") or "").strip().lower()
+        if source_type == "danbooru":
+            source_type = "rating_management"
+        if source_type == "rating_management":
+            connected.append({**_rating_management_source(), "label": raw.get("label") or "평가 관리 전체"})
+        elif source_type == "nai_test":
+            try:
+                source = _test_source_payload(raw.get("source_id"))
+            except LookupError:
+                continue
+            connected.append({**source, "label": raw.get("label") or source["label"]})
+
+    image_counts = {}
+    for image in group.get("images", []):
+        keys = set(image.get("artist_keys") or [])
+        if image.get("artist_key"):
+            keys.add(image["artist_key"])
+        for key in keys:
+            image_counts[key] = image_counts.get(key, 0) + 1
+    artists = []
+    for member in group.get("included_artists", []):
+        key = normalize_artist_key(member.get("artist_key") or member.get("artist_tag"))
+        if not key:
+            continue
+        contributions = []
+        for source in connected:
+            score = _score_map_for_source(source).get(key)
+            if _style_source_score(score) is not None:
+                contributions.append({
+                    "origin_type": source["source_type"],
+                    "origin_id": source["source_id"],
+                    "label": source.get("label") or source.get("name") or source["source_type"],
+                    "score": score,
+                })
+        artists.append({
+            "artist_key": key,
+            "artist_tag": str(member.get("artist_tag") or key).strip(),
+            "image_count": image_counts.get(key, 0),
+            "contributions": contributions,
+        })
+    return {
+        "source_type": "style_group",
+        "source_id": str(group["id"]),
+        "label": str(group.get("name") or f"그림체 그룹 #{group['id']}"),
+        "name": str(group.get("name") or f"그림체 그룹 #{group['id']}"),
+        "status": "available",
+        "updated_at": group.get("updated_at") or "",
+        "artists": artists,
+        "connected_sources": connected,
+    }
+
+
+def _resolve_style_source(descriptor):
+    source_type = descriptor["source_type"]
+    source_id = descriptor["source_id"]
+    if source_type == "rating_management":
+        return _rating_management_source()
+    if source_type == "nai_test":
+        return _test_source_payload(source_id)
+    return _group_source_payload(source_id)
+
+
+def _source_artist_details(source):
+    merged = {
+        item["artist_key"]: item
+        for item in merge_artist_sources([source])
+    }
+    result = []
+    for artist in sorted(source.get("artists", []), key=lambda item: normalize_artist_key(item.get("artist_key") or item.get("artist_tag"))):
+        key = normalize_artist_key(artist.get("artist_key") or artist.get("artist_tag"))
+        if not key:
+            continue
+        item = merged.get(key)
+        detail = {
+            "artist_key": key,
+            "artist_tag": str(artist.get("artist_tag") or key).strip(),
+            "score": item.get("raw_score") if item else None,
+            "score_bucket": item.get("score_bucket") if item else None,
+            "image_count": int(artist.get("image_count") or 0),
+            "score_sources": item.get("score_sources", []) if item else [],
+        }
+        if item:
+            for key_name in ("query_text", "query_tags_json", "memo", "rating_status", "updated_at", "danbooru_score"):
+                if key_name in item:
+                    detail[key_name] = item[key_name]
+        result.append(detail)
+    return result
+
+
+def _safe_source_settings(config):
+    return {
+        key: config[key]
+        for key in STYLE_ARTIST_SOURCE_SETTING_KEYS
+        if key in config and isinstance(config[key], (str, int, float, bool))
+    }
+
+
+def _source_prompts(source):
+    config = source.get("config") or {}
+    variants = config.get("prompt_variants")
+    if not isinstance(variants, list) or not variants:
+        variants = [{"prompt": config.get("base_prompt", ""), "images_per_artist": source.get("images_per_artist", 1)}]
+    prompts = []
+    for index, variant in enumerate(variants):
+        if isinstance(variant, str):
+            variant = {"prompt": variant}
+        if not isinstance(variant, dict):
+            continue
+        prompt = str(variant.get("prompt", variant.get("base_prompt", "")) or "")
+        prompts.append({
+            "label": str(variant.get("label") or f"변형 {index + 1}"),
+            "prompt": prompt,
+            "base_prompt": prompt,
+            "leading_prompt": str(variant.get("leading_prompt", config.get("leading_prompt", "")) or ""),
+            "fixed_prompt": str(variant.get("fixed_prompt", config.get("fixed_prompt", "")) or ""),
+            "negative_prompt": str(variant.get("negative_prompt", config.get("negative_prompt", "")) or ""),
+            "images_per_artist": variant.get("images_per_artist", variant.get("count")),
+        })
+    return prompts
+
+
+def _style_source_response(source):
+    detail = {
+        "source_type": source["source_type"],
+        "source_id": str(source["source_id"]),
+        "label": source.get("label") or source.get("name") or "작가 출처",
+        "status": source.get("status") or "available",
+        "updated_at": source.get("updated_at") or "",
+    }
+    payload = {
+        "source": detail,
+        "artists": _source_artist_details(source),
+        "prompts": _source_prompts(source) if source["source_type"] == "nai_test" else [],
+        "settings": _safe_source_settings(source.get("config") or {}) if source["source_type"] == "nai_test" else {},
+    }
+    if source["source_type"] == "style_group":
+        payload["prompts"] = [
+            {
+                **prompt,
+                "label": f"{connected.get('label') or connected.get('name') or 'NAI 테스트'} · {prompt['label']}",
+                "source_type": connected["source_type"],
+                "source_id": str(connected["source_id"]),
+            }
+            for connected in source.get("connected_sources", [])
+            if connected.get("source_type") == "nai_test"
+            for prompt in _source_prompts(connected)
+        ]
+    return payload
+
+
+def _style_source_summary(source):
+    artists = source.get("artists", [])
+    details = _source_artist_details(source)
+    return {
+        "source_type": source["source_type"],
+        "source_id": str(source["source_id"]),
+        "label": source.get("label") or source.get("name") or "작가 출처",
+        "status": source.get("status") or "available",
+        "artist_count": len({normalize_artist_key(item.get("artist_key") or item.get("artist_tag")) for item in artists if normalize_artist_key(item.get("artist_key") or item.get("artist_tag"))}),
+        "scored_artist_count": sum(1 for item in details if item.get("score") is not None),
+        "updated_at": source.get("updated_at") or "",
+    }
+
+
+def _validated_artist_sources(value, require_existing=True):
+    if not isinstance(value, list) or not value:
+        raise ValueError("작가 출처를 하나 이상 선택하세요.")
+    descriptors = []
+    sources = []
+    seen = set()
+    for raw in value:
+        descriptor = _normalize_style_source_descriptor(raw)
+        key = (descriptor["source_type"], descriptor["source_id"])
+        if key in seen:
+            raise ValueError("같은 작가 출처를 중복 선택할 수 없습니다.")
+        seen.add(key)
+        try:
+            source = _resolve_style_source(descriptor)
+        except LookupError:
+            if require_existing:
+                raise ValueError("선택한 작가 출처를 찾을 수 없습니다.") from None
+            source = None
+        descriptors.append(descriptor)
+        sources.append(source)
+    return descriptors, [source for source in sources if source is not None]
+
+
+def _style_source_list():
+    sources = [_rating_management_source()]
+    for test in list_nai_artist_tests(DB_PATH):
+        try:
+            sources.append(_test_source_payload(test["id"]))
+        except LookupError:
+            continue
+    for group in list_style_groups(DB_PATH):
+        try:
+            sources.append(_group_source_payload(group["id"]))
+        except LookupError:
+            continue
+    order = {name: index for index, name in enumerate(STYLE_ARTIST_SOURCE_SECTIONS)}
+    sources.sort(key=lambda source: (
+        order[source["source_type"]],
+        "" if source["source_type"] == "rating_management" else source.get("updated_at", ""),
+        0 if source["source_type"] == "rating_management" else -int(source["source_id"]),
+    ), reverse=False)
+    # Section order is fixed; only the non-rating sections are newest first.
+    rating = [source for source in sources if source["source_type"] == "rating_management"]
+    others = [source for source in sources if source["source_type"] != "rating_management"]
+    others.sort(key=lambda source: (order[source["source_type"]], source.get("updated_at", ""), int(source["source_id"])), reverse=False)
+    grouped = rating + [source for source in others if source["source_type"] == "nai_test"] + [source for source in others if source["source_type"] == "style_group"]
+    for section in ("nai_test", "style_group"):
+        section_sources = [source for source in grouped if source["source_type"] == section]
+        section_sources.sort(key=lambda source: (source.get("updated_at", ""), int(source["source_id"])), reverse=True)
+        grouped = [source for source in grouped if source["source_type"] != section] + section_sources
+    grouped.sort(key=lambda source: order[source["source_type"]])
+    return [_style_source_summary(source) for source in grouped]
+
+
+@app.route("/api/style-maker/artist-sources")
+def api_style_maker_artist_sources():
+    try:
+        return json_response({"sources": _style_source_list()})
+    except sqlite3.Error:
+        return json_response({"error": "작가 출처 목록을 불러오지 못했습니다."}, 500)
+
+
+@app.route("/api/style-maker/artist-sources/<source_type>/<source_id>")
+def api_style_maker_artist_source_detail(source_type, source_id):
+    try:
+        descriptor = _normalize_style_source_descriptor({
+            "source_type": source_type,
+            "source_id": source_id,
+        })
+        source = _resolve_style_source(descriptor)
+        return json_response(_style_source_response(source))
+    except ValueError as exc:
+        return json_response({"error": str(exc)}, 400)
+    except LookupError as exc:
+        return json_response({"error": str(exc)}, 404)
+    except sqlite3.Error:
+        return json_response({"error": "작가 출처 상세를 불러오지 못했습니다."}, 500)
+
+
+def _style_group_request_payload():
+    payload = request.get_json(silent=True)
+    if isinstance(payload, dict):
+        return payload
+    raw = request.form.get("payload", "")
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            decoded = {}
+        return decoded if isinstance(decoded, dict) else {}
+    return request.form.to_dict(flat=True)
+
+
+def _style_group_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+@app.route("/api/style-groups/targets")
+def api_style_group_targets():
+    with closing(db()) as conn:
+        ratings = conn.execute(
+            """SELECT r.id,r.artist_tag,r.score,r.representative_thumbnail_path,
+                      COUNT(e.id) AS example_count
+               FROM ratings r LEFT JOIN rating_examples e ON e.rating_id=r.id
+               GROUP BY r.id ORDER BY r.updated_at DESC,r.id DESC"""
+        ).fetchall()
+        examples_by_rating = {}
+        if ratings:
+            placeholders = ",".join("?" for _ in ratings)
+            for row in conn.execute(
+                f"SELECT rating_id,image_path FROM rating_examples WHERE rating_id IN ({placeholders})",
+                [row["id"] for row in ratings],
+            ).fetchall():
+                examples_by_rating.setdefault(row["rating_id"], []).append(row["image_path"])
+        tests = conn.execute(
+            """SELECT t.id,t.name,t.status,COUNT(i.id) AS generated_count,
+                      GROUP_CONCAT(g.image_path, '|') AS generated_paths
+               FROM nai_artist_tests t LEFT JOIN nai_artist_test_items i
+                 ON i.test_id=t.id AND i.status='complete' AND i.generated_image_id IS NOT NULL
+               LEFT JOIN generated_images g ON g.id=i.generated_image_id
+               GROUP BY t.id HAVING COUNT(i.id) > 0 ORDER BY t.updated_at DESC,t.id DESC"""
+        ).fetchall()
+    def local_generated_path(value):
+        normalized = str(value or "").replace("\\", "/")
+        path = Path(normalized)
+        if not normalized or path.is_absolute() or ".." in path.parts or normalized != path.as_posix():
+            return False
+        root = GENERATED_DIR.resolve()
+        target = (GENERATED_DIR / path).resolve()
+        return root in target.parents and target.is_file()
+
+    def local_thumbnail_path(value):
+        target = safe_thumbnail_path(value)
+        return bool(target and target.is_file())
+
+    ratings = [
+        row for row in ratings
+        if local_thumbnail_path(row["representative_thumbnail_path"])
+        or any(
+            local_thumbnail_path(path)
+            for path in examples_by_rating.get(row["id"], [])
+        )
+    ]
+    tests = [
+        row for row in tests
+        if any(local_generated_path(path) for path in str(row["generated_paths"] or "").split("|"))
+    ]
+
+    def rating_target_payload(row):
+        representative = row["representative_thumbnail_path"]
+        return {
+            **dict(row),
+            "source_type": "danbooru",
+            "source_id": row["id"],
+            # A row may be eligible because an example exists even when its
+            # representative path is stale.  Do not emit an unsafe/stale URL.
+            "image_url": (
+                f"/thumbnails/{representative}"
+                if local_thumbnail_path(representative) else ""
+            ),
+        }
+
+    legacy_payload = {
+        "danbooru": [rating_target_payload(row) for row in ratings],
+        "nai_test": [
+            {**dict(row), "source_type": "nai_test", "source_id": row["id"]}
+            for row in tests
+        ],
+    }
+    modern_targets = list_style_group_targets(
+        DB_PATH, {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR}
+    )
+    rating_management = next(
+        (target for target in modern_targets if target.get("source_type") == "rating_management"),
+        None,
+    )
+    return json_response({
+        **legacy_payload,
+        "sources": modern_targets,
+        "rating_management": rating_management,
+        "nai_tests": [target for target in modern_targets if target.get("source_type") == "nai_test"],
+    })
+
+
+@app.route("/api/style-groups", methods=["GET", "POST"])
+def api_style_groups():
+    if request.method == "GET":
+        return json_response(list_style_groups(DB_PATH))
+    payload = _style_group_request_payload()
+    try:
+        sources = payload.get("sources", [])
+        if isinstance(sources, str):
+            sources = json.loads(sources or "[]")
+        if not isinstance(sources, list):
+            raise ValueError("sources must be a list.")
+        modern = bool(payload.get("author_mode")) or any(
+            isinstance(source, dict) and str(source.get("source_type", "")).strip().lower()
+            in {"rating_management", "ratings_management", "nai_test", "nai"}
+            for source in sources
+        )
+        if modern:
+            if request.files.get("reference_image"):
+                raise ValueError("새 기준 이미지는 출처 갤러리에서 선택해 주세요.")
+            base = payload.get("base_source")
+            if isinstance(base, str):
+                base = json.loads(base)
+            reference = payload.get("reference")
+            if isinstance(reference, str):
+                reference = json.loads(reference)
+            result = create_author_group(
+                DB_PATH, STYLE_GROUP_IMAGE_DIR, payload.get("name", ""), sources,
+                base_source=base, reference=reference,
+                source_roots={"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+            )
+            return json_response(result, 201)
+        upload = request.files.get("reference_image")
+        reference_bytes = upload.stream.read(32 * 1024 * 1024 + 1) if upload else None
+        result = create_style_group(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, payload.get("name", ""), sources,
+            reference_bytes=reference_bytes, reference_name=upload.filename if upload else "",
+        )
+        return json_response(result, 201)
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+        return json_response({"error": str(exc)}, 400)
+    except sqlite3.Error:
+        return json_response({"error": "그림체 그룹을 저장하지 못했습니다."}, 500)
+
+
+@app.route("/api/style-groups/<int:group_id>", methods=["GET", "PATCH", "DELETE"])
+def api_style_group_detail(group_id):
+    if request.method == "GET":
+        result = get_style_group(DB_PATH, group_id)
+        return json_response(result if result is not None else {"error": "그림체 그룹을 찾을 수 없습니다."}, 200 if result else 404)
+    if request.method == "DELETE":
+        deleted = delete_style_group(DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id)
+        return json_response({"deleted": True, "group_id": group_id} if deleted else {"error": "그림체 그룹을 찾을 수 없습니다."}, 200 if deleted else 404)
+    payload = _style_group_request_payload()
+    try:
+        group_before = get_style_group(DB_PATH, group_id)
+        modern = bool(
+            payload.get("base_source") or payload.get("base_source_type")
+            or payload.get("reference")
+            or (group_before and group_before.get("base_source_type"))
+        )
+        result = update_style_group(
+            DB_PATH, group_id, name=payload.get("name") if "name" in payload else None,
+            reference_image_id=payload.get("reference_image_id") if payload.get("reference_image_id") not in (None, "") else None,
+            clear_reference=_style_group_bool(payload.get("clear_reference", False)),
+        )
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        if modern:
+            if request.files.get("reference_image"):
+                raise ValueError("새 기준 이미지는 출처 갤러리에서 선택해 주세요.")
+            base = payload.get("base_source")
+            if isinstance(base, str):
+                base = json.loads(base)
+            if base:
+                result = set_style_group_base_source(
+                    DB_PATH, group_id, base.get("source_type"), base.get("source_id")
+                )
+            reference = payload.get("reference")
+            if isinstance(reference, str):
+                reference = json.loads(reference)
+            if reference:
+                result = select_style_group_reference(
+                    DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id,
+                    reference.get("source_type"), reference.get("source_id"),
+                    reference.get("candidate_key"),
+                    {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+                )
+            return json_response(result)
+        upload = request.files.get("reference_image")
+        if upload:
+            data = upload.stream.read(32 * 1024 * 1024 + 1)
+            result = add_uploaded_image(DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, data, upload.filename)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/sources", methods=["POST"])
+def api_style_group_sources(group_id):
+    payload = _style_group_request_payload()
+    try:
+        sources = payload.get("sources", payload if isinstance(payload, list) else [])
+        if isinstance(sources, str):
+            sources = json.loads(sources or "[]")
+        modern = any(
+            isinstance(source, dict) and str(source.get("source_type", "")).strip().lower()
+            in {"rating_management", "ratings_management", "nai_test", "nai"}
+            for source in sources
+        )
+        if modern:
+            result = add_style_group_sources_modern(
+                DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, sources,
+                {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+            )
+            if result is None:
+                return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+            return json_response(result)
+        result = add_style_group_sources(DB_PATH, group_id, sources)
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/candidates")
+def api_style_group_candidates(group_id):
+    try:
+        result = list_style_group_candidates(DB_PATH, group_id, request.args.get("source_id"))
+        if get_style_group(DB_PATH, group_id) is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response({"sources": result})
+    except (TypeError, ValueError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/sources/<int:source_id>/candidates")
+def api_style_group_source_candidates(group_id, source_id):
+    try:
+        result = list_style_group_candidates(DB_PATH, group_id, source_id)
+        if get_style_group(DB_PATH, group_id) is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response({"source": result[0] if result else None})
+    except (TypeError, ValueError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/source-gallery")
+def api_style_group_source_gallery():
+    try:
+        result = list_style_group_source_gallery(
+            DB_PATH, request.args.get("source_type"), request.args.get("source_id"),
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+        )
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/artist-review")
+def api_style_group_artist_review(group_id):
+    try:
+        result = list_style_group_artist_review(
+            DB_PATH, group_id, request.args.get("artist_key"),
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+        )
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/artist-gallery")
+def api_style_group_artist_gallery(group_id):
+    try:
+        result = get_style_group_artist_gallery(
+            DB_PATH, group_id, request.args.get("artist_key"),
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+        )
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/artist-decision", methods=["POST"])
+def api_style_group_artist_decision(group_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        artist_tag = payload.get("artist_tag") or payload.get("artist_key")
+        include = payload.get("include")
+        if not isinstance(include, bool):
+            raise ValueError("include must be boolean.")
+        result = record_style_group_artist_decision(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, artist_tag, include,
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+            payload.get("reference_source_type"), payload.get("reference_source_id"),
+            payload.get("reference_candidate_key"),
+        )
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/artists", methods=["POST"])
+def api_style_group_direct_artist(group_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = add_style_group_direct_artist(
+            DB_PATH, group_id, payload.get("artist_tag") or payload.get("artist"), STYLE_GROUP_IMAGE_DIR
+        )
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result, 201)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/artists/<path:artist_key>", methods=["DELETE"])
+def api_style_group_remove_artist(group_id, artist_key):
+    try:
+        result = remove_style_group_artist(DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, artist_key)
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/artists/<path:artist_key>/reconsider", methods=["POST"])
+def api_style_group_reconsider_artist(group_id, artist_key):
+    try:
+        result = reconsider_style_group_artist(
+            DB_PATH, group_id, artist_key,
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+        )
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/reference", methods=["POST"])
+def api_style_group_select_reference(group_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = select_style_group_reference(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id,
+            payload.get("source_type"), payload.get("source_id"), payload.get("candidate_key"),
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+        )
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/base-source", methods=["PATCH"])
+def api_style_group_base_source(group_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        result = set_style_group_base_source(
+            DB_PATH, group_id, payload.get("source_type"), payload.get("source_id")
+        )
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/danbooru/search", methods=["POST"])
+def api_style_group_danbooru_search():
+    payload = request.get_json(silent=True) or {}
+    artist_tag = str(payload.get("artist_tag") or payload.get("artist") or "").strip()
+    if not artist_tag:
+        return json_response({"error": "artist_tag가 필요합니다."}, 400)
+    try:
+        samples = fetch_artist_samples(
+            artist_tag,
+            payload.get("query_tags") or normalize_query_text(payload.get("query_text", "")),
+            payload.get("sample_limit", 30),
+            payload.get("latest_samples") is True,
+            normalize_cutoff_date(payload.get("cutoff_date")),
+        )
+        return json_response({"artist_tag": artist_tag, "samples": samples})
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+    except requests.RequestException as exc:
+        return json_response({"error": f"Danbooru API 오류: {exc}"}, 502)
+
+
+@app.route("/api/style-groups/<int:group_id>/artists/import", methods=["POST"])
+def api_style_group_import_danbooru_artist(group_id):
+    payload = request.get_json(silent=True) or {}
+    artist_tag = str(payload.get("artist_tag") or payload.get("artist") or "").strip()
+    samples = payload.get("samples") or []
+    if not artist_tag or not isinstance(samples, list) or not samples:
+        return json_response({"error": "작가와 하나 이상의 그림을 선택해 주세요."}, 400)
+    try:
+        group = get_style_group(DB_PATH, group_id)
+        if group is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        timestamp = now_text()
+        prepared = []
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ValueError("그림 선택 형식을 확인해 주세요.")
+            post_id = sample.get("id", sample.get("post_id"))
+            url = sample.get("large_url") or sample.get("preview_url") or sample.get("url") or ""
+            filename = download_thumbnail(url, artist_tag, post_id)
+            if not filename or safe_thumbnail_path(filename) is None:
+                continue
+            prepared.append((post_id, filename, sample))
+        if not prepared:
+            raise ValueError("선택한 그림을 저장하지 못했습니다.")
+        normalized_key = normalize_style_group_artist_tag(artist_tag)
+        with closing(sqlite3.connect(DB_PATH)) as connection, connection:
+            connection.row_factory = sqlite3.Row
+            existing = connection.execute(
+                "SELECT id,artist_tag,score,rating_status FROM ratings"
+            ).fetchall()
+            rating = next((row for row in existing if normalize_style_group_artist_tag(row["artist_tag"]) == normalized_key), None)
+            supplied_score = payload.get("score")
+            if supplied_score is not None:
+                supplied_score = int(supplied_score)
+                if supplied_score < 1 or supplied_score > 5:
+                    raise ValueError("score는 1~5여야 합니다.")
+            if rating is None:
+                cursor = connection.execute(
+                    """INSERT INTO ratings
+                       (artist_tag,score,rating_status,memo,mode,query_text,query_tags_json,matched_post_count,artist_post_count,
+                        representative_post_id,representative_thumbnail_path,representative_preview_url,sample_post_ids_json,prompt_text,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (artist_tag, supplied_score if supplied_score else None, "rated" if supplied_score else "unrated", "", "style_group_import", "", "[]", 0, 0,
+                     prepared[0][0], prepared[0][1], prepared[0][2].get("preview_url") or "", json.dumps([item[0] for item in prepared]),
+                     candidate_prompt(artist_tag), timestamp, timestamp),
+                )
+                rating_id = cursor.lastrowid
+            else:
+                rating_id = rating["id"]
+                if supplied_score:
+                    connection.execute(
+                        "UPDATE ratings SET score=?,rating_status='rated',updated_at=? WHERE id=?",
+                        (supplied_score, timestamp, rating_id),
+                    )
+                connection.execute(
+                    "UPDATE ratings SET representative_post_id=COALESCE(representative_post_id,?),representative_thumbnail_path=COALESCE(NULLIF(representative_thumbnail_path,''),?),updated_at=? WHERE id=?",
+                    (prepared[0][0], prepared[0][1], timestamp, rating_id),
+                )
+            for post_id, filename, sample in prepared:
+                if post_id is None:
+                    continue
+                connection.execute(
+                    """INSERT OR IGNORE INTO rating_examples
+                       (rating_id,post_id,image_path,source_url,post_url,created_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (rating_id, post_id, filename, sample.get("large_url") or sample.get("preview_url") or "", sample.get("post_url") or "", timestamp),
+                )
+        if not any(source.get("source_type") == "rating_management" for source in group.get("sources", [])):
+            add_style_group_sources_modern(
+                DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id,
+                [{"source_type": "rating_management", "source_id": "all", "label": "평가 관리"}],
+                {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+            )
+        result = record_style_group_artist_decision(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, artist_tag, True,
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR}, direct=False,
+        )
+        return json_response(result, 201)
+    except requests.RequestException as exc:
+        return json_response({"error": f"Danbooru API 오류: {exc}"}, 502)
+    except (TypeError, ValueError, OverflowError, sqlite3.Error) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/decision", methods=["POST"])
+def api_style_group_decision(group_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        source_id = int(payload.get("source_id"))
+        candidate_key = str(payload.get("candidate_key") or "")
+        if not candidate_key:
+            raise ValueError("candidate_key is required.")
+        include = payload.get("include")
+        if not isinstance(include, bool):
+            raise ValueError("include must be boolean.")
+        result = record_style_group_decision(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, source_id, candidate_key, include,
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+        )
+        if result is None:
+            return json_response({"error": "그룹 또는 소스를 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/sources/<int:source_id>/decision", methods=["POST"])
+def api_style_group_source_decision(group_id, source_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        candidate_key = str(payload.get("candidate_key") or "")
+        include = payload.get("include")
+        if not candidate_key or not isinstance(include, bool):
+            raise ValueError("candidate_key and boolean include are required.")
+        result = record_style_group_decision(
+            DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, source_id, candidate_key, include,
+            {"thumbnails": THUMBNAIL_DIR, "generated": GENERATED_DIR},
+        )
+        if result is None:
+            return json_response({"error": "그룹 또는 소스를 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/api/style-groups/<int:group_id>/images/<int:image_id>", methods=["DELETE", "PATCH"])
+def api_style_group_image(group_id, image_id):
+    if request.method == "DELETE":
+        result = remove_style_group_image(DB_PATH, STYLE_GROUP_IMAGE_DIR, group_id, image_id)
+        return json_response(result if result is not None else {"error": "이미지를 찾을 수 없습니다."}, 200 if result else 404)
+    payload = request.get_json(silent=True) or {}
+    try:
+        is_reference = _style_group_bool(payload.get("is_reference", True))
+        result = update_style_group(DB_PATH, group_id, reference_image_id=image_id if is_reference else None, clear_reference=not is_reference)
+        if result is None:
+            return json_response({"error": "그림체 그룹을 찾을 수 없습니다."}, 404)
+        return json_response(result)
+    except ValueError as exc:
+        return json_response({"error": str(exc)}, 400)
+
+
+@app.route("/style-group-images/<path:filename>")
+def style_group_image(filename):
+    normalized = filename.replace("\\", "/")
+    path = Path(normalized)
+    if path.is_absolute() or ".." in path.parts or normalized != path.as_posix():
+        return json_response({"error": "Invalid style group image path."}, 400)
+    root = STYLE_GROUP_IMAGE_DIR.resolve()
+    target = (root / path).resolve()
+    if root not in target.parents or not target.is_file():
+        return json_response({"error": "Style group image not found."}, 404)
+    return send_from_directory(root, path.as_posix())
 
 
 @app.route("/api/style-maker/artists", methods=["POST"])
@@ -1321,14 +2964,43 @@ def api_style_maker_artists():
             if not isinstance(scores, list) or not scores:
                 raise ValueError("선택할 평점을 하나 이상 지정하세요.")
             scores = [exact_score(score) for score in scores]
-            with closing(db()) as conn:
-                rows = conn.execute(
-                    "SELECT artist_tag, score, query_text, query_tags_json FROM ratings"
-                ).fetchall()
-            rated_rows = [
-                row for row in rows
-                if rating_tag_rules or rating_matches_tag_filter(row, rating_tag_filter)
-            ]
+            if "artist_sources" in payload:
+                source_descriptors, source_payloads = _validated_artist_sources(payload.get("artist_sources"))
+                rated_rows = merge_artist_sources(source_payloads)
+                for item in rated_rows:
+                    item.setdefault("query_text", "")
+                    item.setdefault("query_tags_json", "[]")
+                rated_rows = [
+                    item for item in rated_rows
+                    if rating_tag_rules or rating_matches_tag_filter(item, rating_tag_filter)
+                ]
+            else:
+                rating_source = str(
+                    payload.get("rating_source", payload.get("rating_basis", "danbooru"))
+                    or "danbooru"
+                ).strip().lower()
+                if rating_source in {"direct", "nai", "nai-direct", "nai_direct_score"}:
+                    rating_source = "nai_direct"
+                if rating_source not in {"danbooru", "nai_direct"}:
+                    raise ValueError("평점 기준은 danbooru 또는 nai_direct여야 합니다.")
+                with closing(db()) as conn:
+                    rows = conn.execute(
+                        "SELECT artist_tag, score, query_text, query_tags_json FROM ratings WHERE rating_status='rated' AND score IS NOT NULL AND score BETWEEN 1 AND 5"
+                    ).fetchall()
+                direct_scores = latest_direct_rating_map(DB_PATH) if rating_source == "nai_direct" else {}
+                rated_rows = []
+                for row in rows:
+                    item = dict(row)
+                    if rating_source == "nai_direct":
+                        direct = direct_scores.get(item["artist_tag"].replace("_", " ").casefold())
+                        if direct is None:
+                            continue
+                        item["danbooru_score"] = item["score"]
+                        item["score"] = _nai_direct_score_bucket(direct["score"])
+                        item["nai_direct_score"] = float(direct["score"])
+                        item["nai_direct_score_updated_at"] = direct["updated_at"]
+                    if rating_tag_rules or rating_matches_tag_filter(item, rating_tag_filter):
+                        rated_rows.append(item)
             if rating_exclude_tags:
                 rated_rows = [
                     row for row in rated_rows
@@ -1595,11 +3267,10 @@ def api_style_maker_prompt_presets():
     if not isinstance(payload, dict):
         return json_response({"ok": False, "error": "요청 내용을 확인해 주세요."}, 400)
     try:
-        result = get_style_maker_prompt_presets(
-            DB_PATH,
-            payload.get("artists", []),
-            payload.get("limit", 30),
-        )
+        prompt_preset_args = [DB_PATH, payload.get("artists", []), payload.get("limit", 30)]
+        if "model_filter" in payload:
+            prompt_preset_args.append(payload.get("model_filter"))
+        result = get_style_maker_prompt_presets(*prompt_preset_args)
         overrides = load_prompt_preset_overrides(SETTINGS_JSON_PATH, DATA_DIR)
         for preset in result.get("presets", []):
             preset["original_quality_prompt"] = preset.get("base_prompt") or preset.get("quality_prompt") or ""
@@ -2163,6 +3834,7 @@ def _generation_payload_hash(data):
     canonical = {
         "artists": data["artists"],
         "base_prompt": data["base_prompt"],
+        "leading_prompt": data["leading_prompt"],
         "quality_prompt": data["quality_prompt"],
         "original_quality_prompt": data["original_quality_prompt"],
         "excluded_quality_tags": data["excluded_quality_tags"],
@@ -2385,6 +4057,75 @@ def _add_confirmed_url(item):
     return item
 
 
+def _all_generated_item(item, source):
+    """Decorate one generated image with a stable, human-readable source."""
+    decorated = _add_generated_urls(dict(item))
+    decorated["record_key"] = f"generated:{decorated['id']}"
+    decorated["source_type"] = source.get("source_type") if source else "style_maker"
+    decorated["source_label"] = source.get("source_label") if source else "그림체 제작"
+    decorated["source_name"] = source.get("source_name") if source else "그림체 제작"
+    if source:
+        decorated["source_id"] = source.get("source_id")
+        decorated["source_artist_tag"] = source.get("source_artist_tag") or ""
+    return decorated
+
+
+def _comparison_history_item(result):
+    """Normalize a comparison result into the style-manager detail shape."""
+    item = dict(result)
+    settings = item.get("settings") if isinstance(item.get("settings"), dict) else {}
+    group_defaults = item.get("group_defaults") if isinstance(item.get("group_defaults"), dict) else {}
+
+    def value(key, *fallbacks):
+        for candidate in (settings.get(key), item.get(key), *fallbacks):
+            if candidate is not None and candidate != "":
+                return candidate
+        return None
+
+    item["width"] = value("width", item.get("group_width"))
+    item["height"] = value("height", item.get("group_height"))
+    item["seed"] = value("seed")
+    for key, fallback in (
+        ("sampler", "k_euler_ancestral"),
+        ("noise_schedule", "karras"),
+        ("steps", 28),
+        ("scale", 5.0),
+        ("cfg_rescale", 0.0),
+        ("model", group_defaults.get("model") or ""),
+        ("complexity", group_defaults.get("complexity") or ""),
+        ("quality_toggle", group_defaults.get("quality_toggle", False)),
+        ("uc_preset", group_defaults.get("uc_preset", 0)),
+    ):
+        item[key] = value(key, fallback)
+    item["artist_prompt"] = value("artist_prompt", "") or ""
+    item["quality_prompt"] = value("quality_prompt", "") or ""
+    item["original_quality_prompt"] = value("original_quality_prompt", item["quality_prompt"]) or ""
+    item["base_prompt"] = value("base_prompt", item["quality_prompt"]) or ""
+    item["fixed_prompt"] = (
+        settings.get("comparison_fixed_prompt")
+        or settings.get("fixed_prompt")
+        or item.get("group_fixed_prompt")
+        or ""
+    )
+    item["negative_prompt"] = value("negative_prompt", "") or ""
+    characters = value("character_prompts", item.get("group_character_prompts"))
+    item["character_prompts"] = characters if isinstance(characters, list) else []
+    item["variety_plus"] = bool(value("variety_plus", False))
+    item["quality_toggle"] = bool(item["quality_toggle"])
+    item["uc_preset"] = int(item["uc_preset"] or 0)
+    item["name"] = item.get("style_name") or f"비교 결과 #{item['id']}"
+    item["title"] = item["name"]
+    item["record_key"] = f"comparison:{item['id']}"
+    item["source_type"] = "comparison"
+    item["source_label"] = "비교군 관리"
+    group_name = str(item.get("group_name") or "비교군").strip()
+    style_name = str(item.get("style_name") or "비교 결과").strip()
+    item["source_name"] = f"{group_name} · {style_name}"
+    item["image_url"] = f"/comparison-images/{item['image_path']}"
+    item["thumbnail_url"] = f"/style-manager-thumbnails/comparison/{item['image_path']}"
+    return item
+
+
 def _json_object(value):
     if isinstance(value, dict):
         return value
@@ -2553,6 +4294,22 @@ def api_style_manager_generated():
     return json_response([_add_generated_urls(item) for item in list_generated_images(DB_PATH)])
 
 
+@app.route("/api/style-manager/all-generated", methods=["GET"])
+def api_style_manager_all_generated():
+    nai_sources = list_generated_image_sources(DB_PATH)
+    generated = [
+        _all_generated_item(item, nai_sources.get(int(item["id"])))
+        for item in list_all_generated_images(DB_PATH)
+    ]
+    comparisons = [_comparison_history_item(item) for item in list_comparison_results(DB_PATH)]
+    records = [*generated, *comparisons]
+    records.sort(
+        key=lambda item: (str(item.get("created_at") or ""), str(item.get("record_key") or "")),
+        reverse=True,
+    )
+    return json_response(records)
+
+
 @app.route("/api/style-manager/generated/delete-batch", methods=["POST"])
 def api_delete_generated_images_batch():
     payload = request.get_json(silent=True)
@@ -2600,7 +4357,11 @@ def api_style_manager_shared():
                     _safe_source_image(ARCA_STYLE_IMAGE_DIR, local_path),
                     item.get("content_type") or "",
                 )
-                item["model"] = image_metadata.get("model") or ""
+                for key in (
+                    "model", "model_id", "model_family", "model_generation", "model_variant",
+                ):
+                    if image_metadata.get(key) not in (None, ""):
+                        item[key] = image_metadata[key]
             except ValueError:
                 pass
     return json_response(result)
@@ -3255,6 +5016,7 @@ def style_manager_thumbnail(source, filename):
         "generated": GENERATED_DIR,
         "confirmed": CONFIRMED_STYLE_IMAGE_DIR,
         "shared": ARCA_STYLE_IMAGE_DIR,
+        "comparison": COMPARISON_IMAGE_DIR,
     }
     root = roots.get(source)
     normalized = filename.replace("\\", "/")
@@ -3310,8 +5072,8 @@ def api_update_rating(rating_id):
         score = int(payload["score"])
         if score < 1 or score > 5:
             return json_response({"ok": False, "error": "score는 1~5여야 합니다."}, 400)
-        allowed.append("score = ?")
-        params.append(score)
+        allowed.extend(("score = ?", "rating_status = ?"))
+        params.extend((score, "rated"))
     for key in ("memo",):
         if key in payload:
             allowed.append(f"{key} = ?")
@@ -3561,6 +5323,11 @@ def thumbnails(filename):
 
 
 if __name__ == "__main__":
+    from launcher import parse_data_directory_options
+
+    data_dirs, primary_data_dir = parse_data_directory_options(sys.argv[1:])
+    if data_dirs:
+        configure_data_directories(data_dirs, primary_data_dir)
     init_db()
     print("Danbooru Artist Rater")
     print("Open http://127.0.0.1:5001")

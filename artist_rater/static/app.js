@@ -9,6 +9,8 @@ const state = {
   loadingCandidates: false,
   loadingSamples: false,
   savingRating: false,
+  skippingArtist: false,
+  skippedArtists: [],
   autocompleteItems: [],
   autocompleteIndex: -1,
   excludeAutocompleteItems: [],
@@ -453,6 +455,18 @@ function handleManualArtistKeydown(event) {
   } else if (event.key === "Escape") {
     box.classList.add("hidden");
   }
+}
+
+function bindManualTagsAutocomplete() {
+  const input = $("manualTags");
+  const helper = globalThis.promptTagAutocomplete;
+  if (!input || !helper || typeof helper.bind !== "function") return false;
+  helper.bind(input);
+  return true;
+}
+
+if (typeof window !== "undefined") {
+  if (!bindManualTagsAutocomplete() && typeof window.addEventListener === "function") window.addEventListener("load", bindManualTagsAutocomplete, { once: true });
 }
 
 async function addManualRating() {
@@ -1146,6 +1160,7 @@ function ratingParams() {
   if (filter === "score5") params.set("score_min", "5");
   if (filter === "score4") params.set("score_min", "4");
   if (filter === "score3") params.set("score_max", "3");
+  if (filter === "unrated") params.set("rating_status", "unrated");
   const ratingSearch = valueOf("ratingSearch").trim();
   if (ratingSearch) params.set("q", ratingSearch);
   params.set("sort", valueOf("ratingSort", "recent"));
@@ -1153,6 +1168,7 @@ function ratingParams() {
 }
 
 function scoreText(score) {
+  if (!Number.isInteger(Number(score)) || Number(score) < 1 || Number(score) > 5) return "미평가";
   return "★".repeat(score) + "☆".repeat(5 - score);
 }
 
@@ -1166,6 +1182,127 @@ function validatedImageUrl(value) {
     return parsed.protocol === "http:" || parsed.protocol === "https:" ? String(value) : "";
   } catch {
     return "";
+  }
+}
+
+async function skipCurrentArtist() {
+  const candidate = state.currentPick;
+  const artist = String(candidate?.artist || candidate?.artist_tag || "").trim();
+  if (!artist) {
+    showStatus($("status"), "건너뛸 작가가 없습니다.", "error");
+    return;
+  }
+  if (state.skippingArtist) return;
+  state.skippingArtist = true;
+  let saved = false;
+  const button = $("skipArtist");
+  if (button) button.disabled = true;
+  try {
+    await apiFetch("/api/skipped_artists", {
+      method: "POST",
+      body: JSON.stringify({ artist_tag: artist }),
+    });
+    saved = true;
+    state.seenArtists.add(artist);
+    await showNextArtist();
+  } catch (error) {
+    if (!saved && candidate && !state.candidatePool.some((item) => item.artist === artist || item.artist_tag === artist)) {
+      state.candidatePool.unshift(candidate);
+      state.seenArtists.delete(artist);
+      updatePoolStatus();
+    }
+    showStatus($("status"), error.message, "error");
+  } finally {
+    state.skippingArtist = false;
+    if (button) button.disabled = false;
+  }
+}
+
+function renderSkippedArtists(items) {
+  const list = $("skippedArtistsList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("p");
+    empty.className = "help-text skipped-artists-empty";
+    empty.textContent = "건너뛴 작가가 없습니다.";
+    list.append(empty);
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "skipped-artist-row";
+    const details = document.createElement("div");
+    details.className = "skipped-artist-details";
+    const artist = document.createElement("strong");
+    artist.textContent = String(item.artist_tag || "");
+    const skippedAt = document.createElement("small");
+    skippedAt.textContent = item.skipped_at ? `건너뛴 시각: ${String(item.skipped_at)}` : "";
+    details.append(artist, skippedAt);
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "ghost";
+    restore.textContent = "제외 취소";
+    restore.addEventListener("click", () => restoreSkippedArtist(item.artist_tag));
+    row.append(details, restore);
+    list.append(row);
+  });
+}
+
+async function loadSkippedArtists() {
+  const data = await apiFetch("/api/skipped_artists");
+  state.skippedArtists = Array.isArray(data.skipped_artists) ? data.skipped_artists : [];
+  renderSkippedArtists(state.skippedArtists);
+  return state.skippedArtists;
+}
+
+async function openSkippedArtists() {
+  const modal = $("skippedArtistsModal");
+  modal?.classList.remove("hidden");
+  try {
+    await loadSkippedArtists();
+  } catch (error) {
+    renderSkippedArtists([]);
+    showStatus($("status"), error.message, "error");
+  }
+}
+
+function invalidateCandidatePoolAfterSkipChange() {
+  state.candidatePool = [];
+  updatePoolStatus();
+}
+
+async function restoreSkippedArtist(artistValue) {
+  const artist = String(artistValue || "").trim();
+  if (!artist) return;
+  try {
+    await apiFetch("/api/skipped_artists", {
+      method: "DELETE",
+      body: JSON.stringify({ artist_tag: artist }),
+    });
+    state.seenArtists.delete(artist);
+    invalidateCandidatePoolAfterSkipChange();
+    await loadSkippedArtists();
+    showStatus($("status"), `${artist} 작가를 다시 후보에 포함했습니다.`, "ok");
+  } catch (error) {
+    showStatus($("status"), error.message, "error");
+  }
+}
+
+async function clearSkippedArtists() {
+  if (!await globalThis.appDialog.confirm({
+    title: "건너뛴 작가 전체 초기화",
+    message: "건너뛴 작가를 모두 다시 후보에 포함할까요?",
+    confirmLabel: "초기화",
+    tone: "info",
+  })) return;
+  try {
+    await apiFetch("/api/skipped_artists", { method: "DELETE" });
+    invalidateCandidatePoolAfterSkipChange();
+    await loadSkippedArtists();
+    showStatus($("status"), "건너뛴 작가를 모두 다시 후보에 포함했습니다.", "ok");
+  } catch (error) {
+    showStatus($("status"), error.message, "error");
   }
 }
 
@@ -1217,7 +1354,9 @@ function renderRatingCard(item) {
   const heading = document.createElement("h3");
   heading.textContent = String(item.artist_tag || "");
   const score = document.createElement("strong");
-  score.textContent = `${scoreText(item.score)} (${item.score})`;
+  score.textContent = item.rating_status === "unrated" || item.score == null
+    ? "미평가"
+    : `${scoreText(item.score)} (${item.score})`;
   const memoPreview = document.createElement("p");
   memoPreview.className = "memo-preview";
   memoPreview.textContent = String(item.memo || "");
@@ -1285,14 +1424,22 @@ function renderRatingCard(item) {
   queryInput.setAttribute("aria-label", "쿼리 프롬프트");
   queryInput.placeholder = "비우면 전체 작가 수집으로 변경됩니다.";
   queryInput.value = String(item.query_text || (item.query_tags || []).join(", "));
+  const queryLabel = document.createElement("span");
+  queryLabel.className = "inline-edit-label";
+  queryLabel.textContent = "쿼리 프롬프트";
+  const queryField = document.createElement("label");
+  queryField.className = "field inline-edit-query-field";
+  queryField.append(queryLabel, queryInput);
+  const queryAutocomplete = document.createElement("div");
+  queryAutocomplete.className = "autocomplete prompt-tag-autocomplete hidden";
+  queryAutocomplete.setAttribute("aria-label", "쿼리 프롬프트 자동완성");
+  queryField.append(queryAutocomplete);
+  globalThis.promptTagAutocomplete?.bind(queryInput);
   const apply = document.createElement("button");
   apply.type = "button";
   apply.dataset.action = "apply";
   apply.textContent = "적용";
-  const queryLabel = document.createElement("span");
-  queryLabel.className = "inline-edit-label";
-  queryLabel.textContent = "쿼리 프롬프트";
-  editor.append(scoreSelect, memoInput, queryLabel, queryInput, apply);
+  editor.append(scoreSelect, memoInput, queryField, apply);
   body.append(heading, score, memoPreview, meta, actions, editor);
   card.append(body);
 
@@ -1437,7 +1584,13 @@ bindClick("nextArtist", showNextArtist);
 bindClick("prevSample", () => moveSample(-1));
 bindClick("nextSample", () => moveSample(1));
 bindClick("copyPrompt", () => copyText(state.currentPick?.prompt_text));
-bindClick("skipArtist", showNextArtist);
+bindClick("skipArtist", skipCurrentArtist);
+bindClick("clearSkippedArtists", openSkippedArtists);
+bindClick("closeSkippedArtists", () => $("skippedArtistsModal")?.classList.add("hidden"));
+bindClick("clearAllSkippedArtists", clearSkippedArtists);
+document.querySelectorAll("[data-close-skipped-artists]").forEach((element) => {
+  element.addEventListener("click", () => $("skippedArtistsModal")?.classList.add("hidden"));
+});
 const ratingSearch = $("ratingSearch");
 if (ratingSearch) {
   ratingSearch.addEventListener("input", () => {

@@ -23,12 +23,24 @@ function normalizeArcaModel(value) {
   const raw = String(value || "").trim();
   const lowered = raw.toLowerCase();
   if (ARCA_NOVELAI_MODEL_NAMES[lowered]) return lowered;
-  if (lowered === "novelai diffusion v5") return "nai-diffusion-5-full";
-  if (lowered === "novelai diffusion v5 full") return "nai-diffusion-5-full";
-  if (lowered === "novelai diffusion v5 curated") return "nai-diffusion-5-curated";
-  if (lowered === "novelai diffusion v4.5") return "nai-diffusion-4-5-full";
-  if (lowered === "novelai diffusion v4.5 full") return "nai-diffusion-4-5-full";
-  if (lowered === "novelai diffusion v4.5 curated") return "nai-diffusion-4-5-curated";
+  if (lowered === "v5") return "nai-diffusion-5-full";
+  if (lowered === "v5 full") return "nai-diffusion-5-full";
+  if (lowered === "v5 curated") return "nai-diffusion-5-curated";
+  if (lowered === "v4.5") return "nai-diffusion-4-5-full";
+  if (lowered === "v4.5 full") return "nai-diffusion-4-5-full";
+  if (lowered === "v4.5 curated") return "nai-diffusion-4-5-curated";
+
+  // NovelAI's PNG Source value may contain a build/hash suffix, e.g.
+  // "NovelAI Diffusion V4.5 4BDE2A90". Identify V4.5 before V5 so the
+  // dotted generation cannot fall through to a V5 match.
+  const sourceMatch = lowered.match(/\bnovelai\s+diffusion\s+v(4[.-]5|5)\b/);
+  if (sourceMatch) {
+    const generation = sourceMatch[1].replace("-", ".");
+    const curated = /\bcurated\b/.test(lowered);
+    return generation === "5"
+      ? `nai-diffusion-5-${curated ? "curated" : "full"}`
+      : `nai-diffusion-4-5-${curated ? "curated" : "full"}`;
+  }
   return raw;
 }
 
@@ -76,7 +88,7 @@ function shouldRefreshArcaBrowserSession(eventType, visibilityState) {
 
 function normalizeArcaPayload(value) {
   return {
-    keyword: String(value.keyword || "그림체 공유").trim(),
+    keyword: String(value.keyword || "그림체 공유").trim() || "그림체 공유",
     tabs: value.tabs || [],
     start_date: value.start_date || "",
     end_date: value.end_date || "",
@@ -242,6 +254,8 @@ function arcaTagDetailQuery(kind, tag, limit = 24, filters = {}) {
 
 function arcaStatisticsQuery(value = {}) {
   const query = new URLSearchParams();
+  const model = String(value.model ?? "").trim();
+  if (model && model !== "all") query.set("model", model);
   const minimum = String(value.recommendation_min ?? "").trim();
   const maximum = String(value.recommendation_max ?? "").trim();
   if (minimum) query.set("recommendation_min", minimum);
@@ -274,7 +288,7 @@ function randomArcaStatisticsSamples(entries, limit = 8, random = Math.random) {
 
 function arcaCoverageQuery(value = {}) {
   const query = new URLSearchParams({
-    keyword: String(value.keyword || "그림체 공유"),
+    keyword: String(value.keyword || "그림체 공유").trim() || "그림체 공유",
     start_date: String(value.start_date || ""),
     end_date: String(value.end_date || ""),
     max_pages: String(value.max_pages || 0),
@@ -461,6 +475,19 @@ function imagePromptFields(image) {
   };
 }
 
+function imageGenerationSettingsText(image) {
+  const settingText = (value, fallback = "?") => {
+    if (value == null) return fallback;
+    const text = String(value).trim();
+    return text || fallback;
+  };
+  const sampler = settingText(image?.sampler, "Unknown");
+  const steps = settingText(image?.steps);
+  const scale = settingText(image?.scale);
+  const cfgRescale = settingText(image?.cfg_rescale);
+  return `Sampler: ${sampler} · Steps: ${steps} · CFG Scale: ${scale} · CFG Rescale: ${cfgRescale}`;
+}
+
 function hasArcaDependencyArtists(image) {
   const prompt = String(image?.base_prompt || image?.prompt || "");
   return /(?:^|,)\s*(?:[0-9]+(?:\.[0-9]+)?::\s*)?(?:artist|artists)\s*:/i.test(prompt);
@@ -468,6 +495,7 @@ function hasArcaDependencyArtists(image) {
 
 function arcaPayload() {
   return normalizeArcaPayload({
+    keyword: arcaEl("arcaKeyword")?.value,
     tabs: [arcaEl("arcaTabNai").checked && "NAI", arcaEl("arcaTabR18Nai").checked && "R18_NAI"].filter(Boolean),
     start_date: arcaEl("arcaStartDate").value,
     end_date: arcaEl("arcaEndDate").value,
@@ -509,6 +537,10 @@ function arcaButton(label, handler, className = "") {
   return button;
 }
 
+function shouldOpenArcaCollectionPanel(status) {
+  return ["queued", "running", "pause_requested", "paused", "stop_requested"].includes(String(status || ""));
+}
+
 function renderArcaCollectionProgress(job) {
   const labels = {
     queued: "대기", running: "수집 중", pause_requested: "일시정지 중…", paused: "일시정지",
@@ -543,10 +575,16 @@ function renderArcaCollectionProgress(job) {
   arcaEl("pauseArcaCollection")?.classList.toggle("hidden", !running);
   arcaEl("resumeArcaCollection")?.classList.toggle("hidden", !resumable);
   arcaEl("stopArcaCollection")?.classList.toggle("hidden", !(running || pausing || stopping));
+  const panel = arcaEl("arcaCollectionProgressPanel");
+  if (panel) {
+    if (shouldOpenArcaCollectionPanel(job.status)) panel.open = true;
+    else if (job.status === "completed") panel.open = false;
+  }
 }
 
 function setArcaCollectionControlsDisabled(disabled) {
-  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "downloadArcaImageArchive", "chooseArcaImageArchive", "arcaImageArchiveFile", "arcaTabNai", "arcaTabR18Nai", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
+  if (disabled) arcaEl("arcaCollectionProgressPanel")?.setAttribute("open", "");
+  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "downloadArcaImageArchive", "chooseArcaImageArchive", "arcaImageArchiveFile", "arcaTabNai", "arcaTabR18Nai", "arcaKeyword", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
     const element = arcaEl(id);
     if (element) element.disabled = disabled;
   }
@@ -867,18 +905,24 @@ async function controlArcaCollection(action) {
 function renderArcaCard(item) {
   const card = document.createElement("article");
   card.className = "arca-style-card";
+  const thumbnail = document.createElement("button");
+  thumbnail.type = "button";
+  thumbnail.className = "arca-style-thumb-button";
+  thumbnail.setAttribute("aria-label", `확인 및 수정: ${item.title || "수집 그림체"}`);
+  thumbnail.addEventListener("click", () => { void openArcaStyle(item.id); });
   if (item.representative_image_url) {
     const image = document.createElement("img");
     image.className = "arca-style-thumb";
     image.src = item.representative_image_url;
     image.alt = "";
-    card.append(image);
+    thumbnail.append(image);
   } else {
     const empty = document.createElement("div");
     empty.className = "arca-style-thumb empty";
     empty.textContent = "이미지 없음";
-    card.append(empty);
+    thumbnail.append(empty);
   }
+  card.append(thumbnail);
   const body = document.createElement("div");
   body.className = "arca-style-body";
   const title = document.createElement("h3");
@@ -1228,6 +1272,7 @@ async function loadArcaTagStatistics(kind, tag) {
   arcaSetStatus("arcaTagStatisticsStatus", "태그 상세를 불러오는 중…");
   try {
     const query = arcaTagDetailQuery(kind, tag, 24, {
+      model: arcaEl("arcaStatisticsModelFilter")?.value,
       recommendation_min: arcaEl("arcaRecommendationMin")?.value,
       recommendation_max: arcaEl("arcaRecommendationMax")?.value,
     });
@@ -1255,6 +1300,7 @@ async function loadArcaQualitySequence(tags) {
   arcaSetStatus("arcaSequenceStatus", "조합 이미지를 불러오는 중…");
   try {
     const result = await arcaFetch(`/api/arca-styles/statistics/sequence?${arcaSequenceDetailQuery(tags, 40, {
+      model: arcaEl("arcaStatisticsModelFilter")?.value,
       recommendation_min: arcaEl("arcaRecommendationMin")?.value,
       recommendation_max: arcaEl("arcaRecommendationMax")?.value,
     })}`);
@@ -1470,7 +1516,10 @@ function renderArcaStyleGroups(groups) {
     const base = createImagePromptField("베이스 프롬프트", "is-base");
     const negative = createImagePromptField("네거티브 프롬프트", "is-negative");
     const character = createImagePromptField("캐릭터 프롬프트", "is-character");
-    fields.append(base.label, negative.label, character.label);
+    const generationSettings = document.createElement("p");
+    generationSettings.className = "arca-selected-image-settings";
+    generationSettings.setAttribute("aria-live", "polite");
+    fields.append(generationSettings, base.label, negative.label, character.label);
     const buttons = [];
     const selectImage = (image, selectedIndex) => {
       const values = imagePromptFields(image);
@@ -1484,6 +1533,7 @@ function renderArcaStyleGroups(groups) {
       base.textarea.value = values.base;
       negative.textarea.value = values.negative;
       character.textarea.value = values.character;
+      generationSettings.textContent = imageGenerationSettingsText(image);
       buttons.forEach((button, index) => {
         const selected = index === selectedIndex;
         button.classList.toggle("selected", selected);
@@ -1567,6 +1617,7 @@ async function loadArcaStyleStatistics() {
   arcaSetStatus("arcaStyleStatisticsStatus", "통계를 불러오는 중…");
   try {
     const query = arcaStatisticsQuery({
+      model: arcaEl("arcaStatisticsModelFilter")?.value,
       recommendation_min: arcaEl("arcaRecommendationMin")?.value,
       recommendation_max: arcaEl("arcaRecommendationMax")?.value,
     });
@@ -1758,6 +1809,11 @@ function bindArcaCollector() {
   arcaEl("refreshArcaStatistics")?.addEventListener("click", loadArcaStyleStatistics);
   arcaEl("arcaRecommendationPreset")?.addEventListener("change", applyArcaRecommendationPreset);
   arcaEl("applyArcaRecommendationFilter")?.addEventListener("click", loadArcaStyleStatistics);
+  arcaEl("arcaStatisticsModelFilter")?.addEventListener("change", () => {
+    arcaState.statisticTables.artist.page = 1;
+    arcaState.statisticTables.quality.page = 1;
+    void loadArcaStyleStatistics();
+  });
   for (const id of ["arcaRecommendationMin", "arcaRecommendationMax"]) {
     arcaEl(id)?.addEventListener("input", () => { if (arcaEl("arcaRecommendationPreset")) arcaEl("arcaRecommendationPreset").value = "custom"; });
     arcaEl(id)?.addEventListener("keydown", (event) => { if (event.key === "Enter") void loadArcaStyleStatistics(); });
@@ -1795,7 +1851,14 @@ function bindArcaCollector() {
   document.querySelectorAll("[data-close-arca-sequence]").forEach((item) => item.addEventListener("click", closeArcaSequence));
   arcaEl("saveArcaStyle")?.addEventListener("click", saveArcaStyle);
   arcaEl("deleteArcaStyle")?.addEventListener("click", deleteArcaStyle);
-  arcaEl("closeArcaStyle")?.addEventListener("click", () => arcaEl("arcaStyleDialog").classList.add("hidden"));
+  arcaEl("closeArcaStyle")?.addEventListener("click", () => {
+    globalThis.promptTagAutocomplete?.hide?.();
+    arcaEl("arcaStyleDialog")?.classList.add("hidden");
+  });
+  ["arcaEditPrompt", "arcaEditNegativePrompt"].forEach((id) => {
+    const input = arcaEl(id);
+    if (input) globalThis.promptTagAutocomplete?.bind?.(input);
+  });
   for (const id of ["arcaStyleSearch", "arcaMetadataFilter", "arcaModelFilter", "arcaRecommendationMinList", "arcaStyleSort", "arcaStylePageSize"]) {
     arcaEl(id)?.addEventListener("input", () => {
       arcaState.page = 1;
@@ -1811,6 +1874,7 @@ function bindArcaCollector() {
     if (event.key === "Enter") void goToArcaPage(event.currentTarget.value);
   });
   applyArcaCardSize();
+  arcaEl("arcaKeyword")?.addEventListener("input", scheduleArcaSearchCoverage);
   for (const id of ["arcaTabNai", "arcaTabR18Nai", "arcaStartDate", "arcaEndDate"]) {
     arcaEl(id)?.addEventListener("change", scheduleArcaSearchCoverage);
   }
@@ -1836,7 +1900,7 @@ function bindArcaCollector() {
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", bindArcaCollector);
 if (typeof module !== "undefined") module.exports = {
   normalizeArcaPayload, normalizeArcaUrlPayload, arcaSummaryText, collectionProgress, durationText,
-  etaText, formatBytes, imageRestoreEstimateText, imageDownloadSummary, collectionCountsText, groupTitle, promptSection, promptKindClass, imagePromptFields,
+  etaText, formatBytes, imageRestoreEstimateText, imageDownloadSummary, collectionCountsText, groupTitle, promptSection, promptKindClass, imagePromptFields, imageGenerationSettingsText,
   arcaBrowserSessionText, isArcaBrowserSessionPending,
   arcaListQuery, arcaCoverageQuery, arcaCoverageText,
   arcaStyleDetailQuery,
@@ -1847,4 +1911,5 @@ if (typeof module !== "undefined") module.exports = {
   arcaTagDetailQuery, arcaSequenceDetailQuery, arcaStatisticsQuery, arcaRecommendationPreset,
   randomArcaStatisticsSamples, formatArcaRecommendation, hasArcaDependencyArtists,
   normalizeArcaModel, arcaModelDisplayName,
+  shouldOpenArcaCollectionPanel,
 };

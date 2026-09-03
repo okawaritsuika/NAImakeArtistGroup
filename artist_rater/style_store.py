@@ -675,7 +675,6 @@ def reconcile_generated_storage(db_path, generated_dir):
     finally:
         conn.close()
 
-    referenced = set()
     missing_image_ids = []
     affected_style_ids = set()
     for row in rows:
@@ -692,9 +691,7 @@ def reconcile_generated_storage(db_path, generated_dir):
         if not final_path.exists() and staged_paths:
             final_path.parent.mkdir(parents=True, exist_ok=True)
             staged_paths[0].replace(final_path)
-        if final_path.is_file():
-            referenced.add(final_path)
-        else:
+        if not final_path.is_file():
             missing_image_ids.append(row["id"])
             affected_style_ids.add(row["style_id"])
 
@@ -716,12 +713,6 @@ def reconcile_generated_storage(db_path, generated_dir):
     for temp_path in root.rglob("*.tmp"):
         if temp_path.stat().st_mtime < stale_before:
             temp_path.unlink(missing_ok=True)
-    for png_path in root.rglob("*.png"):
-        if (
-            png_path.resolve() not in referenced
-            and png_path.stat().st_mtime < stale_before
-        ):
-            png_path.unlink(missing_ok=True)
 
 
 def _parse_json_field(item, source_key, result_key):
@@ -746,7 +737,22 @@ def list_styles(db_path):
     return styles
 
 
-def list_generated_images(db_path):
+def _decode_generated_rows(rows):
+    images = []
+    for row in rows:
+        item = dict(row)
+        _parse_json_field(item, "artists_json", "artists")
+        _parse_json_field(item, "character_prompts_json", "character_prompts")
+        _parse_json_field(item, "excluded_quality_tags_json", "excluded_quality_tags")
+        item["confirmed"] = bool(item.get("confirmed"))
+        if item.get("variety_plus") is not None:
+            item["variety_plus"] = bool(item["variety_plus"])
+        images.append(item)
+    return images
+
+
+def list_all_generated_images(db_path):
+    """Return every generated image, including samples linked to NAI tests."""
     conn = connect_db(db_path)
     try:
         rows = conn.execute(
@@ -762,17 +768,52 @@ def list_generated_images(db_path):
         ).fetchall()
     finally:
         conn.close()
-    images = []
-    for row in rows:
-        item = dict(row)
-        _parse_json_field(item, "artists_json", "artists")
-        _parse_json_field(item, "character_prompts_json", "character_prompts")
-        _parse_json_field(item, "excluded_quality_tags_json", "excluded_quality_tags")
-        item["confirmed"] = bool(item.get("confirmed"))
-        if item.get("variety_plus") is not None:
-            item["variety_plus"] = bool(item["variety_plus"])
-        images.append(item)
-    return images
+    return _decode_generated_rows(rows)
+
+
+def list_generated_images(db_path):
+    """Return direct style-maker images, excluding NAI test samples."""
+    conn = connect_db(db_path)
+    try:
+        try:
+            rows = conn.execute(
+                """
+                SELECT generated_images.*,
+                       EXISTS(
+                           SELECT 1 FROM confirmed_styles
+                           WHERE source_type='generated' AND source_id=generated_images.id
+                       ) AS confirmed
+                FROM generated_images
+                WHERE NOT EXISTS(
+                    SELECT 1 FROM nai_artist_test_images test_image
+                    WHERE test_image.generated_image_id=generated_images.id
+                )
+                AND NOT EXISTS(
+                    SELECT 1 FROM nai_artist_test_items test_item
+                    WHERE test_item.generated_image_id=generated_images.id
+                )
+                ORDER BY generated_images.created_at DESC, generated_images.id DESC
+                """
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            # Keep this storage helper usable by legacy callers that have not
+            # initialized the optional NAI test tables yet.
+            if not any(table in str(exc) for table in ("nai_artist_test_images", "nai_artist_test_items")):
+                raise
+            rows = conn.execute(
+                """
+                SELECT generated_images.*,
+                       EXISTS(
+                           SELECT 1 FROM confirmed_styles
+                           WHERE source_type='generated' AND source_id=generated_images.id
+                       ) AS confirmed
+                FROM generated_images
+                ORDER BY generated_images.created_at DESC, generated_images.id DESC
+                """
+            ).fetchall()
+    finally:
+        conn.close()
+    return _decode_generated_rows(rows)
 
 
 def delete_generated_image_batch(db_path, generated_dir, image_ids):
