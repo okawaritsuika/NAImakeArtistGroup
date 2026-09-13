@@ -289,6 +289,11 @@ def install_image_archive(
     with zipfile.ZipFile(archive_path) as archive:
         manifest_files = _validated_manifest(archive, expected_count, expected_bytes)
         database_rows = _matching_database_rows(db_path, seed_db_path, manifest_files)
+        if not database_rows:
+            raise ArcaImageArchiveError(
+                "ZIP 이미지와 연결할 공유 그림체가 현재 데이터 DB에 없습니다. "
+                "런처의 데이터 폴더와 앱 버전을 확인해 주세요. ZIP을 다시 받아도 해결되지 않습니다."
+            )
         installed = reused = processed = 0
         started = time.monotonic()
         updates = []
@@ -403,12 +408,18 @@ def _run_archive_job(db_path, image_dir, data_dir, seed_db_path, job_id, mode, a
             progress=install_progress,
             control=lambda: control("extracting_archive"),
         )
+        warning = (
+            f"이미지 {result['updated_rows']}장을 설치했지만 {result['skipped_rows']}장은 "
+            "현재 DB에 연결할 그림체가 없어 건너뛰었습니다. 데이터 폴더와 앱 버전을 확인해 주세요."
+            if result["skipped_rows"] else ""
+        )
         update_collection_job(
             db_path, job_id, status="completed", stage="completed",
             scanned_posts=ARCHIVE_IMAGE_COUNT,
-            downloaded_images=result["updated_rows"], updated=result["installed"], error="",
+            downloaded_images=result["updated_rows"], updated=result["installed"], error=warning,
         )
-        Path(archive_path).unlink(missing_ok=True)
+        if not result["skipped_rows"]:
+            Path(archive_path).unlink(missing_ok=True)
     except ArcaCollectionStopped as exc:
         update_collection_job(db_path, job_id, status="stopped", stage="stopped", error=str(exc))
     except Exception as exc:

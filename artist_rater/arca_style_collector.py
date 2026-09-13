@@ -37,6 +37,7 @@ from novelai_metadata import (
 
 ARCA_BASE_URL = "https://arca.live"
 ARCA_BOARD_PATH = "/b/aiart"
+ARCA_IMAGE_CDN_HOSTS = {"ac.namu.la", "ac.arca.live"}
 DEFAULT_KEYWORD = "그림체 공유"
 REQUEST_TIMEOUT = 12
 IMAGE_TIMEOUT = 20
@@ -1355,7 +1356,11 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
                 _image_identity(row["image_url"]): row["image_url"]
                 for row in item_rows if _image_url_is_fresh(row["image_url"])
             }
-            if len(fresh_urls) < len(item_rows):
+            refreshed_post = False
+
+            def refresh_post_urls():
+                nonlocal refreshed_post
+                refreshed_post = True
                 try:
                     html = _with_transient_retries(
                         lambda: fetch_html(article_session, source_url), article_pacer
@@ -1367,6 +1372,9 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
                     _refresh_item_image_urls(db_path, item_rows[0]["item_id"], article)
                 except (requests.RequestException, ArcaCollectorError) as exc:
                     error_details.append(f"게시글 {source_url}: {_request_error_text(exc)}")
+
+            if len(fresh_urls) < len(item_rows):
+                refresh_post_urls()
             for row in item_rows:
                 _wait_for_collection_control(db_path, job_id, "restoring_images")
                 fresh_url = fresh_urls.get(_image_identity(row["image_url"]))
@@ -1378,8 +1386,21 @@ def restore_arca_style_images(db_path, image_dir, job_id, missing=None):
                             lambda url=fresh_url: download_image(image_session, url), image_pacer
                         )
                     except (requests.RequestException, ArcaCollectorError) as exc:
-                        error_details.append(f"이미지 {row['id']}: {_request_error_text(exc)}")
-                elif fresh_urls:
+                        status = getattr(getattr(exc, "response", None), "status_code", None)
+                        if status in {401, 403, 404, 410} and not refreshed_post:
+                            refresh_post_urls()
+                            replacement = fresh_urls.get(_image_identity(row["image_url"]))
+                            if replacement and replacement != fresh_url:
+                                fresh_url = replacement
+                                try:
+                                    data, content_type = _with_transient_retries(
+                                        lambda: download_image(image_session, fresh_url), image_pacer
+                                    )
+                                except (requests.RequestException, ArcaCollectorError) as retry_exc:
+                                    error_details.append(f"이미지 {row['id']}: {_request_error_text(retry_exc)}")
+                        if data is None:
+                            error_details.append(f"이미지 {row['id']}: {_request_error_text(exc)}")
+                else:
                     error_details.append(f"이미지 {row['id']}: 현재 게시글에서 원본을 찾지 못했습니다.")
                 processed += 1
                 if data is None:
@@ -1601,7 +1622,12 @@ def normalize_arca_article_url(value):
 def _image_identity(value):
     parsed = urlparse(str(value or ""))
     stable = [(key, item) for key, item in parse_qsl(parsed.query, keep_blank_values=True) if key.lower() not in {"expires", "key", "type"}]
-    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", urlencode(sorted(stable)), ""))
+    # Arca serves the same image paths through both CDN domains. Keep the
+    # actual signed download URL intact; only normalize the comparison key.
+    host = parsed.netloc.lower()
+    if host in ARCA_IMAGE_CDN_HOSTS:
+        host = "ac.namu.la"
+    return urlunparse((parsed.scheme.lower(), host, parsed.path, "", urlencode(sorted(stable)), ""))
 
 
 def extract_article_links(html, base_url=ARCA_BASE_URL):
@@ -2413,7 +2439,7 @@ def _request_error_text(exc):
 
 def _image_url_is_fresh(value, minimum_seconds=120):
     parsed = urlparse(str(value or ""))
-    if parsed.netloc.lower() != "ac.namu.la":
+    if parsed.netloc.lower() not in ARCA_IMAGE_CDN_HOSTS:
         return bool(parsed.scheme and parsed.netloc)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     try:

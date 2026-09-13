@@ -839,7 +839,7 @@ async function pollArcaCollectionJob(jobId) {
         const message = job.status === "completed"
           ? arcaSummaryText(job)
           : job.error || "ZIP 설치가 중단되었습니다.";
-        arcaSetStatus("arcaImageArchiveStatus", message, job.status === "completed" ? "success" : "error");
+        arcaSetStatus("arcaImageArchiveStatus", message, job.status === "completed" && !job.error ? "success" : "error");
       }
       if (job.status === "completed") {
         arcaSetStatus("arcaCollectorStatus", arcaSummaryText(job), job.error ? "error" : "success");

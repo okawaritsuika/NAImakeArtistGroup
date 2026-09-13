@@ -18,7 +18,7 @@ from arca_image_archive import (
     install_image_archive,
     start_local_upload,
 )
-from arca_style_collector import init_arca_style_tables
+from arca_style_collector import get_collection_job, init_arca_style_tables
 
 
 class FakeResponse:
@@ -119,8 +119,8 @@ class ArcaImageArchiveTest(unittest.TestCase):
                 "VALUES(2,1,?,?,?,?)",
                 (second_url, "", "ok", "now"),
             )
-        local_first_url = "https://ac.namu.la/path/one.png?expires=99&key=new"
-        local_second_url = "https://ac.namu.la/path/two.png?expires=99&key=new"
+        local_first_url = "https://ac.arca.live/path/one.png?expires=99&key=new"
+        local_second_url = "https://ac.arca.live/path/two.png?expires=99&key=new"
         with closing(sqlite3.connect(self.db_path)) as connection, connection:
             connection.execute(
                 "INSERT INTO arca_style_items(id,source_url,collected_at,updated_at,representative_image_url,metadata_status) "
@@ -162,6 +162,46 @@ class ArcaImageArchiveTest(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(paths, [(first_name,), (second_name,)])
         self.assertEqual(representative, first_name)
+
+    def test_archive_with_no_matching_local_rows_does_not_report_success(self):
+        url = "https://ac.namu.la/path/one.png?expires=1&key=old"
+        name = hashlib.sha256(url.encode()).hexdigest() + ".png"
+        with closing(sqlite3.connect(self.seed_path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO arca_style_items(id,source_url,collected_at,updated_at) VALUES(1,?,'now','now')",
+                ("https://arca.live/b/aiart/1",),
+            )
+            connection.execute(
+                "INSERT INTO arca_style_images(id,item_id,image_url,metadata_status,created_at) VALUES(1,1,?,'ok','now')",
+                (url,),
+            )
+        archive_path = self.make_archive([(1, 1, name, b"image")])
+        with self.assertRaisesRegex(ArcaImageArchiveError, "연결할.*없"):
+            install_image_archive(
+                archive_path, self.db_path, self.image_dir, self.seed_path,
+                expected_archive_sha256=hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                expected_archive_bytes=archive_path.stat().st_size,
+                expected_count=1, expected_bytes=5,
+            )
+        self.assertTrue(archive_path.is_file())
+        self.assertFalse((self.image_dir / name).exists())
+
+    def test_partial_install_reports_unmatched_images_and_keeps_zip(self):
+        archive_path = self.root / "partial-install.zip"
+        archive_path.write_bytes(b"archive")
+        job_id = archive_module._create_archive_job(self.db_path, "local", archive_path)
+        with patch.object(archive_module, "install_image_archive", return_value={
+            "installed": 1, "reused": 0, "updated_rows": 1, "skipped_rows": 1,
+        }):
+            archive_module._run_archive_job(
+                self.db_path, self.image_dir, self.root, self.seed_path,
+                job_id, "local", archive_path,
+            )
+        job = get_collection_job(self.db_path, job_id)
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["downloaded_images"], 1)
+        self.assertIn("건너뛰었습니다", job["error"])
+        self.assertTrue(archive_path.is_file())
 
     def test_rejects_archive_path_traversal(self):
         manifest = {

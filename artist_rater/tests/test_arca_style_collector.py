@@ -407,7 +407,7 @@ class ArcaCollectorTest(unittest.TestCase):
     def test_image_restore_refreshes_each_fixed_post_before_downloading(self):
         image_dir = Path(self.temp.name) / "images"
         old_url = "https://ac.namu.la/path/1.png?expires=1&key=old&type=orig"
-        fresh_url = "https://ac.namu.la/path/1.png?expires=9999999999&key=fresh&type=orig"
+        fresh_url = "https://ac.arca.live/path/1.png?expires=9999999999&key=fresh&type=orig"
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
             item_id = conn.execute(
                 "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_url,metadata_status) VALUES(?,?,?,?,?)",
@@ -437,6 +437,61 @@ class ArcaCollectorTest(unittest.TestCase):
         estimate = get_image_restore_estimate(self.db_path, image_dir)
         self.assertEqual((estimate["total_images"], estimate["local_images"], estimate["missing_images"]), (1, 1, 0))
         self.assertEqual(estimate["local_bytes"], 9)
+
+    def test_signed_url_expiry_applies_to_both_arca_cdn_hosts(self):
+        for host in ("ac.namu.la", "ac.arca.live"):
+            with self.subTest(host=host):
+                self.assertFalse(collector_module._image_url_is_fresh(f"https://{host}/one.png?expires=1&key=old"))
+                self.assertFalse(collector_module._image_url_is_fresh(f"https://{host}/one.png"))
+                self.assertTrue(collector_module._image_url_is_fresh(f"https://{host}/one.png?expires=9999999999&key=new"))
+        self.assertNotEqual(
+            collector_module._image_identity("https://example.com/one.png"),
+            collector_module._image_identity("https://ac.arca.live/one.png"),
+        )
+
+    def test_image_restore_refreshes_rejected_unexpired_url_once(self):
+        image_dir = Path(self.temp.name) / "images"
+        old_url = "https://ac.arca.live/path/rejected.png?expires=9999999999&key=old"
+        fresh_url = old_url.replace("key=old", "key=new")
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            item_id = conn.execute(
+                "INSERT INTO arca_style_items(source_url,collected_at,updated_at,representative_image_url,metadata_status) VALUES(?,?,?,?,?)",
+                ("https://arca.live/b/aiart/1", "now", "now", old_url, "ok"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO arca_style_images(item_id,image_url,metadata_status,created_at) VALUES(?,?,'ok','now')",
+                (item_id, old_url),
+            )
+        job_id, missing = create_image_restore_job(self.db_path, image_dir)
+        response = requests.Response()
+        response.status_code = 403
+        html = f'<div class="article-content"><img src="{fresh_url}"></div>'
+        with (
+            patch.object(collector_module, "IMAGE_DOWNLOAD_INTERVAL_SECONDS", 0),
+            patch.object(collector_module, "fetch_html", return_value=html) as fetch,
+            patch.object(collector_module, "download_image", side_effect=[
+                requests.HTTPError("forbidden", response=response), (b"image", "image/png"),
+            ]) as download,
+        ):
+            result = restore_arca_style_images(self.db_path, image_dir, job_id, missing)
+        self.assertEqual((result["restored"], result["failed"]), (1, 0))
+        fetch.assert_called_once()
+        self.assertEqual([call.args[1] for call in download.call_args_list], [old_url, fresh_url])
+
+        # A newly issued URL can still be blocked. Do not keep refetching the
+        # post or turn a persistent access failure into a successful restore.
+        with (
+            patch.object(collector_module, "IMAGE_DOWNLOAD_INTERVAL_SECONDS", 0),
+            patch.object(collector_module, "fetch_html", return_value=html) as fetch,
+            patch.object(collector_module, "download_image", side_effect=requests.HTTPError(
+                "forbidden", response=response,
+            )) as download,
+        ):
+            result = restore_arca_style_images(self.db_path, image_dir, job_id, missing)
+        self.assertEqual((result["restored"], result["failed"]), (0, 1))
+        fetch.assert_called_once()
+        self.assertEqual(download.call_count, 2)
+        self.assertIn("HTTP 403", get_collection_job(self.db_path, job_id)["error"])
 
     def test_image_restore_retries_429_in_the_same_run(self):
         image_dir = Path(self.temp.name) / "images"
