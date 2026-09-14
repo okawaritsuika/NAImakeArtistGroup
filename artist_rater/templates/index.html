@@ -975,7 +975,7 @@
               <p id="arcaSessionBridgeSetupStatus" class="status" aria-live="polite"></p>
             </details>
           </section>
-          <div class="check-row"><label><input id="arcaTabNai" type="checkbox" checked> NAI</label><label><input id="arcaTabR18Nai" type="checkbox" checked> 🔞 NAI</label></div>
+          <div class="check-row"><label><input id="arcaTabNai" type="checkbox" checked> NAI</label><label><input id="arcaTabR18Nai" type="checkbox" checked> 🔞 NAI</label><label title="새로 수집하는 PNG를 품질 90 WebP로 저장합니다. 프롬프트 보존을 검증하며, 실패하면 원본을 저장합니다. 기존 파일과 WebP는 유지합니다."><input id="arcaWebpCompress" type="checkbox"> WebP 압축</label></div>
           <label class="field"><span>검색어</span><input id="arcaKeyword" type="search" value="그림체 공유" autocomplete="off" placeholder="제목에 포함된 검색어"></label>
           <label class="field"><span>시작일</span><input id="arcaStartDate" type="date"></label><label class="field"><span>종료일</span><input id="arcaEndDate" type="date"></label>
           <div id="arcaSearchCoverage" class="status arca-search-coverage"></div>
@@ -1013,22 +1013,28 @@
             <div><h2>공유 그림체 프롬프트 분석</h2><p id="arcaStyleStatisticsSummary" class="arca-statistics-summary">저장된 이미지 프롬프트를 분석합니다.</p></div>
             <button id="refreshArcaStatistics" type="button">통계 새로고침</button>
           </div>
+          <input id="arcaStatisticsModelFilter" type="hidden" value="v5">
+          <div class="arca-recommendation-filter">
+          <div class="field arca-statistics-model-field"><span>분석 모델</span>
           <div class="arca-statistics-model-tabs" role="tablist" aria-label="통계 모델 선택">
             <button type="button" data-arca-statistics-model="v4.5" role="tab" aria-selected="false" tabindex="-1" aria-controls="arcaStyleStatistics">V4.5</button>
             <button type="button" class="active" data-arca-statistics-model="v5" role="tab" aria-selected="true" tabindex="0" aria-controls="arcaStyleStatistics">V5</button>
             <button type="button" data-arca-statistics-model="all" role="tab" aria-selected="false" tabindex="-1" aria-controls="arcaStyleStatistics">전체</button>
           </div>
-          <input id="arcaStatisticsModelFilter" type="hidden" value="v5">
-          <div class="arca-recommendation-filter">
+          </div>
             <label class="field"><span>추천수 빠른 선택</span><select id="arcaRecommendationPreset"><option value="all">전체</option><option value="10">10 이상</option><option value="30">30 이상</option><option value="50">50 이상</option><option value="100">100 이상</option><option value="custom">직접 입력</option></select></label>
             <label class="field"><span>최소 추천수</span><input id="arcaRecommendationMin" type="number" min="0" step="1" placeholder="제한 없음"></label>
             <label class="field"><span>최대 추천수</span><input id="arcaRecommendationMax" type="number" min="0" step="1" placeholder="제한 없음"></label>
             <button id="applyArcaRecommendationFilter" type="button">추천수 적용</button>
           </div>
           <p id="arcaStatisticsScopeNote" class="notice"></p>
-          <div id="arcaStyleStatisticsStatus" class="status" role="status"></div>
+          <section id="arcaStatisticsFeedback" class="arca-statistics-feedback hidden" role="status" aria-live="polite">
+            <span class="arca-statistics-spinner" aria-hidden="true"></span>
+            <div><strong id="arcaStatisticsFeedbackTitle"></strong><p id="arcaStyleStatisticsStatus"></p><p id="arcaStatisticsElapsed" aria-hidden="true"></p></div>
+            <button id="retryArcaStatistics" class="hidden" type="button">다시 시도</button>
+          </section>
         </section>
-        <div class="arca-statistics-content">
+        <div id="arcaStatisticsContent" class="arca-statistics-content">
         <section class="panel arca-statistics-showcase">
           <div class="arca-statistics-view-tabs" role="tablist" aria-label="분석 화면 선택">
             <button type="button" class="active" data-arca-statistics-view="artist" role="tab" aria-selected="true">작가</button>

@@ -66,6 +66,14 @@ class ArcaStyleApiTest(unittest.TestCase):
         response = self.client.post("/api/arca-styles/collect-url", json={"source_url": "https://example.com/x"})
         self.assertEqual(response.status_code, 400)
 
+    @patch("app.start_url_collection_job", return_value=24)
+    def test_collect_url_passes_webp_option(self, start_job):
+        response = self.client.post('/api/arca-styles/collect-url', json={
+            'source_url': 'https://arca.live/b/aiart/123', 'webp_compress': True,
+        })
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(start_job.call_args.kwargs['webp_compress'])
+
     @patch("app.get_arca_browser_session_status")
     def test_browser_session_status_exposes_only_safe_fields(self, get_status):
         get_status.return_value = {"connected": True, "browser": "Chrome", "error": ""}

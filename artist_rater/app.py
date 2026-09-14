@@ -4803,7 +4803,8 @@ def api_collect_arca_style_url():
         if not isinstance(payload, dict):
             raise ArcaCollectorError("요청 데이터가 올바르지 않습니다.")
         source_url = normalize_arca_article_url(payload.get("source_url"))
-        job_id = start_url_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, source_url)
+        options = {"webp_compress": payload["webp_compress"]} if "webp_compress" in payload else {}
+        job_id = start_url_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, source_url, **options)
         return json_response({"job_id": job_id, "status": "queued"}, 202)
     except ArcaCollectorError as exc:
         return json_response({"error": str(exc)}, 400)

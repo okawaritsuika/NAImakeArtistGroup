@@ -10,7 +10,7 @@ test("statistics model tabs ignore late responses from the previous model", asyn
     dataset: { arcaStatisticsModel: model }, classList: { toggle() {} },
     setAttribute(name, value) { this[name] = value; },
   }));
-  const context = vm.createContext({ URLSearchParams, document: {
+  const context = vm.createContext({ URLSearchParams, setInterval: () => 1, clearInterval() {}, document: {
     addEventListener() {}, querySelectorAll: () => tabs,
     getElementById: id => id === "arcaStatisticsModelFilter" ? filter : null,
   }});
@@ -29,6 +29,50 @@ test("statistics model tabs ignore late responses from the previous model", asyn
   assert.deepEqual(rendered.filter(row => row.model), [{ model: "v5" }]);
   assert.equal(tabs[1]["aria-selected"], "true");
   assert.equal(tabs[0].tabIndex, -1);
+});
+
+test("statistics loading, failure and retry do not render a false empty result", async () => {
+  const nodes = new Map(), timers = new Map(), rendered = [], pending = [];
+  let timerId = 0;
+  function element(id) {
+    if (!nodes.has(id)) {
+      const classes = new Set();
+      nodes.set(id, { value: id === "arcaStatisticsModelFilter" ? "v5" : "", textContent: "", classes,
+        classList: { toggle(name, active) { active ? classes.add(name) : classes.delete(name); } },
+        setAttribute(name, value) { this[name] = value; },
+      });
+    }
+    return nodes.get(id);
+  }
+  const context = vm.createContext({ URLSearchParams,
+    setInterval: fn => { timers.set(++timerId, fn); return timerId; },
+    clearInterval: id => timers.delete(id),
+    document: { addEventListener() {}, getElementById: element },
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "../static/arca_style_collector.js"), "utf8"), context);
+  context.arcaFetch = () => new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  context.renderArcaStyleStatistics = result => rendered.push(result);
+  context.arcaSetStatus = (id, text) => { element(id).textContent = text; };
+  const loading = context.loadArcaStyleStatistics();
+  assert.equal(rendered.length, 0);
+  assert.equal(element("arcaStatisticsFeedbackTitle").textContent, "V5 통계 집계 중");
+  assert.equal(element("arcaStatisticsContent").classes.has("hidden"), true);
+  assert.equal(element("arcaStyleStatistics")["aria-busy"], "true");
+  [...timers.values()][0]();
+  assert.match(element("arcaStatisticsElapsed").textContent, /초 경과/);
+  pending[0].reject(new Error("연결 실패"));
+  await loading;
+  assert.equal(rendered.length, 0);
+  assert.equal(element("retryArcaStatistics").classes.has("hidden"), false);
+  assert.equal(element("arcaStyleStatistics")["aria-busy"], "false");
+  assert.equal(timers.size, 0);
+  const retry = context.loadArcaStyleStatistics();
+  pending[1].resolve({ analyzed_image_count: 0 });
+  await retry;
+  assert.equal(rendered.length, 1);
+  assert.equal(element("arcaStatisticsContent").classes.has("hidden"), false);
+  assert.equal(element("arcaStatisticsFeedback").classes.has("hidden"), true);
+  assert.equal(timers.size, 0);
 });
 const {
   normalizeArcaPayload, arcaSummaryText, collectionProgress, durationText,
@@ -269,6 +313,13 @@ test("direct URL payload trims one article link", () => {
   assert.deepEqual(normalizeArcaUrlPayload("  https://arca.live/b/aiart/174457459  "), {
     source_url: "https://arca.live/b/aiart/174457459",
   });
+});
+
+test("WebP compression is opt-in for search and direct-link collection", () => {
+  assert.equal(normalizeArcaPayload({}).webp_compress, undefined);
+  assert.equal(normalizeArcaPayload({ webp_compress: true }).webp_compress, true);
+  assert.equal(normalizeArcaUrlPayload('https://arca.live/b/aiart/123', true).webp_compress, true);
+  assert.equal(normalizeArcaUrlPayload('https://arca.live/b/aiart/123', false).webp_compress, undefined);
 });
 
 test("summary explains when an existing search was skipped", () => {

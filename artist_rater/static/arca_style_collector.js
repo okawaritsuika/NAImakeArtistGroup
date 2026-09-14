@@ -94,11 +94,12 @@ function normalizeArcaPayload(value) {
     end_date: value.end_date || "",
     max_pages: Number(value.max_pages || 0),
     max_posts: Number(value.max_posts || 0),
+    ...(value.webp_compress === true ? { webp_compress: true } : {}),
   };
 }
 
-function normalizeArcaUrlPayload(value) {
-  return { source_url: String(value || "").trim() };
+function normalizeArcaUrlPayload(value, webpCompress = false) {
+  return { source_url: String(value || "").trim(), ...(webpCompress === true ? { webp_compress: true } : {}) };
 }
 
 function arcaListQuery(value = {}) {
@@ -499,6 +500,7 @@ function arcaPayload() {
     tabs: [arcaEl("arcaTabNai").checked && "NAI", arcaEl("arcaTabR18Nai").checked && "R18_NAI"].filter(Boolean),
     start_date: arcaEl("arcaStartDate").value,
     end_date: arcaEl("arcaEndDate").value,
+    webp_compress: arcaEl("arcaWebpCompress")?.checked,
   });
 }
 
@@ -584,7 +586,7 @@ function renderArcaCollectionProgress(job) {
 
 function setArcaCollectionControlsDisabled(disabled) {
   if (disabled) arcaEl("arcaCollectionProgressPanel")?.setAttribute("open", "");
-  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "downloadArcaImageArchive", "chooseArcaImageArchive", "arcaImageArchiveFile", "arcaTabNai", "arcaTabR18Nai", "arcaKeyword", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
+  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "downloadArcaImageArchive", "chooseArcaImageArchive", "arcaImageArchiveFile", "arcaTabNai", "arcaTabR18Nai", "arcaWebpCompress", "arcaKeyword", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
     const element = arcaEl(id);
     if (element) element.disabled = disabled;
   }
@@ -1618,6 +1620,19 @@ async function loadArcaStyles() {
 }
 
 let arcaStatisticsRequest = 0;
+let arcaStatisticsTimer = null;
+
+function setArcaStatisticsPhase(phase, modelLabel) {
+  const loading = phase === "loading";
+  arcaEl("arcaStyleStatistics")?.setAttribute("aria-busy", String(loading));
+  arcaEl("arcaStatisticsContent")?.classList.toggle("hidden", phase !== "ready");
+  arcaEl("arcaStatisticsFeedback")?.classList.toggle("hidden", phase === "ready");
+  arcaEl("arcaStatisticsFeedback")?.classList.toggle("is-loading", loading);
+  arcaEl("retryArcaStatistics")?.classList.toggle("hidden", phase !== "error");
+  arcaEl("arcaStatisticsElapsed")?.classList.toggle("hidden", !loading);
+  const title = arcaEl("arcaStatisticsFeedbackTitle");
+  if (title) title.textContent = loading ? `${modelLabel} 통계 집계 중` : "통계를 불러오지 못했습니다";
+}
 
 function selectArcaStatisticsModel(model) {
   const filter = arcaEl("arcaStatisticsModelFilter");
@@ -1636,11 +1651,22 @@ function selectArcaStatisticsModel(model) {
 
 async function loadArcaStyleStatistics() {
   const request = ++arcaStatisticsRequest;
-  const root = arcaEl("arcaStyleStatistics");
+  clearInterval(arcaStatisticsTimer);
+  const model = arcaEl("arcaStatisticsModelFilter")?.value;
+  const modelLabel = model === "v5" ? "V5" : model === "v4.5" ? "V4.5" : "전체 모델";
   arcaState.statisticsLoaded = false;
-  renderArcaStyleStatistics({});
-  if (root) root.setAttribute("aria-busy", "true");
-  arcaSetStatus("arcaStyleStatisticsStatus", "통계를 불러오는 중…");
+  setArcaStatisticsPhase("loading", modelLabel);
+  const summary = arcaEl("arcaStyleStatisticsSummary");
+  if (summary) summary.textContent = `${modelLabel} · 선택한 추천수 조건으로 통계를 준비하고 있습니다.`;
+  const scope = arcaEl("arcaStatisticsScopeNote");
+  if (scope) scope.textContent = "";
+  arcaSetStatus("arcaStyleStatisticsStatus", "저장된 프롬프트에서 작가·퀄리티 태그와 가중치를 집계합니다. 데이터가 많으면 잠시 걸릴 수 있습니다.");
+  const started = Date.now();
+  const elapsed = arcaEl("arcaStatisticsElapsed");
+  if (elapsed) elapsed.textContent = "0초 경과";
+  arcaStatisticsTimer = setInterval(() => {
+    if (request === arcaStatisticsRequest && elapsed) elapsed.textContent = `${Math.floor((Date.now() - started) / 1000)}초 경과 · 응답을 기다리고 있습니다`;
+  }, 1000);
   try {
     const query = arcaStatisticsQuery({
       model: arcaEl("arcaStatisticsModelFilter")?.value,
@@ -1651,13 +1677,19 @@ async function loadArcaStyleStatistics() {
     if (request !== arcaStatisticsRequest) return;
     renderArcaStyleStatistics(result);
     arcaState.statisticsLoaded = true;
+    setArcaStatisticsPhase("ready", modelLabel);
     arcaSetStatus("arcaStyleStatisticsStatus", "");
   } catch (error) {
     if (request !== arcaStatisticsRequest) return;
     arcaState.statisticsLoaded = false;
+    setArcaStatisticsPhase("error", modelLabel);
+    if (summary) summary.textContent = `${modelLabel} · 집계에 실패했습니다. 다시 시도해 주세요.`;
     arcaSetStatus("arcaStyleStatisticsStatus", error.message, "error");
   } finally {
-    if (root && request === arcaStatisticsRequest) root.setAttribute("aria-busy", "false");
+    if (request === arcaStatisticsRequest) {
+      clearInterval(arcaStatisticsTimer);
+      arcaStatisticsTimer = null;
+    }
   }
 }
 
@@ -1735,7 +1767,7 @@ async function restoreArcaImages() {
 
 async function collectArcaUrl() {
   if (arcaState.collecting) return;
-  const payload = normalizeArcaUrlPayload(arcaEl("arcaDirectUrl")?.value);
+  const payload = normalizeArcaUrlPayload(arcaEl("arcaDirectUrl")?.value, arcaEl("arcaWebpCompress")?.checked);
   if (!payload.source_url) {
     arcaSetStatus("arcaCollectorStatus", "추가할 게시글 링크를 입력해 주세요.", "error");
     return;
@@ -1835,6 +1867,7 @@ function bindArcaCollector() {
   arcaEl("stopArcaCollection")?.addEventListener("click", () => controlArcaCollection("stop"));
   arcaEl("refreshArcaStyles")?.addEventListener("click", refreshArcaStyleData);
   arcaEl("refreshArcaStatistics")?.addEventListener("click", loadArcaStyleStatistics);
+  arcaEl("retryArcaStatistics")?.addEventListener("click", loadArcaStyleStatistics);
   arcaEl("arcaRecommendationPreset")?.addEventListener("change", applyArcaRecommendationPreset);
   arcaEl("applyArcaRecommendationFilter")?.addEventListener("click", loadArcaStyleStatistics);
   arcaEl("arcaStatisticsModelFilter")?.addEventListener("change", () => {

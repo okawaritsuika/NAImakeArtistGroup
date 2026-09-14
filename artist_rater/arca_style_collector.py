@@ -754,6 +754,12 @@ def _iso_date(value, name):
         raise ArcaCollectorError(f"{name} 형식은 YYYY-MM-DD여야 합니다.")
 
 
+def _webp_compression_enabled(value):
+    if type(value) is not bool:
+        raise ArcaCollectorError("WebP 압축 옵션은 체크 여부로 지정해 주세요.")
+    return value
+
+
 def normalize_collect_payload(payload, *, allow_empty_keyword=False):
     payload = payload if isinstance(payload, dict) else {}
     today = date.today()
@@ -777,7 +783,10 @@ def normalize_collect_payload(payload, *, allow_empty_keyword=False):
         keyword = str(raw_keyword or DEFAULT_KEYWORD).strip()
     if (not keyword and not allow_empty_keyword) or len(keyword) > 200:
         raise ArcaCollectorError("검색어를 확인해 주세요.")
-    return {"keyword": keyword, "tabs": tabs, "start_date": start.isoformat(), "end_date": end.isoformat(), "max_pages": max_pages, "max_posts": max_posts}
+    result = {"keyword": keyword, "tabs": tabs, "start_date": start.isoformat(), "end_date": end.isoformat(), "max_pages": max_pages, "max_posts": max_posts}
+    if _webp_compression_enabled(payload.get("webp_compress", False)):
+        result["webp_compress"] = True
+    return result
 
 
 def merge_date_intervals(intervals):
@@ -961,6 +970,8 @@ def resume_collection_job(db_path, image_dir, job_id, seed_db_path=None):
         payload = json.loads(job["request_json"])
     except (TypeError, json.JSONDecodeError):
         raise ArcaCollectorError("이전 수집 조건을 읽지 못했습니다.")
+    if payload.get("source_url"):
+        return start_url_collection_job(db_path, image_dir, payload["source_url"], webp_compress=payload.get("webp_compress", False))
     return start_collection_job(db_path, image_dir, payload)
 
 
@@ -995,13 +1006,16 @@ def start_collection_job(db_path, image_dir, payload):
     return job_id
 
 
-def create_url_collection_job(db_path, source_url):
+def create_url_collection_job(db_path, source_url, *, webp_compress=False):
     canonical = normalize_arca_article_url(source_url)
+    payload = {"source_url": canonical}
+    if _webp_compression_enabled(webp_compress):
+        payload["webp_compress"] = True
     now = datetime.now().isoformat(timespec="seconds")
     with closing(_connect(db_path)) as conn, conn:
         return conn.execute(
             "INSERT INTO arca_collection_jobs(request_json,status,stage,total_pages,total_posts,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (json.dumps({"source_url": canonical}, ensure_ascii=False), "queued", "queued", 1, 1, now, now),
+            (json.dumps(payload, ensure_ascii=False), "queued", "queued", 1, 1, now, now),
         ).lastrowid
 
 
@@ -1041,7 +1055,8 @@ def _reusable_direct_item_id(db_path, image_dir, source_url):
     return item["id"] if any(_local_image_exists(image_dir, row["image_path"]) for row in rows) else None
 
 
-def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=None):
+def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=None, *, webp_compress=False):
+    webp_compress = _webp_compression_enabled(webp_compress)
     canonical = normalize_arca_article_url(source_url)
     init_arca_style_tables(db_path)
     reusable_item_id = _reusable_direct_item_id(db_path, image_dir, canonical)
@@ -1069,7 +1084,7 @@ def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=
     if job_id:
         update_collection_job(db_path, job_id, stage="downloading", scanned_pages=1, scanned_posts=1)
     summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
-    downloaded_count, item_id = _save_article(db_path, image_dir, session, article, summary)
+    downloaded_count, item_id = _save_article(db_path, image_dir, session, article, summary, **({"webp_compress": True} if webp_compress else {}))
     result = {
         "ok": True, "item_id": item_id, "saved": summary["saved"], "updated": summary["updated"],
         "downloaded_images": downloaded_count,
@@ -1083,17 +1098,17 @@ def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=
     return result
 
 
-def _run_url_collection_job(db_path, image_dir, source_url, job_id):
+def _run_url_collection_job(db_path, image_dir, source_url, job_id, webp_compress=False):
     try:
-        collect_arca_style_url(db_path, image_dir, source_url, job_id=job_id)
+        collect_arca_style_url(db_path, image_dir, source_url, job_id=job_id, webp_compress=webp_compress)
     except Exception as exc:
         update_collection_job(db_path, job_id, status="failed", stage="failed", error=str(exc)[:1000])
 
 
-def start_url_collection_job(db_path, image_dir, source_url):
+def start_url_collection_job(db_path, image_dir, source_url, *, webp_compress=False):
     canonical = normalize_arca_article_url(source_url)
-    job_id = create_url_collection_job(db_path, canonical)
-    Thread(target=_run_url_collection_job, args=(db_path, image_dir, canonical, job_id), daemon=True).start()
+    job_id = create_url_collection_job(db_path, canonical, webp_compress=webp_compress)
+    Thread(target=_run_url_collection_job, args=(db_path, image_dir, canonical, job_id, webp_compress), daemon=True).start()
     return job_id
 
 
@@ -3661,7 +3676,7 @@ def collect_arca_styles(
                     summary["skipped"] += 1
                     continue
                 _wait_for_collection_control(db_path, job_id, "downloading")
-                downloaded_count, _ = _save_article(db_path, image_dir, session, article, summary, run_id=run_id)
+                downloaded_count, _ = _save_article(db_path, image_dir, session, article, summary, run_id=run_id, **({"webp_compress": True} if params.get("webp_compress") else {}))
                 if job_id:
                     previous = get_collection_job(db_path, job_id)
                     elapsed = max(fetch_seconds + time.monotonic() - post_started, 0.001)
@@ -3701,7 +3716,7 @@ def collect_arca_styles(
     return summary
 
 
-def _save_article(db_path, image_dir, session, article, summary, run_id=None):
+def _save_article(db_path, image_dir, session, article, summary, run_id=None, *, webp_compress=False):
     image_root = Path(image_dir).resolve()
     with closing(_connect(db_path)) as conn:
         rows = conn.execute(
@@ -3761,6 +3776,14 @@ def _save_article(db_path, image_dir, session, article, summary, run_id=None):
             if data is None:
                 return image_url, None, content_type, extract_novelai_metadata(b"")
             meta = extract_novelai_metadata(data, content_type)
+            if webp_compress and meta["metadata_status"] == "ok" and content_type != "image/webp":
+                from shared_style_webp import verified_webp
+                try:
+                    encoded = verified_webp(data, quality=90)
+                except (ValueError, OSError):
+                    pass  # Keep original bytes when metadata-preserving conversion fails.
+                else:
+                    data, content_type = encoded, "image/webp"
             return image_url, data if meta["metadata_status"] == "ok" else None, content_type, meta
         except (requests.RequestException, ArcaCollectorError, zlib.error):
             return None

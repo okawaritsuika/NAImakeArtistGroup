@@ -132,7 +132,7 @@ class LauncherControllerTest(unittest.TestCase):
                 controller.remove_data_directory("C:/one")
 
     def test_packaged_version_matches_next_release(self):
-        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.10")
+        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.11")
 
     def test_independent_frozen_environment_removes_parent_bootloader_state(self):
         env = launcher.independent_frozen_environment({
