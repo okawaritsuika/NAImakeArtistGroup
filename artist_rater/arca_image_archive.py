@@ -29,7 +29,7 @@ from arca_style_collector import (
 
 ARCHIVE_FILENAME = "NAImakeArtistGroup_shared_images_20260914_webp.zip"
 ARCHIVE_DOWNLOAD_URL = (
-    "https://huggingface.co/datasets/okawaritsuika/nai-shared-styles/resolve/main/"
+    "https://huggingface.co/datasets/okawaritsuika/nai-shared-styles/resolve/30a53b41204e9cfd8ef73cc4276f53402911f11c/"
     + ARCHIVE_FILENAME + "?download=true"
 )
 ARCHIVE_BYTES = 566_181_633
