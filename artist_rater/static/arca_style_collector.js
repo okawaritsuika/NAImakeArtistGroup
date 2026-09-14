@@ -759,9 +759,9 @@ async function startGoogleArcaImageArchive() {
   if (isArcaCollectionBusy(arcaState)) return;
   arcaState.collecting = true;
   setArcaCollectionControlsDisabled(true);
-  arcaSetStatus("arcaImageArchiveStatus", "Google Drive ZIP 다운로드를 준비합니다.");
+  arcaSetStatus("arcaImageArchiveStatus", "Hugging Face 이미지팩 다운로드를 준비합니다.");
   try {
-    const result = await arcaFetch("/api/arca-styles/image-archive/google", { method: "POST", body: "{}" });
+    const result = await arcaFetch("/api/arca-styles/image-archive/huggingface", { method: "POST", body: "{}" });
     arcaState.activeJobId = result.job_id;
     arcaSetStatus("arcaImageArchiveStatus", "다운로드 중입니다. 중단되면 같은 버튼으로 이어받을 수 있습니다.");
     await pollArcaCollectionJob(result.job_id);
@@ -1266,6 +1266,7 @@ function renderArcaTagStatistics(result) {
 }
 
 async function loadArcaTagStatistics(kind, tag) {
+  const scopeRequest = arcaStatisticsRequest;
   const modal = arcaEl("arcaTagStatisticsModal");
   modal?.classList.remove("hidden");
   arcaEl("arcaTagStatisticsTitle").textContent = tag || "태그 상세";
@@ -1277,6 +1278,7 @@ async function loadArcaTagStatistics(kind, tag) {
       recommendation_max: arcaEl("arcaRecommendationMax")?.value,
     });
     const result = await arcaFetch(`/api/arca-styles/statistics/tag?${query}`);
+    if (scopeRequest !== arcaStatisticsRequest) return;
     renderArcaTagStatistics(result);
     arcaSetStatus("arcaTagStatisticsStatus", "");
   } catch (error) {
@@ -1294,6 +1296,7 @@ function renderArcaQualitySequence(result) {
 }
 
 async function loadArcaQualitySequence(tags) {
+  const scopeRequest = arcaStatisticsRequest;
   const modal = arcaEl("arcaSequenceModal");
   modal?.classList.remove("hidden");
   arcaEl("arcaSequenceTitle").textContent = (tags || []).join(" → ") || "퀄리티 순서 조합";
@@ -1304,6 +1307,7 @@ async function loadArcaQualitySequence(tags) {
       recommendation_min: arcaEl("arcaRecommendationMin")?.value,
       recommendation_max: arcaEl("arcaRecommendationMax")?.value,
     })}`);
+    if (scopeRequest !== arcaStatisticsRequest) return;
     renderArcaQualitySequence(result);
     arcaSetStatus("arcaSequenceStatus", "");
   } catch (error) {
@@ -1375,7 +1379,9 @@ function renderArcaStyleStatistics(result) {
     const minimum = arcaEl("arcaRecommendationMin")?.value;
     const maximum = arcaEl("arcaRecommendationMax")?.value;
     const range = minimum || maximum ? ` · 추천수 ${minimum || 0}–${maximum || "제한 없음"}` : "";
-    summary.textContent = `${arcaStatisticsSummary(result)}${range}`;
+    const model = arcaEl("arcaStatisticsModelFilter")?.value;
+    const modelLabel = model === "v5" ? "V5" : model === "v4.5" ? "V4.5" : "전체 모델";
+    summary.textContent = `${modelLabel} · ${arcaStatisticsSummary(result)}${range}`;
   }
   const scope = arcaEl("arcaStatisticsScopeNote");
   if (scope) scope.textContent = result?.collection_scope_note || "";
@@ -1611,8 +1617,28 @@ async function loadArcaStyles() {
   }
 }
 
+let arcaStatisticsRequest = 0;
+
+function selectArcaStatisticsModel(model) {
+  const filter = arcaEl("arcaStatisticsModelFilter");
+  if (!filter || !["v4.5", "v5", "all"].includes(model)) return;
+  filter.value = model;
+  document.querySelectorAll("[data-arca-statistics-model]").forEach((button) => {
+    const active = button.dataset.arcaStatisticsModel === model;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  });
+  arcaEl("arcaTagStatisticsModal")?.classList.add("hidden");
+  arcaEl("arcaSequenceModal")?.classList.add("hidden");
+  return loadArcaStyleStatistics();
+}
+
 async function loadArcaStyleStatistics() {
+  const request = ++arcaStatisticsRequest;
   const root = arcaEl("arcaStyleStatistics");
+  arcaState.statisticsLoaded = false;
+  renderArcaStyleStatistics({});
   if (root) root.setAttribute("aria-busy", "true");
   arcaSetStatus("arcaStyleStatisticsStatus", "통계를 불러오는 중…");
   try {
@@ -1622,14 +1648,16 @@ async function loadArcaStyleStatistics() {
       recommendation_max: arcaEl("arcaRecommendationMax")?.value,
     });
     const result = await arcaFetch(`/api/arca-styles/statistics?${query}`);
+    if (request !== arcaStatisticsRequest) return;
     renderArcaStyleStatistics(result);
     arcaState.statisticsLoaded = true;
     arcaSetStatus("arcaStyleStatisticsStatus", "");
   } catch (error) {
+    if (request !== arcaStatisticsRequest) return;
     arcaState.statisticsLoaded = false;
     arcaSetStatus("arcaStyleStatisticsStatus", error.message, "error");
   } finally {
-    if (root) root.setAttribute("aria-busy", "false");
+    if (root && request === arcaStatisticsRequest) root.setAttribute("aria-busy", "false");
   }
 }
 
@@ -1813,6 +1841,18 @@ function bindArcaCollector() {
     arcaState.statisticTables.artist.page = 1;
     arcaState.statisticTables.quality.page = 1;
     void loadArcaStyleStatistics();
+  });
+  const modelTabs = [...document.querySelectorAll("[data-arca-statistics-model]")];
+  modelTabs.forEach((button, index) => {
+    button.addEventListener("click", () => void selectArcaStatisticsModel(button.dataset.arcaStatisticsModel));
+    button.addEventListener("keydown", (event) => {
+      const offset = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+      const next = event.key === "Home" ? 0 : event.key === "End" ? modelTabs.length - 1 : (index + offset + modelTabs.length) % modelTabs.length;
+      if (!offset && !["Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      modelTabs[next].focus();
+      void selectArcaStatisticsModel(modelTabs[next].dataset.arcaStatisticsModel);
+    });
   });
   for (const id of ["arcaRecommendationMin", "arcaRecommendationMax"]) {
     arcaEl(id)?.addEventListener("input", () => { if (arcaEl("arcaRecommendationPreset")) arcaEl("arcaRecommendationPreset").value = "custom"; });

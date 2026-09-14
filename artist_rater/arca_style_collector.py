@@ -701,12 +701,16 @@ def import_arca_style_seed(db_path, seed_db):
             f"image.{name}" if name in seed_image_columns else ("'unknown'" if name in {"model_family", "model_generation", "model_variant"} else ("NULL" if name in {"quality_toggle", "uc_preset"} else "''"))
             for name in image_columns
         ]
+        conn.create_function("seed_image_identity", 1, _image_identity)
         conn.execute(
             f"INSERT OR IGNORE INTO arca_style_images (item_id,{','.join(image_columns)}) "
             f"SELECT target.id,{','.join(image_select)} "
             "FROM seed.arca_style_images image "
             "JOIN seed.arca_style_items source ON source.id=image.item_id "
-            "JOIN arca_style_items target ON target.source_url=source.source_url"
+            "JOIN arca_style_items target ON target.source_url=source.source_url "
+            "WHERE NOT EXISTS (SELECT 1 FROM arca_style_images existing "
+            "WHERE existing.item_id=target.id AND existing.metadata_status='ok' "
+            "AND seed_image_identity(existing.image_url)=seed_image_identity(image.image_url))"
         )
         run_map = {}
         run_columns = [

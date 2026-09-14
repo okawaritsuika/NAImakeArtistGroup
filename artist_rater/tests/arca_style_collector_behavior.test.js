@@ -2,6 +2,34 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
+
+test("statistics model tabs ignore late responses from the previous model", async () => {
+  const pending = [], rendered = [], filter = { value: "v5" };
+  const tabs = ["v4.5", "v5", "all"].map(model => ({
+    dataset: { arcaStatisticsModel: model }, classList: { toggle() {} },
+    setAttribute(name, value) { this[name] = value; },
+  }));
+  const context = vm.createContext({ URLSearchParams, document: {
+    addEventListener() {}, querySelectorAll: () => tabs,
+    getElementById: id => id === "arcaStatisticsModelFilter" ? filter : null,
+  }});
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "../static/arca_style_collector.js"), "utf8"), context);
+  context.arcaFetch = url => new Promise(resolve => pending.push({ url, resolve }));
+  context.renderArcaStyleStatistics = result => rendered.push(result);
+  context.arcaSetStatus = () => {};
+  const old = context.selectArcaStatisticsModel("v4.5");
+  const latest = context.selectArcaStatisticsModel("v5");
+  assert.match(pending[0].url, /model=v4.5/);
+  assert.match(pending[1].url, /model=v5/);
+  pending[1].resolve({ model: "v5" });
+  await latest;
+  pending[0].resolve({ model: "v4.5" });
+  await old;
+  assert.deepEqual(rendered.filter(row => row.model), [{ model: "v5" }]);
+  assert.equal(tabs[1]["aria-selected"], "true");
+  assert.equal(tabs[0].tabIndex, -1);
+});
 const {
   normalizeArcaPayload, arcaSummaryText, collectionProgress, durationText,
   etaText, collectionCountsText, groupTitle, promptSection,

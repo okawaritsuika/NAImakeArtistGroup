@@ -180,6 +180,12 @@ class ArcaStyleApiTest(unittest.TestCase):
             app.DB_PATH, app.ARCA_STYLE_IMAGE_DIR, app.DATA_DIR, app.ARCA_STYLE_SEED_PATH,
         )
 
+    def test_huggingface_image_archive_route_keeps_legacy_response(self):
+        with patch("app.start_google_archive_job", return_value=42):
+            response = self.client.post("/api/arca-styles/image-archive/huggingface", json={})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"job_id": 42, "status": "queued"})
+
     @patch("app.start_local_upload")
     def test_local_image_archive_upload_route_returns_chunk_size(self, start_upload):
         start_upload.return_value = {"upload_id": "a" * 32, "chunk_bytes": 8, "uploaded_bytes": 0}

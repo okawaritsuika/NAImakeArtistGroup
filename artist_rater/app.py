@@ -4714,6 +4714,7 @@ def api_arca_style_image_archive():
 
 
 @app.route("/api/arca-styles/image-archive/google", methods=["POST"])
+@app.route("/api/arca-styles/image-archive/huggingface", methods=["POST"])
 def api_download_arca_style_image_archive():
     try:
         job_id = start_google_archive_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, DATA_DIR, ARCA_STYLE_SEED_PATH)

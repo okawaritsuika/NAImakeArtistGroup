@@ -1,4 +1,5 @@
 import json
+import gc
 import sqlite3
 import tempfile
 import unittest
@@ -58,6 +59,7 @@ class AuthorStyleGroupApiTest(unittest.TestCase):
     def tearDown(self):
         for name, value in self.originals.items():
             setattr(app, name, value)
+        gc.collect()  # Release SQLite cursor cycles before Windows removes the fixture.
         self.temp.cleanup()
 
     def test_author_targets_create_review_decision_and_reference_gallery(self):

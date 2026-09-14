@@ -1,4 +1,5 @@
 import json
+import gc
 import sqlite3
 import tempfile
 import unittest
@@ -96,6 +97,7 @@ class DataMergeTest(unittest.TestCase):
                 "DB_PATH",
                 "MERGE_SOURCE_DIRS",
                 "ARCA_LOGIN_MANAGER",
+                "ARCA_STYLE_SEED_PATH",
             )
         }
 
@@ -109,6 +111,7 @@ class DataMergeTest(unittest.TestCase):
             primary = root / "primary-data"
             source_project = root / "source-project"
             source_data = source_project / "artist_rater" / "data"
+            app.ARCA_STYLE_SEED_PATH = root / "missing-seed.sqlite"
 
             app.configure_data_directories([source_data])
             app.init_db()
@@ -160,6 +163,7 @@ class DataMergeTest(unittest.TestCase):
             self.assertEqual(examples.status_code, 200)
             self.assertEqual(examples.get_json()["examples"][0]["image_url"], "/thumbnails/source.webp")
             self.assertEqual((source_data / "artist_rater.sqlite").read_bytes(), source_db_bytes)
+            gc.collect()  # Release SQLite cursor cycles before Windows removes the fixture.
 
     def test_normalize_requires_primary_to_be_one_of_data_dirs(self):
         with tempfile.TemporaryDirectory() as temp:

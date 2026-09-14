@@ -930,11 +930,11 @@
           <section class="arca-image-restore-card" aria-labelledby="arcaImageArchiveTitle">
             <div>
               <strong id="arcaImageArchiveTitle">공유 그림체 ZIP으로 빠르게 설치</strong>
-              <p>Google Drive에서 약 3.10 GB ZIP을 이어받아 SHA-256을 확인하고 이미지 1,687장을 자동으로 풉니다. 자동 다운로드가 안 되면 Drive에서 ZIP 사본을 직접 받은 뒤 로컬 ZIP 설치를 선택하세요.</p>
+              <p>Hugging Face에서 WebP 이미지팩을 이어받아 SHA-256과 기본 그림체 데이터의 일치 여부를 확인한 뒤 설치합니다. 프롬프트와 생성 설정은 이미지에 보존됩니다. 직접 받은 배포 ZIP은 내 ZIP 설치로 선택할 수 있습니다.</p>
             </div>
             <p id="arcaImageArchiveStatus" class="arca-image-restore-estimate" aria-live="polite">기존 아카라이브 직접 다운로드 방식도 아래에 그대로 남아 있습니다.</p>
             <div class="arca-image-restore-actions">
-              <button id="downloadArcaImageArchive" class="primary" type="button">Google Drive에서 빠르게 받기</button>
+              <button id="downloadArcaImageArchive" class="primary" type="button">Hugging Face에서 빠르게 받기</button>
               <button id="chooseArcaImageArchive" type="button">내 ZIP 설치</button>
               <input id="arcaImageArchiveFile" class="hidden" type="file" accept=".zip,application/zip">
             </div>
@@ -1013,8 +1013,13 @@
             <div><h2>공유 그림체 프롬프트 분석</h2><p id="arcaStyleStatisticsSummary" class="arca-statistics-summary">저장된 이미지 프롬프트를 분석합니다.</p></div>
             <button id="refreshArcaStatistics" type="button">통계 새로고침</button>
           </div>
+          <div class="arca-statistics-model-tabs" role="tablist" aria-label="통계 모델 선택">
+            <button type="button" data-arca-statistics-model="v4.5" role="tab" aria-selected="false" tabindex="-1" aria-controls="arcaStyleStatistics">V4.5</button>
+            <button type="button" class="active" data-arca-statistics-model="v5" role="tab" aria-selected="true" tabindex="0" aria-controls="arcaStyleStatistics">V5</button>
+            <button type="button" data-arca-statistics-model="all" role="tab" aria-selected="false" tabindex="-1" aria-controls="arcaStyleStatistics">전체</button>
+          </div>
+          <input id="arcaStatisticsModelFilter" type="hidden" value="v5">
           <div class="arca-recommendation-filter">
-            <label class="field"><span>분석 모델</span><select id="arcaStatisticsModelFilter"><option value="all">전체</option><option value="v5">V5만</option><option value="v4.5">V4.5만</option></select></label>
             <label class="field"><span>추천수 빠른 선택</span><select id="arcaRecommendationPreset"><option value="all">전체</option><option value="10">10 이상</option><option value="30">30 이상</option><option value="50">50 이상</option><option value="100">100 이상</option><option value="custom">직접 입력</option></select></label>
             <label class="field"><span>최소 추천수</span><input id="arcaRecommendationMin" type="number" min="0" step="1" placeholder="제한 없음"></label>
             <label class="field"><span>최대 추천수</span><input id="arcaRecommendationMax" type="number" min="0" step="1" placeholder="제한 없음"></label>
