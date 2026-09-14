@@ -13,6 +13,7 @@ from pathlib import Path
 from threading import RLock, Thread
 
 import requests
+from PIL import Image
 
 from arca_style_collector import (
     ArcaCollectionStopped,
@@ -26,21 +27,21 @@ from arca_style_collector import (
 )
 
 
-DRIVE_FILE_ID = "1JdTHVsu7a99TB2NulAu0TxZhYlsJa5Fs"
-ARCHIVE_FILENAME = "NAImakeArtistGroup_shared_images_v0.1.0.zip"
+ARCHIVE_FILENAME = "NAImakeArtistGroup_shared_images_20260914_webp.zip"
 ARCHIVE_DOWNLOAD_URL = (
-    f"https://drive.usercontent.google.com/download?id={DRIVE_FILE_ID}"
-    "&export=download&confirm=t"
+    "https://huggingface.co/datasets/okawaritsuika/nai-shared-styles/resolve/30a53b41204e9cfd8ef73cc4276f53402911f11c/"
+    + ARCHIVE_FILENAME + "?download=true"
 )
-ARCHIVE_BYTES = 3_328_615_720
-ARCHIVE_SHA256 = "a0e11b9ea5e6b07f8efd789eb5e78c4b4addfea318e4d1d692c0eeff26a5e4f6"
-ARCHIVE_IMAGE_COUNT = 1_687
-ARCHIVE_IMAGE_BYTES = 3_327_765_422
+ARCHIVE_BYTES = 566_181_633
+ARCHIVE_SHA256 = "0ae1fc6211013c9372361147e3c3abe77e852b86b2a2951e2f02cf3e865cce46"
+ARCHIVE_IMAGE_COUNT = 3_617
+ARCHIVE_IMAGE_BYTES = 563_876_948
+ARCHIVE_SEED_SHA256 = "424dfa55e32897047a4fed1f1ef3768087ca828139498ffc7dfb3a8d2aeaa826"
 ARCHIVE_FORMAT = "naimakeartistgroup-shared-images"
 DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024
 LOCAL_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 INSTALL_FREE_SPACE_MARGIN = 256 * 1024 * 1024
-IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.png$")
+IMAGE_NAME = re.compile(r"^[0-9a-f]{64}\.(?:png|webp)$")
 SHA256_TEXT = re.compile(r"^[0-9a-f]{64}$")
 _UPLOAD_LOCK = RLock()
 _LOCAL_UPLOADS = {}
@@ -100,16 +101,16 @@ def _drive_response(session, offset):
     )
     if response.status_code not in ({206} if offset else {200, 206}):
         response.close()
-        raise ArcaImageArchiveError(f"Google Drive 다운로드 응답이 올바르지 않습니다. HTTP {response.status_code}")
+        raise ArcaImageArchiveError(f"이미지팩 다운로드 응답이 올바르지 않습니다. HTTP {response.status_code}")
     content_type = response.headers.get("Content-Type", "").lower()
     if "text/html" in content_type:
         response.close()
-        raise ArcaImageArchiveError("Google Drive가 ZIP 대신 확인 페이지를 반환했습니다.")
+        raise ArcaImageArchiveError("이미지 호스팅 서버가 ZIP 대신 확인 페이지를 반환했습니다.")
     if offset:
         content_range = response.headers.get("Content-Range", "")
         if not content_range.startswith(f"bytes {offset}-") or not content_range.endswith(f"/{ARCHIVE_BYTES}"):
             response.close()
-            raise ArcaImageArchiveError("Google Drive 이어받기 범위를 확인하지 못했습니다.")
+            raise ArcaImageArchiveError("이미지팩 이어받기 범위를 확인하지 못했습니다.")
     return response
 
 
@@ -153,7 +154,7 @@ def download_google_archive(target, progress=None, control=None, session=None):
         if own_session:
             session.close()
     if target.stat().st_size != ARCHIVE_BYTES:
-        raise ArcaImageArchiveError("Google Drive 다운로드가 끝까지 완료되지 않았습니다. 다시 누르면 이어받습니다.")
+        raise ArcaImageArchiveError("이미지팩 다운로드가 끝까지 완료되지 않았습니다. 다시 누르면 이어받습니다.")
     return target
 
 
@@ -176,7 +177,7 @@ def _validated_manifest(archive, expected_count=ARCHIVE_IMAGE_COUNT, expected_by
         manifest = json.loads(archive.read("manifest.json"))
     except (KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ArcaImageArchiveError("ZIP의 manifest.json을 읽지 못했습니다.") from exc
-    if manifest.get("format") != ARCHIVE_FORMAT or manifest.get("version") != 1:
+    if manifest.get("format") != ARCHIVE_FORMAT or manifest.get("version") not in (1, 2):
         raise ArcaImageArchiveError("지원하지 않는 공유 그림체 ZIP 형식입니다.")
     files = manifest.get("files")
     if not isinstance(files, list) or len(files) != expected_count:
@@ -202,6 +203,13 @@ def _validated_manifest(archive, expected_count=ARCHIVE_IMAGE_COUNT, expected_by
             raise ArcaImageArchiveError("ZIP 이미지 해시가 올바르지 않습니다.")
         if type(item.get("image_id")) is not int or type(item.get("item_id")) is not int:
             raise ArcaImageArchiveError("ZIP 이미지 식별자가 올바르지 않습니다.")
+        if manifest["version"] == 2:
+            source, identity = item.get("source_url"), item.get("image_identity")
+            if not isinstance(source, str) or not isinstance(identity, str):
+                raise ArcaImageArchiveError("ZIP의 원본 이미지 식별자가 올바르지 않습니다.")
+            expected_name = hashlib.sha256((source + "\n" + identity).encode()).hexdigest() + ".webp"
+            if name != expected_name or _image_identity(identity) != identity:
+                raise ArcaImageArchiveError("ZIP의 원본 이미지 식별자가 일치하지 않습니다.")
         info = infos[f"arca_style_images/{name}"]
         if info.flag_bits & 0x1 or info.file_size != item.get("bytes") or info.file_size > 32 * 1024 * 1024:
             raise ArcaImageArchiveError("ZIP 이미지 크기 또는 암호화 상태가 올바르지 않습니다.")
@@ -226,7 +234,15 @@ def _matching_database_rows(db_path, seed_db_path, manifest_files):
         ).fetchall()
     seed_by_id = {row["id"]: dict(row) for row in seed_rows if row["id"] in manifest_ids}
     archive_keys = {}
+    modern = all("image_identity" in entry for entry in manifest_files)
+    seed_keys = {(row["source_url"], _image_identity(row["image_url"])) for row in seed_rows}
     for entry in manifest_files:
+        if modern:
+            key = (entry["source_url"], entry["image_identity"])
+            if key not in seed_keys or key in archive_keys:
+                raise ArcaImageArchiveError("공유 그림체 ZIP과 기본 DB의 이미지 연결 정보가 일치하지 않습니다.")
+            archive_keys[key] = entry["name"]
+            continue
         seed_row = seed_by_id.get(entry["image_id"])
         expected_name = (
             hashlib.sha256(seed_row["image_url"].encode()).hexdigest() + ".png"
@@ -243,6 +259,9 @@ def _matching_database_rows(db_path, seed_db_path, manifest_files):
             raise ArcaImageArchiveError("공유 그림체 ZIP의 안정 이미지 식별자가 중복됩니다.")
         archive_keys[key] = entry["name"]
 
+    if modern and seed_keys != set(archive_keys):
+        raise ArcaImageArchiveError("ZIP에 기본 DB의 이미지가 빠져 있습니다. 앱 버전에 맞는 이미지팩을 받아 주세요.")
+
     with closing(_connect(db_path)) as connection:
         rows = connection.execute(
             "SELECT image.id,image.item_id,image.image_url,image.image_path,item.source_url "
@@ -250,19 +269,20 @@ def _matching_database_rows(db_path, seed_db_path, manifest_files):
             "JOIN arca_style_items item ON item.id=image.item_id "
             "WHERE image.metadata_status='ok'",
         ).fetchall()
-    exact_rows = {(row["source_url"], row["image_url"]): dict(row) for row in rows}
     stable_rows = {}
     for row in rows:
         key = (row["source_url"], _image_identity(row["image_url"]))
-        stable_rows.setdefault(key, dict(row))
+        stable_rows.setdefault(key, []).append(dict(row))
 
     result = {}
     for entry in manifest_files:
-        seed_row = seed_by_id[entry["image_id"]]
-        stable_key = (seed_row["source_url"], _image_identity(seed_row["image_url"]))
-        row = exact_rows.get((seed_row["source_url"], seed_row["image_url"])) or stable_rows.get(stable_key)
-        if row:
-            result[entry["name"]] = row
+        if modern:
+            stable_key = (entry["source_url"], entry["image_identity"])
+        else:
+            seed_row = seed_by_id[entry["image_id"]]
+            stable_key = (seed_row["source_url"], _image_identity(seed_row["image_url"]))
+        if stable_key in stable_rows:
+            result[entry["name"]] = stable_rows[stable_key]
     return result
 
 
@@ -306,13 +326,29 @@ def install_image_archive(
                 if progress:
                     progress(processed, expected_count, installed, reused, time.monotonic() - started)
                 continue
+            existing_name = ""
+            for match in row:
+                candidate = (image_dir / match["image_path"]).resolve() if match["image_path"] else None
+                if candidate and candidate.is_relative_to(image_dir.resolve()) and candidate.is_file():
+                    if candidate.name == item["name"] and (
+                        candidate.stat().st_size != item["bytes"]
+                        or _sha256_file(candidate, control=control) != item["sha256"]
+                    ):
+                        continue
+                    try:
+                        with Image.open(candidate) as image:
+                            image.load()
+                        existing_name = match["image_path"]
+                        break
+                    except (OSError, SyntaxError, ValueError):
+                        pass
             target = image_dir / item["name"]
             valid_existing = (
                 target.is_file()
                 and target.stat().st_size == item["bytes"]
                 and _sha256_file(target, control=control) == item["sha256"]
             )
-            if valid_existing:
+            if existing_name or valid_existing:
                 reused += 1
             else:
                 temporary = target.with_suffix(target.suffix + ".partial")
@@ -331,7 +367,7 @@ def install_image_archive(
                     if temporary.exists():
                         temporary.unlink()
                 installed += 1
-            updates.append((item["name"], row["id"], row["item_id"]))
+            updates.extend((existing_name or item["name"], match["id"], match["item_id"]) for match in row)
             processed += 1
             if progress:
                 progress(processed, expected_count, installed, reused, time.monotonic() - started)
@@ -363,8 +399,28 @@ def install_image_archive(
         "installed": installed,
         "reused": reused,
         "updated_rows": len(updates),
-        "skipped_rows": expected_count - len(updates),
+        "skipped_rows": expected_count - len(database_rows),
     }
+
+
+def _missing_seed_images(db_path, image_dir, seed_db_path):
+    """Verify seed coverage, including entries an outdated ZIP never contained."""
+    with closing(_connect(seed_db_path)) as seed:
+        required = {(row[0], _image_identity(row[1])) for row in seed.execute(
+            "SELECT item.source_url,image.image_url FROM arca_style_images image "
+            "JOIN arca_style_items item ON item.id=image.item_id WHERE image.metadata_status='ok'"
+        )}
+    root = Path(image_dir).resolve()
+    present = set()
+    with closing(_connect(db_path)) as db:
+        for row in db.execute(
+            "SELECT item.source_url,image.image_url,image.image_path FROM arca_style_images image "
+            "JOIN arca_style_items item ON item.id=image.item_id WHERE image.metadata_status='ok'"
+        ):
+            path = (root / row[2]).resolve() if row[2] else None
+            if path and path.is_relative_to(root) and path.is_file():
+                present.add((row[0], _image_identity(row[1])))
+    return len(required - present)
 
 
 def _run_archive_job(db_path, image_dir, data_dir, seed_db_path, job_id, mode, archive_path):
@@ -383,7 +439,7 @@ def _run_archive_job(db_path, image_dir, data_dir, seed_db_path, job_id, mode, a
 
     try:
         update_collection_job(db_path, job_id, status="running", stage="downloading_archive")
-        if mode == "google_drive":
+        if mode in {"google_drive", "huggingface"}:
             download_google_archive(
                 archive_path,
                 progress=download_progress,
@@ -409,16 +465,19 @@ def _run_archive_job(db_path, image_dir, data_dir, seed_db_path, job_id, mode, a
             control=lambda: control("extracting_archive"),
         )
         warning = (
-            f"이미지 {result['updated_rows']}장을 설치했지만 {result['skipped_rows']}장은 "
+            f"이미지 {result['installed'] + result['reused']}장을 설치했지만 {result['skipped_rows']}장은 "
             "현재 DB에 연결할 그림체가 없어 건너뛰었습니다. 데이터 폴더와 앱 버전을 확인해 주세요."
             if result["skipped_rows"] else ""
         )
+        missing = _missing_seed_images(db_path, image_dir, seed_db_path)
+        if missing:
+            warning += (" " if warning else "") + f"기본 그림체 이미지 {missing}장이 아직 없습니다. 앱 버전과 이미지팩을 확인해 주세요."
         update_collection_job(
             db_path, job_id, status="completed", stage="completed",
             scanned_posts=ARCHIVE_IMAGE_COUNT,
-            downloaded_images=result["updated_rows"], updated=result["installed"], error=warning,
+            downloaded_images=result["installed"] + result["reused"], updated=result["installed"], error=warning,
         )
-        if not result["skipped_rows"]:
+        if not warning:
             Path(archive_path).unlink(missing_ok=True)
     except ArcaCollectionStopped as exc:
         update_collection_job(db_path, job_id, status="stopped", stage="stopped", error=str(exc))
@@ -446,8 +505,9 @@ def _start_archive_job(db_path, image_dir, data_dir, seed_db_path, mode, archive
 
 
 def start_google_archive_job(db_path, image_dir, data_dir, seed_db_path):
+    # Keep the callable name for existing integrations; the provider is Hugging Face.
     archive_path = _archive_path(data_dir)
-    return _start_archive_job(db_path, image_dir, data_dir, seed_db_path, "google_drive", archive_path)
+    return _start_archive_job(db_path, image_dir, data_dir, seed_db_path, "huggingface", archive_path)
 
 
 def start_local_archive_job(db_path, image_dir, data_dir, seed_db_path, archive_path):
@@ -459,7 +519,7 @@ def resume_archive_job(db_path, image_dir, data_dir, seed_db_path, job):
         payload = json.loads(job.get("request_json") or "{}")
     except json.JSONDecodeError as exc:
         raise ArcaImageArchiveError("이전 ZIP 작업 정보를 읽지 못했습니다.") from exc
-    if payload.get("mode") == "google_drive":
+    if payload.get("mode") in {"google_drive", "huggingface"}:
         return start_google_archive_job(db_path, image_dir, data_dir, seed_db_path)
     if payload.get("mode") == "local_upload":
         archive_path = Path(payload.get("archive_path", "")).resolve()

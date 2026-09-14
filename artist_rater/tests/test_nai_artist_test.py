@@ -104,7 +104,7 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         first, state = claim_next_item(self.db_path, test["id"])
         self.assertEqual(state, "claimed")
         self.assertTrue(first["generation_requested_at"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(9, 'test.png')")
         complete_item(self.db_path, test["id"], first["id"], 9)
         second, second_state = claim_next_item(self.db_path, test["id"])
@@ -115,7 +115,7 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "batch", self.config, [{"artist_tag": "a"}], 2, 2)
         set_status(self.db_path, test["id"], "running")
         first, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.executemany("INSERT INTO generated_images(id, image_path) VALUES(?, ?)", [(9, "one.png"), (10, "two.png")])
         complete_item(self.db_path, test["id"], first["id"], 9)
         with self.assertRaisesRegex(RuntimeError, "모든 이미지 생성"):
@@ -142,10 +142,10 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "batch", self.config, [{"artist_tag": "a"}], 1, 2)
         set_status(self.db_path, test["id"], "running")
         item, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(9, 'test.png')")
         complete_item(self.db_path, test["id"], item["id"], 9)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("DELETE FROM generated_images WHERE id=9")
             remaining = conn.execute("SELECT generated_image_id FROM nai_artist_test_items WHERE id=?", (item["id"],)).fetchone()[0]
@@ -199,7 +199,7 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "history", self.config, [{"artist_tag": "a"}], 1, 2, prompt_variants=[{"prompt": "{{artist}}, sunset", "images_per_artist": 1}])
         set_status(self.db_path, test["id"], "running")
         item, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(9, 'history.png')")
         complete_item(self.db_path, test["id"], item["id"], 9)
         history = list_artist_history(self.db_path)
@@ -211,7 +211,7 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "append", self.config, [{"artist_tag": "a", "score": 4}, {"artist_tag": "b", "score": 3}], 1, 2)
         set_status(self.db_path, test["id"], "running")
         first, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(9, 'append.png')")
         complete_item(self.db_path, test["id"], first["id"], 9)
         set_status(self.db_path, test["id"], "cancelled")
@@ -231,7 +231,7 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         done = create_test(self.db_path, "done", self.config, [{"artist_tag": "a"}], 1, 2)
         set_status(self.db_path, done["id"], "running")
         item, _ = claim_next_item(self.db_path, done["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(10, 'done.png')")
         complete_item(self.db_path, done["id"], item["id"], 10)
         set_status(self.db_path, done["id"], "cancelled")
@@ -242,7 +242,7 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "completed append", self.config, [{"artist_tag": "a", "score": 4}], 1, 0)
         set_status(self.db_path, test["id"], "running")
         item, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(30, 'rated.png')")
         complete_item(self.db_path, test["id"], item["id"], 30)
         completed = save_item_rating(self.db_path, test["id"], item["id"], 5)
@@ -264,11 +264,11 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "evaluation append", self.config, [{"artist_tag": "a"}], 2, 0)
         set_status(self.db_path, test["id"], "running")
         first, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(31, 'first.png')")
         complete_item(self.db_path, test["id"], first["id"], 31)
         second, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(32, 'second.png')")
         complete_item(self.db_path, test["id"], second["id"], 32)
         evaluation_pending = get_test(self.db_path, test["id"])
@@ -285,11 +285,11 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "remaining append", self.config, [{"artist_tag": "done"}, {"artist_tag": "unfinished"}], 2, 0)
         set_status(self.db_path, test["id"], "running")
         first, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(33, 'done-one.png')")
         complete_item(self.db_path, test["id"], first["id"], 33)
         second, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(34, 'done-two.png')")
         complete_item(self.db_path, test["id"], second["id"], 34)
         set_status(self.db_path, test["id"], "paused")
@@ -303,14 +303,14 @@ class NaiArtistTestStoreTest(unittest.TestCase):
         test = create_test(self.db_path, "deletable", self.config, [{"artist_tag": "a"}], 1, 0)
         set_status(self.db_path, test["id"], "running")
         item, _ = claim_next_item(self.db_path, test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(41, 'keep.png')")
         complete_item(self.db_path, test["id"], item["id"], 41)
         completed = save_item_rating(self.db_path, test["id"], item["id"], 4)
         self.assertEqual(completed["status"], "completed")
         self.assertTrue(delete_test(self.db_path, test["id"]))
         self.assertIsNone(get_test(self.db_path, test["id"]))
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM generated_images WHERE id=41").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM nai_artist_tests WHERE id=?", (test["id"],)).fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM nai_artist_test_items WHERE test_id=?", (test["id"],)).fetchone()[0], 0)
@@ -370,7 +370,7 @@ class NaiArtistTestItemRatingApiTest(unittest.TestCase):
         self.test = create_test(self.db_path, "batch", {"base_prompt": "{{artist}}"}, [{"artist_tag": "a"}], 1, 0)
         set_status(self.db_path, self.test["id"], "running")
         item, _ = claim_next_item(self.db_path, self.test["id"])
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO generated_images(id, image_path) VALUES(9, 'test.png')")
         complete_item(self.db_path, self.test["id"], item["id"], 9)
         self.item_id = item["id"]
@@ -403,7 +403,7 @@ class NaiArtistTestItemRatingApiTest(unittest.TestCase):
         self.client.post(f"/api/nai-artist-tests/{self.test['id']}/items/{self.item_id}/rating", json={"score": 4})
         deleted = self.client.delete(f"/api/nai-artist-tests/{self.test['id']}")
         self.assertEqual(deleted.status_code, 200)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM generated_images WHERE id=9").fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM nai_artist_tests WHERE id=?", (self.test["id"],)).fetchone()[0], 0)
         missing = self.client.delete("/api/nai-artist-tests/99999")
