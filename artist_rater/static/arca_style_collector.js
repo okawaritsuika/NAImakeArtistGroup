@@ -3,6 +3,7 @@ const arcaState = {
   loginPollTimer: null, activeJobId: null, browserConnected: false,
   pendingCollectionPayload: null, loginImporting: false, browserSessionLoadPromise: null,
   imageRestoreEstimate: null,
+  statsRefreshModel: "v5", statsRefreshStarting: false,
   coverageTimer: null, statisticsLoaded: false, statisticsData: null, statisticsView: "artist",
   page: 1, totalPages: 1, totalItems: 0,
   statisticTables: {
@@ -13,6 +14,7 @@ const arcaState = {
 const arcaEl = (id) => typeof document === "undefined" ? null : document.getElementById(id);
 
 const ARCA_NOVELAI_MODEL_NAMES = Object.freeze({
+  "nai-diffusion-5-full-medium": "V5 Full Medium",
   "nai-diffusion-5-full": "V5 Full",
   "nai-diffusion-5-curated": "V5 Curated",
   "nai-diffusion-4-5-full": "V4.5 Full",
@@ -23,8 +25,11 @@ function normalizeArcaModel(value) {
   const raw = String(value || "").trim();
   const lowered = raw.toLowerCase();
   if (ARCA_NOVELAI_MODEL_NAMES[lowered]) return lowered;
+  if (/^novelai diffusion v5 (?:93f4bd30|70ab5786)$/.test(lowered)
+      || /^(?:novelai\s+diffusion\s+)?v5\s+full\s+medium$/.test(lowered)) return "nai-diffusion-5-full-medium";
   if (lowered === "v5") return "nai-diffusion-5-full";
   if (lowered === "v5 full") return "nai-diffusion-5-full";
+  if (lowered === "v5 full medium") return "nai-diffusion-5-full-medium";
   if (lowered === "v5 curated") return "nai-diffusion-5-curated";
   if (lowered === "v4.5") return "nai-diffusion-4-5-full";
   if (lowered === "v4.5 full") return "nai-diffusion-4-5-full";
@@ -94,11 +99,12 @@ function normalizeArcaPayload(value) {
     end_date: value.end_date || "",
     max_pages: Number(value.max_pages || 0),
     max_posts: Number(value.max_posts || 0),
+    ...(value.webp_compress === true ? { webp_compress: true } : {}),
   };
 }
 
-function normalizeArcaUrlPayload(value) {
-  return { source_url: String(value || "").trim() };
+function normalizeArcaUrlPayload(value, webpCompress = false) {
+  return { source_url: String(value || "").trim(), ...(webpCompress === true ? { webp_compress: true } : {}) };
 }
 
 function arcaListQuery(value = {}) {
@@ -323,6 +329,13 @@ function arcaBrowserSessionAction(status, hasPendingCollection = false) {
 }
 
 function arcaSummaryText(result) {
+  if (result.job_type === "stats_refresh") {
+    if (result.skipped_existing) return "선택한 모델에 해당하는 저장된 글이 없습니다.";
+    const updated = Number(result.updated || 0);
+    const unconfirmed = Math.max(0, Number(result.scanned_posts || 0) - updated);
+    const summary = `조회·추천 갱신 완료 · 갱신 ${updated}개 · 미확인 ${unconfirmed}개`;
+    return result.error ? `${summary}. ${result.error}` : summary;
+  }
   if (result.error) return String(result.error);
   if (result.job_type === "image_archive") {
     return `공유 그림체 이미지 ${result.downloaded_images || 0}장을 ZIP에서 설치했습니다.`;
@@ -419,6 +432,14 @@ function updateArcaImageDownloadDisclosure(estimate) {
 }
 
 function collectionCountsText(job) {
+  if (job?.job_type === "stats_refresh") {
+    if (job.status === "completed" && job.skipped_existing) return "갱신할 저장된 글 없음 · 새 요청 없음";
+    const posts = job.progress?.posts || [job.scanned_posts || 0, job.total_posts ?? null];
+    const pages = job.progress?.pages?.[0] ?? job.scanned_pages ?? 0;
+    const updated = Number(job.updated || 0);
+    const unconfirmed = Math.max(0, Number(posts[0] || 0) - updated);
+    return `목록 ${pages}페이지 · 게시글 ${posts[0] || 0}/${posts[1] == null ? "?" : posts[1]} · 갱신 ${updated}개 · 미확인 ${unconfirmed}개`;
+  }
   if (job?.status === "completed" && job?.skipped_existing) {
     return "이미 수집한 기간 · 새 요청 없음";
   }
@@ -499,6 +520,7 @@ function arcaPayload() {
     tabs: [arcaEl("arcaTabNai").checked && "NAI", arcaEl("arcaTabR18Nai").checked && "R18_NAI"].filter(Boolean),
     start_date: arcaEl("arcaStartDate").value,
     end_date: arcaEl("arcaEndDate").value,
+    webp_compress: arcaEl("arcaWebpCompress")?.checked,
   });
 }
 
@@ -556,7 +578,9 @@ function renderArcaCollectionProgress(job) {
     ? "이미지 복원 중"
     : job.job_type === "image_url_refresh" && job.status === "running"
       ? "최신 이미지 주소 확인 중"
-      : labels[job.status] || job.status;
+      : job.job_type === "stats_refresh" && job.status === "running"
+        ? job.stage === "refreshing_stats_posts" ? "남은 게시글 조회·추천 확인 중" : "검색 목록에서 조회·추천 갱신 중"
+        : labels[job.status] || job.status;
   arcaEl("arcaCollectionState").dataset.state = job.status;
   arcaEl("arcaCollectionCounts").textContent = collectionCountsText(job);
   arcaEl("arcaCollectionElapsed").textContent = `경과 ${durationText(job.elapsed_seconds)}`;
@@ -584,7 +608,7 @@ function renderArcaCollectionProgress(job) {
 
 function setArcaCollectionControlsDisabled(disabled) {
   if (disabled) arcaEl("arcaCollectionProgressPanel")?.setAttribute("open", "");
-  for (const id of ["collectArcaStyles", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "downloadArcaImageArchive", "chooseArcaImageArchive", "arcaImageArchiveFile", "arcaTabNai", "arcaTabR18Nai", "arcaKeyword", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
+  for (const id of ["collectArcaStyles", "refreshArcaStats", "restoreArcaImages", "confirmRestoreArcaImages", "cancelRestoreArcaImages", "downloadArcaImageArchive", "chooseArcaImageArchive", "arcaImageArchiveFile", "arcaTabNai", "arcaTabR18Nai", "arcaWebpCompress", "arcaKeyword", "arcaStartDate", "arcaEndDate", "collectArcaUrl", "arcaDirectUrl", "importArcaBrowserSession", "setupArcaSessionBridge", "refreshArcaBrowserSession"]) {
     const element = arcaEl(id);
     if (element) element.disabled = disabled;
   }
@@ -844,6 +868,11 @@ async function pollArcaCollectionJob(jobId) {
       if (job.status === "completed") {
         arcaSetStatus("arcaCollectorStatus", arcaSummaryText(job), job.error ? "error" : "success");
         await Promise.all([loadArcaStyles(), loadArcaSearchCoverage(), loadArcaStyleStatistics(), loadArcaImageRestoreEstimate()]);
+      } else if (job.job_type === "stats_refresh") {
+        await Promise.all([loadArcaStyles(), loadArcaStyleStatistics()]);
+      }
+      if (job.job_type === "stats_refresh" && document.activeElement === arcaEl("arcaCollectionProgressPanel")) {
+        arcaEl("refreshArcaStats")?.focus({ preventScroll: true });
       }
       return;
     }
@@ -1618,6 +1647,19 @@ async function loadArcaStyles() {
 }
 
 let arcaStatisticsRequest = 0;
+let arcaStatisticsTimer = null;
+
+function setArcaStatisticsPhase(phase, modelLabel) {
+  const loading = phase === "loading";
+  arcaEl("arcaStyleStatistics")?.setAttribute("aria-busy", String(loading));
+  arcaEl("arcaStatisticsContent")?.classList.toggle("hidden", phase !== "ready");
+  arcaEl("arcaStatisticsFeedback")?.classList.toggle("hidden", phase === "ready");
+  arcaEl("arcaStatisticsFeedback")?.classList.toggle("is-loading", loading);
+  arcaEl("retryArcaStatistics")?.classList.toggle("hidden", phase !== "error");
+  arcaEl("arcaStatisticsElapsed")?.classList.toggle("hidden", !loading);
+  const title = arcaEl("arcaStatisticsFeedbackTitle");
+  if (title) title.textContent = loading ? `${modelLabel} 통계 집계 중` : "통계를 불러오지 못했습니다";
+}
 
 function selectArcaStatisticsModel(model) {
   const filter = arcaEl("arcaStatisticsModelFilter");
@@ -1636,11 +1678,22 @@ function selectArcaStatisticsModel(model) {
 
 async function loadArcaStyleStatistics() {
   const request = ++arcaStatisticsRequest;
-  const root = arcaEl("arcaStyleStatistics");
+  clearInterval(arcaStatisticsTimer);
+  const model = arcaEl("arcaStatisticsModelFilter")?.value;
+  const modelLabel = model === "v5" ? "V5" : model === "v4.5" ? "V4.5" : "전체 모델";
   arcaState.statisticsLoaded = false;
-  renderArcaStyleStatistics({});
-  if (root) root.setAttribute("aria-busy", "true");
-  arcaSetStatus("arcaStyleStatisticsStatus", "통계를 불러오는 중…");
+  setArcaStatisticsPhase("loading", modelLabel);
+  const summary = arcaEl("arcaStyleStatisticsSummary");
+  if (summary) summary.textContent = `${modelLabel} · 선택한 추천수 조건으로 통계를 준비하고 있습니다.`;
+  const scope = arcaEl("arcaStatisticsScopeNote");
+  if (scope) scope.textContent = "";
+  arcaSetStatus("arcaStyleStatisticsStatus", "저장된 프롬프트에서 작가·퀄리티 태그와 가중치를 집계합니다. 데이터가 많으면 잠시 걸릴 수 있습니다.");
+  const started = Date.now();
+  const elapsed = arcaEl("arcaStatisticsElapsed");
+  if (elapsed) elapsed.textContent = "0초 경과";
+  arcaStatisticsTimer = setInterval(() => {
+    if (request === arcaStatisticsRequest && elapsed) elapsed.textContent = `${Math.floor((Date.now() - started) / 1000)}초 경과 · 응답을 기다리고 있습니다`;
+  }, 1000);
   try {
     const query = arcaStatisticsQuery({
       model: arcaEl("arcaStatisticsModelFilter")?.value,
@@ -1651,13 +1704,19 @@ async function loadArcaStyleStatistics() {
     if (request !== arcaStatisticsRequest) return;
     renderArcaStyleStatistics(result);
     arcaState.statisticsLoaded = true;
+    setArcaStatisticsPhase("ready", modelLabel);
     arcaSetStatus("arcaStyleStatisticsStatus", "");
   } catch (error) {
     if (request !== arcaStatisticsRequest) return;
     arcaState.statisticsLoaded = false;
+    setArcaStatisticsPhase("error", modelLabel);
+    if (summary) summary.textContent = `${modelLabel} · 집계에 실패했습니다. 다시 시도해 주세요.`;
     arcaSetStatus("arcaStyleStatisticsStatus", error.message, "error");
   } finally {
-    if (root && request === arcaStatisticsRequest) root.setAttribute("aria-busy", "false");
+    if (request === arcaStatisticsRequest) {
+      clearInterval(arcaStatisticsTimer);
+      arcaStatisticsTimer = null;
+    }
   }
 }
 
@@ -1671,6 +1730,93 @@ function applyArcaRecommendationPreset() {
 
 async function refreshArcaStyleData() {
   await loadArcaStyles();
+}
+
+function refreshArcaStats() {
+  if (isArcaCollectionBusy(arcaState) || arcaState.statsRefreshStarting) return;
+  const modal = arcaEl("arcaStatsRefreshModal");
+  const model = arcaEl("arcaStatsRefreshModel");
+  if (!modal || !model) return;
+  model.value = arcaState.statsRefreshModel;
+  arcaSetStatus("arcaStatsRefreshStatus", "");
+  modal.classList.remove("hidden");
+  model.focus();
+}
+
+function closeArcaStatsRefresh(restoreFocus = true) {
+  if (arcaState.statsRefreshStarting) return;
+  arcaEl("arcaStatsRefreshModal")?.classList.add("hidden");
+  if (restoreFocus) arcaEl("refreshArcaStats")?.focus({ preventScroll: true });
+}
+
+function setArcaStatsRefreshStarting(starting) {
+  arcaState.statsRefreshStarting = starting;
+  const modal = arcaEl("arcaStatsRefreshModal");
+  modal?.setAttribute("aria-busy", String(starting));
+  for (const id of ["closeArcaStatsRefresh", "arcaStatsRefreshModel", "cancelArcaStatsRefresh", "startArcaStatsRefresh"]) {
+    const element = arcaEl(id);
+    if (element) element.disabled = starting;
+  }
+  if (starting) modal?.focus();
+}
+
+function handleArcaStatsRefreshKeydown(event) {
+  const modal = arcaEl("arcaStatsRefreshModal");
+  if (!modal || modal.classList.contains("hidden")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeArcaStatsRefresh();
+  } else if (event.key === "Tab") {
+    const focusable = ["closeArcaStatsRefresh", "arcaStatsRefreshModel", "cancelArcaStatsRefresh", "startArcaStatsRefresh"]
+      .map(arcaEl).filter(element => element && !element.disabled);
+    const first = focusable[0], last = focusable[focusable.length - 1];
+    if (!first) {
+      event.preventDefault();
+      modal.focus();
+    } else if (document.activeElement === modal || !modal.contains(document.activeElement)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+}
+
+async function startArcaStatsRefresh() {
+  if (isArcaCollectionBusy(arcaState) || arcaState.statsRefreshStarting) return;
+  const modal = arcaEl("arcaStatsRefreshModal");
+  if (!modal || modal.classList.contains("hidden")) return;
+  arcaState.statsRefreshModel = arcaEl("arcaStatsRefreshModel")?.value || "v5";
+  arcaState.collecting = true;
+  setArcaCollectionControlsDisabled(true);
+  setArcaStatsRefreshStarting(true);
+  arcaSetStatus("arcaStatsRefreshStatus", "선택한 모델의 저장된 글을 확인하는 중…");
+  let result;
+  try {
+    result = await arcaFetch("/api/arca-styles/refresh-stats", {
+      method: "POST", body: JSON.stringify({ model: arcaState.statsRefreshModel }),
+    });
+  } catch (error) {
+    arcaState.collecting = false;
+    setArcaCollectionControlsDisabled(false);
+    setArcaStatsRefreshStarting(false);
+    arcaSetStatus("arcaStatsRefreshStatus", error.message, "error");
+    arcaEl("startArcaStatsRefresh")?.focus();
+    return;
+  }
+  setArcaStatsRefreshStarting(false);
+  closeArcaStatsRefresh(false);
+  arcaState.activeJobId = result.job_id;
+  arcaSetStatus("arcaCollectorStatus", "선택한 모델의 저장된 글을 수집 검색어 목록에서 먼저 확인하고, 남은 글만 개별 확인합니다.");
+  const panel = arcaEl("arcaCollectionProgressPanel");
+  panel?.setAttribute("tabindex", "-1");
+  panel?.focus({ preventScroll: true });
+  await pollArcaCollectionJob(result.job_id);
 }
 
 function loadArcaCollectorData() {
@@ -1735,7 +1881,7 @@ async function restoreArcaImages() {
 
 async function collectArcaUrl() {
   if (arcaState.collecting) return;
-  const payload = normalizeArcaUrlPayload(arcaEl("arcaDirectUrl")?.value);
+  const payload = normalizeArcaUrlPayload(arcaEl("arcaDirectUrl")?.value, arcaEl("arcaWebpCompress")?.checked);
   if (!payload.source_url) {
     arcaSetStatus("arcaCollectorStatus", "추가할 게시글 링크를 입력해 주세요.", "error");
     return;
@@ -1834,7 +1980,17 @@ function bindArcaCollector() {
   arcaEl("resumeArcaCollection")?.addEventListener("click", () => controlArcaCollection("resume"));
   arcaEl("stopArcaCollection")?.addEventListener("click", () => controlArcaCollection("stop"));
   arcaEl("refreshArcaStyles")?.addEventListener("click", refreshArcaStyleData);
+  arcaEl("refreshArcaStats")?.addEventListener("click", refreshArcaStats);
+  arcaEl("startArcaStatsRefresh")?.addEventListener("click", startArcaStatsRefresh);
+  arcaEl("closeArcaStatsRefresh")?.addEventListener("click", () => closeArcaStatsRefresh());
+  arcaEl("cancelArcaStatsRefresh")?.addEventListener("click", () => closeArcaStatsRefresh());
+  document.querySelectorAll("[data-close-arca-stats-refresh]").forEach(element => {
+    element.addEventListener("click", () => closeArcaStatsRefresh());
+  });
+  arcaEl("arcaStatsRefreshModel")?.addEventListener("change", event => { arcaState.statsRefreshModel = event.target.value; });
+  arcaEl("arcaStatsRefreshModal")?.addEventListener("keydown", handleArcaStatsRefreshKeydown);
   arcaEl("refreshArcaStatistics")?.addEventListener("click", loadArcaStyleStatistics);
+  arcaEl("retryArcaStatistics")?.addEventListener("click", loadArcaStyleStatistics);
   arcaEl("arcaRecommendationPreset")?.addEventListener("change", applyArcaRecommendationPreset);
   arcaEl("applyArcaRecommendationFilter")?.addEventListener("click", loadArcaStyleStatistics);
   arcaEl("arcaStatisticsModelFilter")?.addEventListener("change", () => {

@@ -1,0 +1,105 @@
+<section id="style-worldcup-tab" class="view worldcup-view" aria-labelledby="worldcupHeading">
+  <div id="worldcupHead" class="worldcup-head">
+    <div>
+      <h2 id="worldcupHeading" tabindex="-1">이상형 월드컵</h2>
+      <p class="worldcup-help">공유·확정 그림체 중 더 마음에 드는 그림을 골라 보세요. 매 경기와 최종 결과가 자동 저장됩니다.</p>
+    </div>
+    <button id="worldcupNew" class="primary" type="button">새로 만들기</button>
+  </div>
+  <p id="worldcupStatus" class="worldcup-status" role="status" aria-live="polite" aria-atomic="true"></p>
+
+  <div id="worldcupList" class="worldcup-list" aria-label="저장된 월드컵"><p class="worldcup-help">저장된 월드컵이 여기에 표시됩니다.</p></div>
+
+  <div id="worldcupDetail" hidden>
+    <div class="worldcup-detail-head">
+      <div><h3 id="worldcupTitle" tabindex="-1"></h3><p id="worldcupProgress" class="worldcup-help"></p></div>
+      <button id="worldcupBack" class="ghost" type="button">목록으로</button>
+    </div>
+    <div id="worldcupMatch" class="worldcup-match" aria-label="현재 대결"></div>
+    <div id="worldcupResult" class="worldcup-result" hidden></div>
+    <details id="worldcupHistory" class="worldcup-history" hidden><summary>대결 기록</summary><ol id="worldcupHistoryList"></ol></details>
+  </div>
+
+  <section id="worldcupPicker" class="worldcup-picker-page" aria-labelledby="worldcupPickerTitle" hidden>
+    <form id="worldcupForm" class="worldcup-create-form" novalidate>
+    <div class="worldcup-create-head">
+      <h3 id="worldcupPickerTitle" tabindex="-1">새 월드컵</h3>
+      <label class="worldcup-field worldcup-name-field" for="worldcupName"><span>이름</span><input id="worldcupName" maxlength="200" value="나의 그림체 월드컵" required></label>
+      <button id="worldcupStart" class="primary" type="submit" disabled>월드컵 시작 (0개)</button>
+      <button id="worldcupPickerClose" class="ghost" type="button">목록으로</button>
+    </div>
+    <div class="worldcup-selection-bar">
+      <div class="worldcup-selection-counts" role="status" aria-live="polite"><p id="worldcupCandidateCount" class="worldcup-count">후보 개수는 필터 적용 후 표시됩니다.</p><p id="worldcupPickerSelectionCount" class="worldcup-selected-badge">선택 0개 · 시작은 2개부터</p></div>
+      <div id="worldcupSizeSection" class="worldcup-auto-row">
+        <label class="worldcup-field worldcup-auto-size" for="worldcupSize"><select id="worldcupSize" aria-label="자동 선택 규모" aria-describedby="worldcupSizeHelp" disabled></select></label>
+        <button id="worldcupAutoSelect" type="button" disabled>자동 선택</button>
+        <details class="worldcup-auto-help"><summary>선택 안내</summary><p id="worldcupSizeHelp" class="worldcup-help"></p></details>
+      </div>
+    </div>
+    <p id="worldcupCreateStatus" class="worldcup-status" role="status" aria-live="polite"></p>
+    <div id="worldcupPickerBody" class="worldcup-picker-body">
+      <section id="worldcupPickerFilters" class="worldcup-picker-filters" aria-labelledby="worldcupPickerFilterTitle">
+        <h4 id="worldcupPickerFilterTitle">그림체 필터</h4>
+        <div class="worldcup-filter-grid">
+          <label class="worldcup-field" for="worldcupModel"><span>생성 모델</span><select id="worldcupModel"><option value="all">전체 모델</option><option value="v5">V5 전체</option><option value="nai-diffusion-5-full-medium">V5 Medium</option><option value="nai-diffusion-5-full">V5 Full</option><option value="nai-diffusion-5-curated">V5 Curated</option><option value="v4.5">V4.5 전체</option><option value="nai-diffusion-4-5-full">V4.5 Full</option><option value="nai-diffusion-4-5-curated">V4.5 Curated</option><option value="unknown">모델 미상</option></select></label>
+          <label id="worldcupRecommendationField" class="worldcup-field" for="worldcupRecommendation"><span>추천수 N 이하 제외</span><input id="worldcupRecommendation" type="number" min="0" step="1" inputmode="numeric" placeholder="제한 없음" aria-describedby="worldcupRecommendationHelp"></label>
+          <label class="field worldcup-field" for="worldcupIncludeTags"><span>포함할 태그</span><textarea id="worldcupIncludeTags" rows="1" placeholder="artist:작가명, 태그" autocomplete="off" aria-describedby="worldcupFilterHelp"></textarea><div id="worldcupIncludeTagsAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+          <label class="field worldcup-field" for="worldcupExcludeTags"><span>제외할 태그</span><textarea id="worldcupExcludeTags" rows="1" placeholder="artist:작가명, 태그" autocomplete="off" aria-describedby="worldcupFilterHelp worldcupFilterExample"></textarea><div id="worldcupExcludeTagsAutocomplete" class="autocomplete prompt-tag-autocomplete hidden"></div></label>
+          <button id="worldcupPickerFilterApply" type="button">필터 적용</button>
+          <details class="worldcup-filter-guide"><summary>조건 안내</summary><p class="worldcup-help" id="worldcupRecommendationHelp">공유에만 적용 · 추천수 미상 제외. 추천수는 입력한 수보다 높은 공유 그림체만 표시하며, 비워 두면 추천수 제한이 없습니다.</p><p class="worldcup-help" id="worldcupFilterHelp">작가도 artist:작가명 형식으로 일반 태그와 같은 칸에 입력하세요. 쉼표 또는 줄바꿈으로 구분하며, 두 글자 이상 입력하면 태그를 제안합니다. 포함 조건은 모두 만족해야 하며, 제외 조건은 하나라도 맞으면 해당 그림체 전체가 후보에서 빠집니다. 베이스 프롬프트의 완전한 태그만 검사하며 네거티브·캐릭터 프롬프트는 사용하지 않습니다.</p><p class="worldcup-help" id="worldcupFilterExample">예: 제외할 태그에 artist:artist_a, monochrome을 넣으면 해당 작가나 태그가 들어 있는 이미지는 참가하지 않습니다. 참가 후보를 거르는 조건이며 원본 프롬프트를 편집하지 않습니다. 필터를 바꿔도 선택한 그림체는 유지됩니다.</p></details>
+        </div>
+      </section>
+      <div class="worldcup-picker-toolbar">
+        <div class="worldcup-field worldcup-picker-source-field">
+          <span>표시할 출처</span>
+          <div id="worldcupPickerSources" class="worldcup-source-buttons" role="group" aria-label="표시할 출처">
+            <button id="worldcupPickerAllSource" type="button" aria-pressed="true">전체</button>
+            <button id="worldcupPickerSharedSource" type="button" aria-pressed="false">공유</button>
+            <button id="worldcupPickerConfirmedSource" type="button" aria-pressed="false">확정</button>
+          </div>
+        </div>
+        <label class="worldcup-field" for="worldcupPickerMode"><span>보기</span><select id="worldcupPickerMode"><option value="all">전체 후보</option><option value="selected">선택한 그림만</option></select></label>
+        <label class="worldcup-field" for="worldcupPickerSort"><span>정렬</span><select id="worldcupPickerSort"><option value="default">기본순</option><option value="recommendation_desc">추천 많은 순</option><option value="recommendation_asc">추천 적은 순</option></select></label>
+        <label class="worldcup-field worldcup-picker-size-field" for="worldcupPickerCardSize"><span>그림 크기 <output id="worldcupPickerCardSizeValue" for="worldcupPickerCardSize">160px</output></span><input id="worldcupPickerCardSize" type="range" min="112" max="240" step="16" value="160"></label>
+      </div>
+      <div class="worldcup-gallery-summary"><p id="worldcupPickerVisibleCount">필터 적용 전</p><p class="worldcup-help worldcup-drag-help" title="빈틈이나 카드에서 드래그하면 영역 안 그림체를 선택합니다. 선택된 카드에서 시작하면 해제합니다.">드래그로 영역 선택 · Esc 취소</p><p id="worldcupPickerModel" class="worldcup-picker-model">적용 모델 · 없음</p></div>
+      <p id="worldcupPickerStatus" class="worldcup-status" role="status" aria-live="polite" aria-atomic="true"></p>
+      <div id="worldcupGalleryLayout" class="worldcup-gallery-layout" data-detail-open="false">
+        <div class="worldcup-gallery-results">
+          <div id="worldcupPickerGrid" class="worldcup-picker-grid" aria-label="참가 그림체 갤러리"><div id="worldcupPickerMarquee" class="worldcup-picker-marquee" aria-hidden="true" hidden></div></div>
+          <div class="worldcup-picker-pages">
+            <button id="worldcupPickerPrev" type="button">이전</button>
+            <span id="worldcupPickerPage" aria-live="polite"></span>
+            <button id="worldcupPickerNext" type="button">다음</button>
+          </div>
+        </div>
+        <aside id="worldcupCandidateDetail" class="worldcup-candidate-detail" aria-labelledby="worldcupCandidateDetailTitle" hidden>
+          <div class="worldcup-candidate-head"><h3 id="worldcupCandidateDetailTitle" tabindex="-1">그림체 상세</h3><button id="worldcupCandidateDetailBack" class="ghost" type="button">상세 닫기</button></div>
+          <p id="worldcupCandidateDetailStatus" class="worldcup-help" role="status" aria-live="polite"></p>
+          <div id="worldcupCandidateDetailMetadata" class="worldcup-candidate-metadata"></div>
+          <div id="worldcupCandidateDetailContent" class="worldcup-candidate-content" hidden>
+            <div class="worldcup-candidate-toolbar">
+              <button id="worldcupCandidateDetailPrev" type="button" aria-label="이전 이미지" disabled>이전</button>
+              <p id="worldcupCandidateDetailImageModel" class="worldcup-help" aria-live="polite"></p>
+              <button id="worldcupCandidateDetailNext" type="button" aria-label="다음 이미지" disabled>다음</button>
+              <label class="worldcup-field worldcup-candidate-size-field" for="worldcupCandidateDetailSize"><span>이미지 크기 <output id="worldcupCandidateDetailSizeValue" for="worldcupCandidateDetailSize">100%</output></span><input id="worldcupCandidateDetailSize" type="range" min="40" max="100" step="10" value="100"></label>
+            </div>
+            <div id="worldcupCandidateDetailImage" class="worldcup-candidate-image"></div>
+            <div id="worldcupCandidateDetailThumbnails" class="worldcup-candidate-thumbnails" aria-label="전체 이미지"></div>
+            <div class="worldcup-candidate-prompts">
+              <details><summary>베이스 프롬프트</summary><pre id="worldcupCandidateDetailBase"></pre></details>
+              <details><summary>네거티브 프롬프트</summary><pre id="worldcupCandidateDetailNegative"></pre></details>
+              <details><summary>캐릭터 프롬프트</summary><pre id="worldcupCandidateDetailCharacters"></pre></details>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+    <p id="worldcupCreateStatusBottom" class="worldcup-status"></p>
+    <div class="worldcup-picker-bottom-actions">
+      <button id="worldcupStartBottom" class="primary" type="submit" disabled>월드컵 시작 (0개)</button>
+      <button id="worldcupPickerCloseBottom" class="ghost" type="button">목록으로</button>
+    </div>
+    </form>
+  </section>
+</section>

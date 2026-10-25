@@ -1,5 +1,8 @@
 const styleState = {
   artists: [],
+  promptArtistPreview: [],
+  displayedStyleResult: null,
+  combinationSource: "preview",
   allowedScores: new Set([1, 2, 3, 4, 5]),
   customRanges: [],
   ratedArtists: [],
@@ -127,6 +130,7 @@ const ARTIST_SOURCE_SECTION_LABELS = Object.freeze({
 const ARTIST_SOURCE_DEFAULT = Object.freeze({ source_type: "rating_management", source_id: "all" });
 
 const NOVELAI_MODEL_DEFINITIONS = Object.freeze({
+  "nai-diffusion-5-full-medium": Object.freeze({ id: "nai-diffusion-5-full-medium", generation: "V5", family: "V5", displayName: "V5 Full Medium", isV5: true, maxCharacterPrompts: 22, supportsComplexity: true }),
   "nai-diffusion-5-full": Object.freeze({ id: "nai-diffusion-5-full", generation: "V5", family: "V5", displayName: "V5 Full", isV5: true, maxCharacterPrompts: 22, supportsComplexity: true }),
   "nai-diffusion-5-curated": Object.freeze({ id: "nai-diffusion-5-curated", generation: "V5", family: "V5", displayName: "V5 Curated", isV5: true, maxCharacterPrompts: 22, supportsComplexity: true }),
   "nai-diffusion-4-5-full": Object.freeze({ id: "nai-diffusion-4-5-full", generation: "V4.5", family: "V4.5", displayName: "V4.5 Full", isV5: false, maxCharacterPrompts: 6, supportsComplexity: false }),
@@ -143,6 +147,8 @@ const NOVELAI_MODEL_ALIASES = Object.freeze({
 function explicitNovelAiModelAlias(value) {
   const raw = String(value ?? "").trim();
   const lowered = raw.toLowerCase();
+  if (/^novelai diffusion v5 (?:93f4bd30|70ab5786)$/.test(lowered)
+      || /^(?:novelai\s+diffusion\s+)?v5\s+full\s+medium$/.test(lowered)) return "nai-diffusion-5-full-medium";
   const family = lowered.match(/^(?:novelai\s+diffusion\s+)?v(5|4\.5)(?=$|[\s:_-])/i)?.[1];
   if (!family) return "";
   const variants = [...lowered.matchAll(/(?:^|[\s:_-])(full|curated)(?=$|[\s:_-])/gi)].map((match) => match[1].toLowerCase());
@@ -215,6 +221,55 @@ function normalizeNovelAiComplexity(value, model = "") {
   return definition.supportsComplexity && ["low", "medium", "high", "ultra"].includes(complexity) ? complexity : "";
 }
 
+function isNovelAiMediumModel(model) {
+  return normalizeNovelAiModel(model, "") === "nai-diffusion-5-full-medium";
+}
+
+// Fixed values also apply when settings arrive from a saved style or history.
+function normalizeMediumGenerationSettings(settings) {
+  if (!isNovelAiMediumModel(settings.model)) return { ...settings };
+  return { ...settings, steps: 14, sampler: "k_euler_ancestral", noise_schedule: "karras",
+    cfg_rescale: 0, variety_plus: false, uc_preset: 2, negative_prompt: "" };
+}
+
+function syncMediumControls(model, controls, hintId) {
+  const medium = isNovelAiMediumModel(model);
+  Object.entries(controls).forEach(([id, fixedValue]) => {
+    const element = styleElement(id);
+    if (!element) return;
+    const property = element.type === "checkbox" ? "checked" : "value";
+    if (medium) {
+      if (!element.mediumBackup) element.mediumBackup = { value: element[property], disabled: element.disabled, restoreValue: fixedValue !== null };
+      if (fixedValue !== null) element[property] = fixedValue;
+      element.disabled = true;
+    } else if (element.mediumBackup) {
+      if (element.mediumBackup.restoreValue) element[property] = element.mediumBackup.value;
+      element.disabled = element.mediumBackup.disabled;
+      delete element.mediumBackup;
+    }
+  });
+  styleElement(hintId)?.classList.toggle("hidden", !medium);
+  return medium;
+}
+
+const MEDIUM_GENERATION_CONTROLS = Object.freeze({
+  generationSteps: 14, generationSampler: "k_euler_ancestral", generationScheduler: "karras",
+  generationCfgRescale: 0, generationCfgRescaleRange: 0, generationVarietyPlus: false,
+  negativePrompt: null,
+});
+
+function syncGenerationMediumControls(model = currentGenerationModel()) {
+  const medium = syncMediumControls(model, MEDIUM_GENERATION_CONTROLS, "generationMediumHint");
+  if (typeof document !== "undefined") {
+    document.querySelectorAll('[data-random-target="negative"]').forEach((button) => { button.disabled = medium; });
+    document.querySelectorAll("#negativePromptTokens button").forEach((button) => {
+      button.disabled = medium;
+      button.draggable = !medium;
+    });
+  }
+  return medium;
+}
+
 function novelAiModelFilterMatches(itemModel, filter) {
   const value = String(filter || "all").toLowerCase();
   if (value === "all") return true;
@@ -282,6 +337,7 @@ if (typeof globalThis !== "undefined") {
   globalThis.novelAiModelBadgeLabel = novelAiModelBadgeLabel;
   globalThis.novelAiModelBadgeClass = novelAiModelBadgeClass;
   globalThis.normalizeNovelAiModel = normalizeNovelAiModel;
+  globalThis.novelAiMedium = { normalize: normalizeMediumGenerationSettings, syncControls: syncMediumControls };
 }
 
 function normalizeSharedDependencyArtistPolicy(value) {
@@ -293,6 +349,7 @@ const STYLE_REQUEST_CONTROL_IDS = [
   "rerollStyleWeights",
   "rerollStyleAll",
   "styleArtistCount",
+  "styleFixedArtistsOnly",
   "sharedStyleArtistMin",
   "sharedStyleArtistMax",
   "sharedDependencyFixedRatio",
@@ -998,22 +1055,22 @@ function parseStyleArtistEntries(text) {
   const names = [];
   const seen = new Set();
   const source = String(text || "");
-  const weightedBlocks = [...source.matchAll(/(\d+(?:\.\d+)?)\s*::\s*artist:\s*(.*?)::/gis)];
-  const values = weightedBlocks.length
-    ? weightedBlocks.flatMap((match) => String(match[2] || "")
-      .split(/[,\n;]+/)
-      .map((artist) => ({ artist: artist.trim(), weight: Number(match[1]) })))
-    : source
-      .split(/[,\n;]+/)
-      .map((item) => item.trim())
-      .filter(Boolean)
-      .map((value) => {
-        const match = value.match(/^(?:(\d+(?:\.\d+)?)\s*::\s*)?(?:artist:\s*)?(.+?)(?:::)?$/i);
-        return {
-          artist: (match?.[2] || "").trim(),
-          weight: match?.[1] === undefined ? undefined : Number(match[1]),
-        };
-      });
+  // A new weight also ends an unclosed block; numeric artist endings are not openers.
+  const weightedBlocks = [...source.matchAll(/(?:^|[,;\n]\s*|(?<=::)\s*)(\d+(?:\.\d+)?)\s*::\s*((?:(?!::|[,;\n]\s*\d+(?:\.\d+)?\s*::).)*)(?:::|(?=[,;\n]\s*\d+(?:\.\d+)?\s*::)|$)/gis)];
+  const values = [];
+  const appendNames = (text, weight) => {
+    String(text).split(/[,\n;]+/).forEach((value) => {
+      const artist = value.trim().replace(/^artist:\s*/i, "").trim();
+      if (artist && !artist.includes("::")) values.push({ artist, weight });
+    });
+  };
+  let offset = 0;
+  weightedBlocks.forEach((match) => {
+    appendNames(source.slice(offset, match.index));
+    appendNames(match[2], Number(match[1]));
+    offset = match.index + match[0].length;
+  });
+  appendNames(source.slice(offset));
   values.forEach(({ artist, weight }) => {
     if (!artist || seen.has(artist)) return;
     names.push(Number.isFinite(weight) && weight > 0 ? { artist, weight } : { artist });
@@ -1166,8 +1223,13 @@ function fixedStyleArtistEntries(artists) {
     .filter((entry) => entry.artist.fixed === true);
 }
 
-function limitArtistsToTotalCount(artists, totalCount) {
+function fixedArtistsOnlyEnabled() {
+  return Boolean(styleElement("styleFixedArtistsOnly")?.checked);
+}
+
+function limitArtistsToTotalCount(artists, totalCount, fixedOnly = false) {
   const source = Array.isArray(artists) ? artists : [];
+  if (fixedOnly) return source.filter((item) => item.fixed === true);
   const count = Math.max(1, Math.trunc(Number(totalCount)));
   const fixedCount = source.filter((item) => item.fixed === true).length;
   if (fixedCount > count) {
@@ -1196,7 +1258,19 @@ function fixedArtistSlotEntries(artists) {
 }
 
 function chooseArtistsForPrompt(artists, randomFn = Math.random, options = {}) {
-  const source = Array.isArray(artists) ? artists : [];
+  let source = Array.isArray(artists) ? artists : [];
+  const fixedOnly = options.fixedOnly ?? fixedArtistsOnlyEnabled();
+  if (fixedOnly) {
+    const requestedCount = options.count ?? styleNumber("styleArtistCount", 12);
+    const candidates = source.filter((item) => item.fixed === true);
+    const count = Number.isInteger(requestedCount) && requestedCount > 0 ? Math.min(requestedCount, candidates.length) : 0;
+    const indexes = candidates.map((_, index) => index);
+    for (let index = 0; index < count; index += 1) {
+      const target = index + Math.min(indexes.length - index - 1, Math.max(0, Math.floor(randomFn() * (indexes.length - index))));
+      [indexes[index], indexes[target]] = [indexes[target], indexes[index]];
+    }
+    source = indexes.slice(0, count).sort((a, b) => a - b).map((index) => candidates[index]);
+  }
   const fixedBySlot = new Map();
   fixedArtistSlotEntries(source).forEach((entry) => {
     if (entry.slot === 0) return;
@@ -1205,7 +1279,7 @@ function chooseArtistsForPrompt(artists, randomFn = Math.random, options = {}) {
   });
   const usedSlots = new Set();
   const selected = source.flatMap((item, index) => {
-    if (item.fixed !== true) return [{ ...item }];
+    if (fixedOnly || item.fixed !== true) return [{ ...item }];
     const slot = normalizeFixedArtistSlot(item, index + 1);
     if (slot === 0) return [{ ...item }];
     if (usedSlots.has(slot)) return [];
@@ -1464,6 +1538,7 @@ function formatPromptAutocompleteTag(item, prefixArtist = true) {
 }
 
 function readGenerationSettings() {
+  const draftValue = (id) => styleElement(id)?.mediumBackup?.value ?? styleElement(id)?.value;
   return {
     model: normalizeNovelAiModel(styleElement("generationModel")?.value),
     complexity: normalizeNovelAiComplexity(styleElement("generationComplexity")?.value, styleElement("generationModel")?.value),
@@ -1471,18 +1546,20 @@ function readGenerationSettings() {
     resolution_preset: styleElement("generationResolutionPreset")?.value || "832x1216",
     width: Number(styleElement("generationWidth")?.value || 832),
     height: Number(styleElement("generationHeight")?.value || 1216),
-    sampler: styleElement("generationSampler")?.value || "k_euler_ancestral",
-    scheduler: styleElement("generationScheduler")?.value || "karras",
-    steps: Number(styleElement("generationSteps")?.value || 28),
+    sampler: draftValue("generationSampler") || "k_euler_ancestral",
+    scheduler: draftValue("generationScheduler") || "karras",
+    steps: Number(draftValue("generationSteps") || 28),
     scale: Number(styleElement("generationScale")?.value || 5),
-    cfg_rescale: Number(styleElement("generationCfgRescale")?.value || 0),
-    variety_plus: Boolean(styleElement("generationVarietyPlus")?.checked),
+    cfg_rescale: Number(draftValue("generationCfgRescale") || 0),
+    variety_plus: Boolean(styleElement("generationVarietyPlus")?.mediumBackup?.value ?? styleElement("generationVarietyPlus")?.checked),
     seed: styleElement("generationSeed")?.value || "",
     seed_fixed: Boolean(styleElement("generationSeedFixed")?.checked),
     limit_mode: styleElement("generationLimitMode")?.value || "count",
     generation_count: Number(styleElement("generationCount")?.value || 10),
-    shared_artist_min: Number(styleElement("sharedStyleArtistMin")?.value || 0),
-    shared_artist_max: Number(styleElement("sharedStyleArtistMax")?.value || 0),
+    shared_artist_min: Number((sharedRangeBeforeRules?.[0] ?? styleElement("sharedStyleArtistMin")?.value) || 0),
+    fixed_artists_only: fixedArtistsOnlyEnabled(),
+    artist_count: Number(styleElement("styleArtistCount")?.value || 12),
+    shared_artist_max: Number((sharedRangeBeforeRules?.[1] ?? styleElement("sharedStyleArtistMax")?.value) || 0),
     shared_dependency_source_ratios: {
       fixed: Number(styleElement("sharedDependencyFixedRatio")?.value || 0),
       reference: Number(styleElement("sharedDependencyReferenceRatio")?.value || 100),
@@ -1500,6 +1577,7 @@ function readGenerationSettings() {
 }
 
 function applyGenerationSettings(settings = {}) {
+  syncGenerationMediumControls("");
   const setValue = (id, value) => {
     const element = styleElement(id);
     if (element && value !== undefined && value !== null) element.value = String(value);
@@ -1521,6 +1599,9 @@ function applyGenerationSettings(settings = {}) {
   setValue("generationSeed", settings.seed);
   setValue("generationLimitMode", settings.limit_mode);
   setValue("generationCount", settings.generation_count);
+  setValue("styleArtistCount", settings.artist_count);
+  const fixedOnly = styleElement("styleFixedArtistsOnly");
+  if (fixedOnly) fixedOnly.checked = settings.fixed_artists_only === true;
   setValue("sharedStyleArtistMin", settings.shared_artist_min ?? 0);
   setValue("sharedStyleArtistMax", settings.shared_artist_max);
   setValue("weightMode", settings.weight_mode);
@@ -1559,6 +1640,7 @@ function applyGenerationSettings(settings = {}) {
   if (count) count.disabled = styleElement("generationLimitMode")?.value === "unlimited";
   styleElement("customRangeSection")?.classList.toggle("hidden", styleElement("weightMode")?.value !== "custom");
   syncSharedDependencyControls();
+  syncGenerationMediumControls();
 }
 
 function addPromptGroupItem(group, item) {
@@ -1669,6 +1751,8 @@ function normalizePromptPresetModelFilter(value) {
     "v4.5": "v4.5",
     "v5-full": "nai-diffusion-5-full",
     "v5 full": "nai-diffusion-5-full",
+    "v5-full-medium": "nai-diffusion-5-full-medium",
+    "v5 full medium": "nai-diffusion-5-full-medium",
     "v5-curated": "nai-diffusion-5-curated",
     "v5 curated": "nai-diffusion-5-curated",
     "v4.5-full": "nai-diffusion-4-5-full",
@@ -1682,6 +1766,7 @@ function normalizePromptPresetModelFilter(value) {
     "all",
     "v5",
     "v4.5",
+    "nai-diffusion-5-full-medium",
     "nai-diffusion-5-full",
     "nai-diffusion-5-curated",
     "nai-diffusion-4-5-full",
@@ -1708,29 +1793,44 @@ function renderExcludedPromptTags() {
   const list = styleElement("excludedPromptTagList");
   if (!container || !list) return;
   const tags = Array.isArray(styleState.excludedPromptTags) ? styleState.excludedPromptTags : [];
-  container.classList.toggle("hidden", tags.length === 0);
+  const focusedIndex = document.activeElement?.dataset?.excludedIndex;
+  const count = styleElement("excludedPromptCount");
+  if (count) count.textContent = String(tags.length);
+  const restoreAll = styleElement("restoreAllExcludedPrompts");
+  if (restoreAll) restoreAll.disabled = tags.length === 0;
+  styleElement("excludedPromptTab")?.setAttribute("aria-label", `제외한 퀄리티 태그 ${tags.length}개`);
   list.replaceChildren(...tags.map((item, index) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "excluded-prompt-tag";
+    button.dataset.excludedIndex = String(index);
     button.textContent = `↩ ${item.prompt || item.tag}`;
     button.title = "기본 프롬프트에 다시 넣기";
     button.addEventListener("click", () => restoreExcludedPromptTag(index));
     return button;
   }));
+  if (!tags.length) list.textContent = "제외한 태그가 없습니다. 퀄리티 토큰을 누르면 여기로 이동합니다.";
+  if (focusedIndex !== undefined) {
+    (list.children[Math.min(Number(focusedIndex), tags.length - 1)] || styleElement("basePromptTab"))?.focus();
+  }
 }
 
 function restoreExcludedPromptTag(index) {
-  const item = styleState.excludedPromptTags[index];
-  const prompt = String(item?.prompt || "").trim();
-  if (!prompt) return false;
+  return restoreExcludedPromptTags([index]);
+}
+
+function restoreExcludedPromptTags(indexes) {
   const input = styleElement("basePrompt");
-  input.value = appendUniquePromptToken(input?.value, prompt);
-  styleState.excludedPromptTags.splice(index, 1);
+  if (!input) return false;
+  const selected = new Set(indexes);
+  const restored = styleState.excludedPromptTags.filter((item, index) => selected.has(index) && String(item?.prompt || item?.tag || "").trim());
+  if (!restored.length) return false;
+  restored.forEach((item) => { input.value = appendUniquePromptToken(input.value, item.prompt || item.tag); });
+  styleState.excludedPromptTags = styleState.excludedPromptTags.filter((item) => !restored.includes(item));
   fixPromptPresetAfterManualEdit();
   persistAndRenderPromptControls();
   renderExcludedPromptTags();
-  setPromptPresetStatus(`제외했던 ${item.tag || prompt} 태그를 복원했습니다. 랜덤 대상이 꺼져 있으면 그대로 유지됩니다.`, "ok");
+  setPromptPresetStatus(`제외했던 태그 ${restored.length}개를 복구했습니다. 랜덤 대상이 꺼져 있으면 그대로 유지됩니다.`, "ok");
   return true;
 }
 
@@ -1757,7 +1857,7 @@ function renderPromptPresetOptions() {
   const button = styleElement("openPromptPresetModal");
   const text = styleElement("promptPresetButtonText");
   if (!styleState.promptPresets.length) {
-    if (text) text.textContent = "사용 가능한 수집 세트가 없습니다.";
+    if (text) text.textContent = "수집 세트 없음";
     if (button) button.disabled = true;
     return;
   }
@@ -1766,7 +1866,7 @@ function renderPromptPresetOptions() {
   const selected = styleState.promptPresets.find((preset) => preset.key === styleState.selectedPromptPresetKey);
   if (text) {
     const modified = selected?.modified ? " · 수정됨" : "";
-    text.textContent = `수집 프롬프트 갤러리 열기 · ${styleState.promptPresets.length}개${modified}`;
+    text.textContent = `수집 세트 · ${styleState.promptPresets.length}개${modified}`;
   }
   if (button) button.disabled = false;
 }
@@ -1996,6 +2096,10 @@ function renderPromptTokens(surface, text, field, characterId = "") {
     chip.type = "button";
     chip.className = `prompt-token-chip ${field}${isPromptItemDisabled(item) ? " disabled-by-group" : ""}`;
     chip.draggable = field !== "artist";
+    if (field === "negative" && isNovelAiMediumModel(currentGenerationModel())) {
+      chip.disabled = true;
+      chip.draggable = false;
+    }
     chip.textContent = token;
     if (field === "base") {
       chip.title = "클릭해서 제외 목록으로 이동";
@@ -2015,6 +2119,8 @@ function renderPromptTokens(surface, text, field, characterId = "") {
 function renderAllPromptTokens() {
   renderPromptTokens(styleElement("basePromptTokens"), styleElement("basePrompt")?.value, "base");
   renderPromptTokens(styleElement("negativePromptTokens"), styleElement("negativePrompt")?.value, "negative");
+  renderPromptTokens(styleElement("groupBasePromptTokens"), styleElement("basePrompt")?.value, "base");
+  renderPromptTokens(styleElement("groupNegativePromptTokens"), styleElement("negativePrompt")?.value, "negative");
   document.querySelectorAll("#characterPromptList .character-prompt-row").forEach((row) => {
     renderPromptTokens(
       row.querySelector(".prompt-token-surface"),
@@ -2032,7 +2138,7 @@ function persistAndRenderPromptControls() {
 }
 
 function selectPromptTab(tabName) {
-  const selected = tabName === "negative" ? "negative" : "base";
+  const selected = ["negative", "excluded"].includes(tabName) ? tabName : "base";
   hidePromptTagAutocomplete();
   document.querySelectorAll("[data-prompt-tab]").forEach((button) => {
     const active = button.dataset.promptTab === selected;
@@ -2042,6 +2148,13 @@ function selectPromptTab(tabName) {
   });
   styleElement("basePromptPanel")?.classList.toggle("hidden", selected !== "base");
   styleElement("negativePromptPanel")?.classList.toggle("hidden", selected !== "negative");
+  styleElement("excludedPromptPanel")?.classList.toggle("hidden", selected !== "excluded");
+  const viewToggle = styleElement("togglePromptView");
+  if (viewToggle) {
+    viewToggle.disabled = selected === "excluded";
+    viewToggle.classList.toggle("hidden", selected === "excluded");
+  }
+  styleElement("restoreAllExcludedPrompts")?.classList.toggle("hidden", selected !== "excluded");
 }
 
 function setPromptViewMode(mode) {
@@ -2089,6 +2202,7 @@ function renderPromptGroups() {
   styleState.promptGroups.forEach((group) => {
     const wrapper = document.createElement("section");
     wrapper.className = `prompt-control-group${group.enabled ? "" : " off"}${group.expanded ? " expanded" : ""}`;
+    wrapper.dataset.groupId = group.id;
 
     const header = document.createElement("div");
     header.className = "prompt-control-group-header";
@@ -2097,7 +2211,7 @@ function renderPromptGroups() {
     name.textContent = group.name;
     const rename = document.createElement("button");
     rename.type = "button";
-    rename.className = "icon-button small";
+    rename.className = "icon-button small prompt-group-rename";
     rename.title = "그룹 이름 변경";
     rename.textContent = "✎";
     rename.addEventListener("click", async () => {
@@ -2109,9 +2223,10 @@ function renderPromptGroups() {
         confirmLabel: "변경",
         tone: "info",
       });
-      if (!next?.trim()) return;
+      if (!next?.trim()) { rename.focus(); return; }
       group.name = next.trim();
       persistAndRenderPromptControls();
+      [...list.querySelectorAll(".prompt-control-group")].find((item) => item.dataset.groupId === group.id)?.querySelector(".prompt-group-rename")?.focus();
     });
     const toggle = document.createElement("button");
     toggle.type = "button";
@@ -2392,7 +2507,10 @@ function renderRatingTagExclusionRows() {
   });
 }
 
+let sharedRangeBeforeRules = null;
+
 function openRatingTagRulesModal() {
+  sharedRangeBeforeRules = ["sharedStyleArtistMin", "sharedStyleArtistMax"].map((id) => styleElement(id)?.value);
   styleState.ratingTagRuleDraft = styleState.ratingTagRules.length
     ? styleState.ratingTagRules.map((rule) => ({ ...rule }))
     : [{ tag: "", count: 1 }];
@@ -2402,13 +2520,22 @@ function openRatingTagRulesModal() {
   renderRatingTagRuleRows();
   renderRatingTagExclusionRows();
   styleElement("ratingTagRulesModal")?.classList.remove("hidden");
+  styleElement("closeRatingTagRules")?.focus();
 }
 
 function closeRatingTagRulesModal() {
+  if (sharedRangeBeforeRules) {
+    ["sharedStyleArtistMin", "sharedStyleArtistMax"].forEach((id, index) => {
+      if (styleElement(id)) styleElement(id).value = sharedRangeBeforeRules[index];
+    });
+    sharedRangeBeforeRules = null;
+    savePromptDraft();
+  }
   hidePromptTagAutocomplete();
   styleElement("ratingTagRulesModal")?.classList.add("hidden");
   styleState.ratingTagRuleDraft = [];
   styleState.ratingExcludeTagDraft = [];
+  styleElement("openRatingTagRules")?.focus();
 }
 
 function addRatingTagRule() {
@@ -2427,12 +2554,16 @@ function saveRatingTagRules() {
     const rules = validateRatingTagRules(styleState.ratingTagRuleDraft);
     const exclusions = validateRatingExcludeTags(styleState.ratingExcludeTagDraft);
     const counts = ratingTagComposition(rules);
+    if (!Number.isInteger(counts.sharedMin) || !Number.isInteger(counts.sharedMax) || counts.sharedMin < 0 || counts.sharedMax > 50 || counts.sharedMin > counts.sharedMax) {
+      throw new Error("공유 작가 범위는 0~50명이며 최소가 최대보다 클 수 없습니다.");
+    }
     if (styleElement("weightMode")?.value !== "shared_dependency" && counts.fixed + counts.tagged + counts.sharedMin > counts.total) {
       throw new Error("고정 작가, 태그 지정 인원, 공유 작가 최소 인원의 합이 전체 작가 수를 넘습니다.");
     }
     styleState.ratingTagRules = rules;
     styleState.ratingExcludeTags = exclusions;
     renderRatingTagRulesSummary();
+    sharedRangeBeforeRules = null;
     savePromptDraft();
     closeRatingTagRulesModal();
   } catch (error) {
@@ -2682,6 +2813,7 @@ function openSharedDependencyReferenceModal() {
 
 function closeSharedDependencyReferenceModal() {
   styleElement("sharedDependencyReferenceModal")?.classList.add("hidden");
+  styleElement("openSharedDependencyReference")?.focus?.();
 }
 
 function setSharedDependencyReferenceFromArca(image, item = {}) {
@@ -2709,11 +2841,17 @@ function setSharedDependencyReferenceFromArca(image, item = {}) {
 if (typeof globalThis !== "undefined") globalThis.setSharedDependencyReferenceFromArca = setSharedDependencyReferenceFromArca;
 
 function syncSharedDependencyControls() {
-  const active = styleElement("weightMode")?.value === "shared_dependency";
-  const state = sharedDependencyControlsState(styleElement("weightMode")?.value);
+  const fixedOnly = fixedArtistsOnlyEnabled();
+  const active = !fixedOnly && styleElement("weightMode")?.value === "shared_dependency";
+  const state = sharedDependencyControlsState(active ? "shared_dependency" : "balanced");
   styleElement("sharedDependencySettings")?.classList.toggle("hidden", !active);
+  styleElement("openWeightGraph")?.classList.toggle("hidden", active);
   const count = styleElement("styleArtistCount");
   if (count) count.disabled = state.countDisabled || styleState.pending;
+  ["styleArtistCountDown", "styleArtistCountUp"].forEach((id) => {
+    const button = styleElement(id);
+    if (button) button.disabled = state.countDisabled || styleState.pending;
+  });
   const countStatus = styleElement("sharedDependencyCountStatus");
   if (countStatus) {
     countStatus.classList.toggle("hidden", !active);
@@ -2723,7 +2861,7 @@ function syncSharedDependencyControls() {
   renderSharedDependencyReferenceSummary();
   ["sharedStyleArtistMin", "sharedStyleArtistMax"].forEach((id) => {
     const input = styleElement(id);
-    if (input) input.disabled = active || styleState.pending;
+    if (input) input.disabled = active || fixedOnly || styleState.pending;
   });
   return active;
 }
@@ -2733,11 +2871,17 @@ function readStyleOptions() {
   const count = Number(styleElement("styleArtistCount")?.value);
   const minWeight = Number(styleElement("styleMinWeight")?.value);
   const maxWeight = Number(styleElement("styleMaxWeight")?.value);
-  const sharedArtistMin = Number(styleElement("sharedStyleArtistMin")?.value || 0);
-  const sharedArtistMax = Number(styleElement("sharedStyleArtistMax")?.value || 0);
+  const sharedArtistMin = Number((sharedRangeBeforeRules?.[0] ?? styleElement("sharedStyleArtistMin")?.value) || 0);
+  const sharedArtistMax = Number((sharedRangeBeforeRules?.[1] ?? styleElement("sharedStyleArtistMax")?.value) || 0);
   if (mode !== "shared_dependency" && (!Number.isInteger(count) || count < 1)) throw new Error("작가 수는 1 이상의 정수여야 합니다.");
   if (![minWeight, maxWeight].every(Number.isFinite) || minWeight <= 0 || minWeight > maxWeight) {
     throw new Error("전체 가중치 범위를 확인하세요.");
+  }
+  if (fixedArtistsOnlyEnabled()) {
+    const candidates = fixedStyleArtistEntries(styleState.artists).length;
+    if (!Number.isInteger(count) || count < 1) throw new Error("작가 수는 1 이상의 정수여야 합니다.");
+    if (candidates < count) throw new Error(`고정 작가 후보가 ${candidates}명입니다. 작가 수 ${count}명 이상 추가하세요.`);
+    return { count, min_weight: minWeight, max_weight: maxWeight, weight_mode: mode };
   }
   if (
     !Number.isInteger(sharedArtistMin)
@@ -2803,6 +2947,15 @@ async function loadStyleArtists(reroll = "all") {
   let payload;
   try {
     showStyleStatus("그림체를 구성하는 중입니다...");
+    if (fixedArtistsOnlyEnabled()) {
+      readStyleOptions();
+      styleState.requestToken += 1;
+      styleState.pending = false;
+      renderWeightGraph();
+      updateArtistPrompt();
+      showStyleStatus(`고정 후보 ${fixedStyleArtistEntries(styleState.artists).length}명 중 ${styleNumber("styleArtistCount", 12)}명을 선택합니다.`, "ok");
+      return true;
+    }
     payload = buildStyleRequestPayload(readStyleOptions(), styleState.artists, reroll);
     payload = applySharedDependencyReference(
       payload,
@@ -2861,10 +3014,14 @@ function updateArtistPrompt() {
   const promptOptions = styleElement("weightMode")?.value === "profile"
     ? { profile: styleState.weightProfile }
     : {};
-  const prompt = chooseArtistsForPrompt(styleState.artists, Math.random, promptOptions)
+  styleState.promptArtistPreview = chooseArtistsForPrompt(styleState.artists, Math.random, promptOptions);
+  const prompt = styleState.promptArtistPreview
     .map((item) => `${formatStyleWeight(item.weight)}::artist:${formatArtistPromptTag(item.artist)}::`)
     .join(", ");
-  return renderArtistPromptPreview(prompt);
+  renderArtistPromptPreview(prompt);
+  const modal = styleElement("styleCombinationModal");
+  if (modal && !modal.classList.contains("hidden")) renderCurrentStyleCombination();
+  return prompt;
 }
 
 function renderWeightProfilePreview() {
@@ -2894,135 +3051,304 @@ function renderWeightProfilePreview() {
   preview.append(polyline);
 }
 
+let weightGraphDraft = null;
+let weightGraphSelection = 0;
+let weightGraphReturnFocus = null;
+
+function weightProfileSlotValues(profile, count, minimum, maximum) {
+  const size = Math.max(1, Math.trunc(Number(count) || 1));
+  return Array.from({ length: size }, (_, index) => (
+    Math.min(maximum, Math.max(minimum, interpolateWeightProfile(profile, size === 1 ? 0 : index / (size - 1))))
+  ));
+}
+
+function weightProfileFromSlotValues(values) {
+  if (values.length === 1) return [{ position: 0, weight: values[0] }, { position: 1, weight: values[0] }];
+  return values.map((weight, index) => ({ position: index / (values.length - 1), weight }));
+}
+
 function openWeightGraphModal() {
+  weightGraphReturnFocus = typeof document !== "undefined" ? document.activeElement : null;
+  weightGraphDraft = {
+    profileMode: styleElement("weightMode")?.value === "profile",
+    profile: styleState.weightProfile.map((point) => ({ ...point })),
+    artists: styleState.artists.map((artist) => ({ ...artist })),
+    count: styleSlotCount(),
+    minimum: styleNumber("styleMinWeight", 0.1),
+    maximum: styleNumber("styleMaxWeight", 2.3),
+    changedWeights: new Map(),
+    profileChanged: false,
+  };
   styleElement("weightGraphModal")?.classList.remove("hidden");
   renderWeightGraph();
+  const graph = styleElement("weightGraph");
+  if (graph) graph.scrollTop = 0;
+  styleElement("weightGraphArtist")?.focus({ preventScroll: true });
 }
 
 function closeWeightGraphModal() {
+  weightGraphDraft = null;
   styleElement("weightGraphModal")?.classList.add("hidden");
+  weightGraphReturnFocus?.focus?.();
+}
+
+function applyWeightGraphModal() {
+  if (!weightGraphDraft || styleState.pending) return;
+  if (weightGraphDraft.profileChanged) {
+    styleState.weightProfile = weightGraphDraft.profile.map((point) => ({ ...point }));
+  }
+  styleState.artists = styleState.artists.map((artist) => (
+    weightGraphDraft.changedWeights.has(artist.artist)
+      ? { ...artist, weight: weightGraphDraft.changedWeights.get(artist.artist) }
+      : artist
+  ));
+  closeWeightGraphModal();
+  renderWeightGraph();
+}
+
+function weightGraphValues() {
+  const draft = weightGraphDraft;
+  if (!draft) return [];
+  return draft.profileMode
+    ? weightProfileSlotValues(draft.profile, draft.count, draft.minimum, draft.maximum)
+    : draft.artists.map((artist) => Math.min(draft.maximum, Math.max(draft.minimum, Number(artist.weight) || draft.minimum)));
+}
+
+function editWeightGraphValue(index, value) {
+  const draft = weightGraphDraft;
+  const numeric = Number(value);
+  const values = weightGraphValues();
+  if (!draft || styleState.pending || !Number.isFinite(numeric) || numeric < draft.minimum || numeric > draft.maximum || index < 0 || index >= values.length) return false;
+  const weight = Number(numeric.toFixed(2));
+  if (draft.profileMode) {
+    values[index] = weight;
+    draft.profile = weightProfileFromSlotValues(values);
+    draft.profileChanged = true;
+  } else {
+    draft.artists[index].weight = weight;
+    draft.changedWeights.set(draft.artists[index].artist, weight);
+  }
+  return true;
+}
+
+function editWeightGraphStroke(from, to) {
+  const start = from || to;
+  const steps = Math.abs(to.index - start.index);
+  const direction = Math.sign(to.index - start.index);
+  for (let step = 0; step <= steps; step += 1) {
+    const weight = step === steps ? to.weight : start.weight + (to.weight - start.weight) * step / steps;
+    editWeightGraphValue(start.index + direction * step, weight);
+  }
 }
 
 function renderWeightProfileGraph(graph) {
+  const draft = weightGraphDraft;
+  if (!draft) return;
+  graph.replaceChildren();
+  graph.classList.toggle("weight-overview", true);
+  const values = weightGraphValues();
+  const count = values.length;
+  const status = styleElement("weightGraphStatus");
+  if (!count) {
+    graph.textContent = "작가를 먼저 선택해 주세요. ‘작가 다시 뽑기’ 또는 ‘작가 추가’로 조합을 만들 수 있습니다.";
+    if (status) status.textContent = "현재 조합에 작가가 없습니다.";
+    return;
+  }
+  weightGraphSelection = Math.max(0, Math.min(weightGraphSelection, count - 1));
+  let selected = weightGraphSelection;
+  const toolbar = document.createElement("div");
+  toolbar.className = "weight-overview-toolbar";
+  const summary = document.createElement("strong");
+  summary.textContent = `${count}명 전체 보기`;
+  const presets = document.createElement("div");
+  presets.className = "weight-overview-presets";
+  [["균등", "flat"], ["앞쪽 강조", "front"], ["완만한 곡선", "curve"]].forEach(([label, preset]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.disabled = styleState.pending;
+    button.addEventListener("click", () => {
+      if (styleState.pending) return;
+      values.forEach((_, index) => {
+        const ratio = count === 1 ? 0 : index / (count - 1);
+        const factor = preset === "flat" ? 0.5 : preset === "front" ? 1 - ratio : 0.8 - ratio * 0.6;
+        editWeightGraphValue(index, draft.minimum + (draft.maximum - draft.minimum) * factor);
+      });
+      renderWeightProfileGraph(graph);
+    });
+    presets.append(button);
+  });
+  toolbar.append(summary, presets);
+  const chart = document.createElement("div");
+  chart.className = "weight-overview-chart";
   const ns = "http://www.w3.org/2000/svg";
-  const width = 900;
-  const height = 430;
-  const pad = { left: 58, right: 24, top: 24, bottom: 44 };
-  const plotWidth = width - pad.left - pad.right;
-  const plotHeight = height - pad.top - pad.bottom;
-  const min = styleNumber("styleMinWeight", 0.1);
-  const max = styleNumber("styleMaxWeight", 2.3);
-  styleState.weightProfile = styleState.weightProfile.map((point) => ({
-    position: point.position,
-    weight: Math.min(max, Math.max(min, point.weight)),
-  }));
-  const x = (position) => pad.left + (position * plotWidth);
-  const y = (weight) => pad.top + ((max - weight) / Math.max(0.01, max - min)) * plotHeight;
+  const width = Math.max(260, Math.round(graph.getBoundingClientRect?.().width || 800) - 32);
+  const height = 220;
+  const left = 34;
+  const right = 14;
+  const top = 25;
+  const bottom = 28;
+  const chartHeight = height - top - bottom;
+  const step = (width - left - right) / count;
+  const labelEvery = Math.max(1, Math.ceil(28 / step));
+  const y = (weight) => top + (draft.maximum - weight) / Math.max(0.01, draft.maximum - draft.minimum) * chartHeight;
   const svg = document.createElementNS(ns, "svg");
-  svg.classList.add("weight-profile-svg");
+  svg.classList.add("weight-overview-svg");
   svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  svg.setAttribute("aria-label", "자리 순서별 가중치 그래프");
-
-  for (let index = 0; index <= 10; index += 1) {
-    const line = document.createElementNS(ns, "line");
-    const lineY = pad.top + (plotHeight * index / 10);
-    line.setAttribute("x1", pad.left);
-    line.setAttribute("x2", width - pad.right);
-    line.setAttribute("y1", lineY);
-    line.setAttribute("y2", lineY);
-    line.classList.add("profile-grid-line");
-    svg.append(line);
-    if (index % 2 === 0) {
-      const label = document.createElementNS(ns, "text");
-      label.setAttribute("x", pad.left - 10);
-      label.setAttribute("y", lineY + 4);
-      label.setAttribute("text-anchor", "end");
-      label.classList.add("profile-axis-label");
-      label.textContent = (max - ((max - min) * index / 10)).toFixed(1);
-      svg.append(label);
-    }
-  }
-  const count = Math.max(2, Math.trunc(styleNumber("styleArtistCount", 12)));
-  for (let index = 0; index < count; index += 1) {
-    const line = document.createElementNS(ns, "line");
-    const lineX = x(index / (count - 1));
-    line.setAttribute("x1", lineX);
-    line.setAttribute("x2", lineX);
-    line.setAttribute("y1", pad.top);
-    line.setAttribute("y2", height - pad.bottom);
-    line.classList.add("profile-grid-line", "profile-slot-line");
-    svg.append(line);
-    const label = document.createElementNS(ns, "text");
-    label.setAttribute("x", lineX);
-    label.setAttribute("y", height - 17);
-    label.setAttribute("text-anchor", "middle");
-    label.classList.add("profile-axis-label");
-    label.textContent = String(index + 1);
-    svg.append(label);
-  }
-  const polyline = document.createElementNS(ns, "polyline");
-  polyline.setAttribute("points", styleState.weightProfile.map((point) => `${x(point.position)},${y(point.weight)}`).join(" "));
-  polyline.classList.add("profile-line");
-  svg.append(polyline);
-
-  const pointFromEvent = (event) => {
-    const rect = svg.getBoundingClientRect();
-    const svgX = ((event.clientX - rect.left) / rect.width) * width;
-    const svgY = ((event.clientY - rect.top) / rect.height) * height;
-    return {
-      position: Math.min(0.99, Math.max(0.01, (svgX - pad.left) / plotWidth)),
-      weight: Math.min(max, Math.max(min, max - ((svgY - pad.top) / plotHeight) * (max - min))),
-    };
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `${count}명 가중치 전체 분포. 그래프를 누르거나 드래그하여 바로 편집할 수 있습니다. 키보드로는 아래 자리 선택과 값 입력을 사용하세요.`);
+  const svgNode = (tag, attributes, text) => {
+    const node = document.createElementNS(ns, tag);
+    Object.entries(attributes).forEach(([key, value]) => node.setAttribute(key, String(value)));
+    if (text !== undefined) node.textContent = text;
+    return node;
   };
-  styleState.weightProfile.forEach((point) => {
-    const circle = document.createElementNS(ns, "circle");
-    circle.setAttribute("cx", x(point.position));
-    circle.setAttribute("cy", y(point.weight));
-    circle.setAttribute("r", 8);
-    circle.classList.add("profile-point");
-    circle.addEventListener("pointerdown", (event) => {
-      event.stopPropagation();
-      circle.setPointerCapture(event.pointerId);
-      const startX = event.clientX;
-      const startY = event.clientY;
-      let moved = false;
-      const move = (moveEvent) => {
-        if (!hasProfileDragMoved(startX, startY, moveEvent.clientX, moveEvent.clientY)) return;
-        moved = true;
-        const next = pointFromEvent(moveEvent);
-        if (point.position !== 0 && point.position !== 1) point.position = Number(next.position.toFixed(3));
-        point.weight = Number(next.weight.toFixed(2));
-        styleState.weightProfile.sort((a, b) => a.position - b.position);
-        circle.setAttribute("cx", x(point.position));
-        circle.setAttribute("cy", y(point.weight));
-        polyline.setAttribute("points", styleState.weightProfile.map((item) => `${x(item.position)},${y(item.weight)}`).join(" "));
-      };
-      circle.addEventListener("pointermove", move);
-      circle.addEventListener("pointerup", () => {
-        circle.removeEventListener("pointermove", move);
-        if (moved) renderWeightGraph();
-      }, { once: true });
-    });
-    circle.addEventListener("dblclick", (event) => {
-      event.stopPropagation();
-      if (point.position === 0 || point.position === 1) return;
-      styleState.weightProfile = styleState.weightProfile.filter((item) => item !== point);
-      renderWeightGraph();
-    });
-    svg.append(circle);
+  [draft.minimum, (draft.minimum + draft.maximum) / 2, draft.maximum].forEach((weight) => {
+    svg.append(svgNode("line", { x1: left, x2: width - right, y1: y(weight), y2: y(weight), class: "profile-grid-line" }));
+    svg.append(svgNode("text", { x: left - 7, y: y(weight) + 4, "text-anchor": "end", class: "profile-axis-label" }, formatStyleWeight(weight)));
   });
-  svg.addEventListener("click", (event) => {
-    if (event.target !== svg && !event.target.classList.contains("profile-grid-line") && event.target !== polyline) return;
-    const point = pointFromEvent(event);
-    styleState.weightProfile.push({ position: Number(point.position.toFixed(3)), weight: Number(point.weight.toFixed(2)) });
-    styleState.weightProfile.sort((a, b) => a.position - b.position);
-    renderWeightGraph();
+  values.forEach((weight, index) => {
+    const group = svgNode("g", { class: index === selected ? "weight-overview-bar selected" : "weight-overview-bar" });
+    group.append(svgNode("title", {}, `${index + 1}번 · ${formatStyleWeight(weight)}`));
+    group.append(svgNode("rect", { x: left + step * (index + 0.14), y: y(weight), width: step * 0.72, height: Math.max(3, top + chartHeight - y(weight)), rx: Math.min(3, step / 5), class: "weight-overview-fill" }));
+    group.append(svgNode("text", { x: left + step * (index + 0.5), y: Math.max(12, y(weight) - 7), "text-anchor": "middle", class: "weight-overview-value", visibility: index === selected || step >= 34 ? "visible" : "hidden" }, formatStyleWeight(weight)));
+    if (index === count - 1 || (index % labelEvery === 0 && index <= count - 1 - labelEvery)) {
+      group.append(svgNode("text", { x: left + step * (index + 0.5), y: height - 6, "text-anchor": "middle", class: "profile-axis-label" }, String(index + 1)));
+    }
+    const hit = svgNode("rect", { x: left + step * index, y: top, width: step, height: chartHeight, fill: "transparent", "data-weight-slot": index });
+    group.append(hit);
+    svg.append(group);
   });
+  chart.append(svg);
+  const detail = document.createElement("div");
+  detail.className = "weight-overview-detail";
+  const artistField = document.createElement("div");
+  const artistLabel = document.createElement("label");
+  artistLabel.htmlFor = "weightGraphArtist";
+  artistLabel.textContent = draft.profileMode ? "선택한 자리 · 최근 조합" : "선택한 작가";
+  const navigation = document.createElement("div");
+  navigation.className = "weight-overview-navigation";
+  const select = document.createElement("select");
+  select.id = "weightGraphArtist";
+  values.forEach((_, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    const artist = draft.artists[index];
+    option.textContent = `${String(index + 1).padStart(2, "0")} · ${artist?.artist || "다음 생성에서 선택"}${artist?.fixed ? " · 고정" : ""}`;
+    select.append(option);
+  });
+  select.value = String(selected);
+  select.addEventListener("change", () => selectSlot(Number(select.value)));
+  const previous = document.createElement("button");
+  const next = document.createElement("button");
+  [[previous, "‹", "이전 자리", -1], [next, "›", "다음 자리", 1]].forEach(([button, label, aria, delta]) => {
+    button.type = "button";
+    button.textContent = label;
+    button.setAttribute("aria-label", aria);
+    button.disabled = selected + delta < 0 || selected + delta >= count;
+    button.addEventListener("click", () => { selectSlot(selected + delta); select.focus(); });
+  });
+  navigation.append(previous, select, next);
+  artistField.append(artistLabel, navigation);
+  const weightField = document.createElement("div");
+  const weightLabel = document.createElement("label");
+  weightLabel.htmlFor = "weightGraphValue";
+  weightLabel.textContent = draft.profileMode ? "자리별 목표 가중치" : "가중치";
+  const controls = document.createElement("div");
+  controls.className = "weight-overview-controls";
+  const slider = document.createElement("input");
+  const number = document.createElement("input");
+  [[slider, "range", "weightGraphRange"], [number, "number", "weightGraphValue"]].forEach(([input, type, id]) => {
+    input.type = type;
+    input.id = id;
+    input.min = String(draft.minimum);
+    input.max = String(draft.maximum);
+    input.step = "0.01";
+    input.value = String(Number(values[selected].toFixed(2)));
+    input.disabled = styleState.pending;
+    input.setAttribute("aria-label", type === "range" ? "선택한 자리 가중치 슬라이더" : "선택한 자리 가중치");
+  });
+  const bars = [...svg.querySelectorAll(".weight-overview-bar")];
+  const refreshGraph = () => {
+    const newValues = weightGraphValues();
+    bars.forEach((bar, index) => {
+      const weight = newValues[index];
+      bar.classList.toggle("selected", index === selected);
+      const rect = bar.querySelector(".weight-overview-fill");
+      rect.setAttribute("y", String(y(weight)));
+      rect.setAttribute("height", String(Math.max(3, top + chartHeight - y(weight))));
+      const label = bar.querySelector(".weight-overview-value");
+      label.textContent = formatStyleWeight(weight);
+      label.setAttribute("y", String(Math.max(12, y(weight) - 7)));
+      label.setAttribute("visibility", index === selected || step >= 34 ? "visible" : "hidden");
+      bar.querySelector("title").textContent = `${index + 1}번 · ${formatStyleWeight(weight)}`;
+    });
+    if (status) status.textContent = `${selected + 1} / ${count}번 · 적용 전까지 기존 가중치를 유지합니다.`;
+  };
+  const selectSlot = (index) => {
+    selected = weightGraphSelection = Math.max(0, Math.min(index, count - 1));
+    select.value = String(selected);
+    previous.disabled = selected === 0;
+    next.disabled = selected === count - 1;
+    slider.value = number.value = String(Number(weightGraphValues()[selected].toFixed(2)));
+    refreshGraph();
+  };
+  const updateValue = (input, other) => {
+    if (!editWeightGraphValue(selected, input.value)) return;
+    other.value = input.value;
+    refreshGraph();
+  };
+  slider.addEventListener("input", () => updateValue(slider, number));
+  number.addEventListener("input", () => updateValue(number, slider));
+  number.addEventListener("change", () => { number.value = String(Number(weightGraphValues()[selected].toFixed(2))); });
+  let pointerId = null;
+  let lastPoint = null;
+  const paintWeight = (event) => {
+    if (weightGraphDraft !== draft || styleState.pending) return;
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    const local = point.matrixTransform(svg.getScreenCTM().inverse());
+    const index = Math.max(0, Math.min(count - 1, Math.floor((local.x - left) / step)));
+    const ratio = Math.max(0, Math.min(1, (top + chartHeight - local.y) / chartHeight));
+    const weight = draft.minimum + ratio * (draft.maximum - draft.minimum);
+    const current = { index, weight };
+    editWeightGraphStroke(lastPoint, current);
+    lastPoint = current;
+    selectSlot(index);
+  };
+  svg.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || pointerId !== null || styleState.pending || !event.target.closest("[data-weight-slot]")) return;
+    event.preventDefault();
+    pointerId = event.pointerId;
+    svg.setPointerCapture(pointerId);
+    paintWeight(event);
+  });
+  svg.addEventListener("pointermove", (event) => {
+    if (event.pointerId === pointerId) paintWeight(event);
+  });
+  const endStroke = (event) => {
+    if (event.pointerId !== pointerId) return;
+    if (event.type === "pointerup") paintWeight(event);
+    pointerId = null;
+    lastPoint = null;
+    if (svg.hasPointerCapture(event.pointerId)) svg.releasePointerCapture(event.pointerId);
+  };
+  svg.addEventListener("pointerup", endStroke);
+  svg.addEventListener("pointercancel", endStroke);
+  svg.addEventListener("lostpointercapture", endStroke);
+  controls.append(slider, number);
+  weightField.append(weightLabel, controls);
+  detail.append(artistField, weightField);
   const hint = document.createElement("p");
-  hint.className = "profile-hint";
-  hint.textContent = "가로는 자리 순서, 세로는 가중치입니다. 클릭해 점을 추가하고 끌어서 흐름을 만드세요. 점을 두 번 누르면 삭제됩니다.";
-  graph.append(svg, hint);
+  hint.className = "weight-overview-hint";
+  hint.textContent = "그래프를 누르면 바로 변경됩니다. 누른 채 가로로 끌면 여러 작가를 한 번에 조절할 수 있습니다. " + (draft.profileMode
+    ? "자동 선택·랜덤 위치 작가에 적용되는 자리별 목표값입니다. 고정 위치 작가의 가중치는 ‘고정 작가 편집’에서 조절합니다."
+    : "현재 조합의 가중치를 편집합니다. 작가 순서·고정·랜덤 설정은 ‘고정 작가 편집’에서 조절합니다.");
+  graph.append(toolbar, chart, detail, hint);
+  if (status) status.textContent = `${selected + 1} / ${count}번 · 적용 전까지 기존 가중치를 유지합니다.`;
 }
+
 
 function removeStyleArtist(index) {
   const removed = styleState.artists[index];
@@ -3081,9 +3407,10 @@ function renderStyleArtistListTarget(list) {
     list.append(empty);
     return;
   }
-  entries.forEach(({ artist: item, index, slot, stackIndex }) => {
+  entries.forEach(({ artist: item, index, slot, stackIndex }, displayIndex) => {
     const row = document.createElement("div");
-    row.className = "style-artist-row";
+    row.className = "style-artist-row style-artist-card";
+    row.dataset.artist = item.artist;
 
     const position = document.createElement("input");
     position.type = "number";
@@ -3099,8 +3426,10 @@ function renderStyleArtistListTarget(list) {
 
     const name = document.createElement("input");
     name.type = "text";
+    name.className = "style-artist-card-name";
     name.value = item.artist;
-    name.title = "작가명";
+    name.size = Math.max(8, Array.from(item.artist).reduce((size, char) => size + (/[^\u0000-\u00ff]/.test(char) ? 2 : 1), 0));
+    name.title = item.artist;
     name.setAttribute("aria-label", `${item.artist} 작가명`);
     name.addEventListener("change", () => {
       styleState.artists = updateStyleArtistAtIndex(styleState.artists, index, { artist: name.value });
@@ -3142,9 +3471,31 @@ function renderStyleArtistListTarget(list) {
     remove.title = "작가 삭제";
     remove.setAttribute("aria-label", `${item.artist} 삭제`);
     remove.textContent = "×";
-    remove.addEventListener("click", () => removeStyleArtist(index));
+    remove.addEventListener("click", () => {
+      removeStyleArtist(index);
+      const cards = list.querySelectorAll(".style-artist-card");
+      const next = cards[Math.min(displayIndex, cards.length - 1)]?.querySelector("input")
+        || list.closest(".modal-dialog")?.querySelector(".modal-head button");
+      next?.focus({ preventScroll: true });
+    });
 
-    row.append(position, name, weight, randomWeight, remove);
+    const controls = document.createElement("div");
+    controls.className = "style-artist-card-controls";
+    [["순서", position], ["가중치", weight]].forEach(([text, input]) => {
+      const field = document.createElement("label");
+      field.className = "style-artist-card-field";
+      const label = document.createElement("span");
+      label.textContent = text;
+      field.append(label, input);
+      controls.append(field);
+    });
+    controls.append(randomWeight, remove);
+    row.append(name, controls);
+    if (list.id === "styleArtistList") {
+      const status = document.createElement("span");
+      status.className = "combination-candidate-status";
+      row.append(status);
+    }
     list.append(row);
   });
 }
@@ -3155,17 +3506,22 @@ function renderStyleArtistList() {
     if (list) renderStyleArtistListTarget(list);
   });
   updateWeightTableSortHeaders();
+  updateWorkspaceSummaries();
+  const combination = styleElement("styleCombinationModal");
+  if (combination && !combination.classList.contains("hidden")) renderCurrentStyleCombination();
 }
 
 function openWeightTableModal() {
   styleElement("weightTableModal")?.classList.remove("hidden");
   renderStyleArtistList();
   renderRatedArtistSelect();
+  styleElement("closeWeightTable")?.focus();
 }
 
 function closeWeightTableModal() {
   hideStyleArtistAutocomplete();
   styleElement("weightTableModal")?.classList.add("hidden");
+  styleElement("openWeightTable")?.focus();
 }
 
 function fixedArtistOverlayCoordinates(indexOrSlot, weight, total, min, max) {
@@ -3412,124 +3768,12 @@ function renderWeightGraphFixedArtistOverlays(graph) {
 function renderWeightGraph() {
   const graph = styleElement("weightGraph");
   renderStyleArtistList();
-  if (!graph) {
-    saveFixedStyleArtists(styleState.artists);
-    return;
+  if (graph) {
+    graph.classList.toggle("profile-mode", styleElement("weightMode")?.value === "profile");
+    if (weightGraphDraft) renderWeightProfileGraph(graph);
+    else graph.replaceChildren();
   }
-  graph.replaceChildren();
-  const profileMode = styleElement("weightMode")?.value === "profile";
-  graph.classList.toggle("profile-mode", profileMode);
-  if (profileMode) {
-    renderWeightProfileGraph(graph);
-    renderWeightGraphFixedArtistOverlays(graph);
-    renderWeightProfilePreview();
-    updateArtistPrompt();
-    refreshPromptPresetsForArtists();
-    saveFixedStyleArtists(styleState.artists);
-    return;
-  }
-  const min = styleNumber("styleMinWeight", 0.1);
-  const max = styleNumber("styleMaxWeight", 2.3);
-
-  styleState.artists.forEach((item, index) => {
-    item.weight = clampStyleWeight(item.weight);
-    const column = document.createElement("article");
-    column.className = "weight-column";
-    column.draggable = !styleState.pending;
-    column.dataset.index = String(index);
-
-    const drag = document.createElement("span");
-    drag.className = "drag-handle icon-button ghost";
-    drag.title = "끌어서 순서 변경";
-    drag.setAttribute("aria-hidden", "true");
-    drag.textContent = "⋮⋮";
-
-    const slider = document.createElement("input");
-    slider.className = "vertical-weight";
-    slider.type = "range";
-    slider.min = String(min);
-    slider.max = String(max);
-    slider.step = "0.01";
-    slider.value = String(item.weight);
-    slider.setAttribute("aria-label", `${item.artist} 가중치`);
-
-    const number = document.createElement("input");
-    number.className = "weight-number";
-    number.type = "number";
-    number.min = String(min);
-    number.max = String(max);
-    number.step = "0.01";
-    number.value = Number(item.weight).toFixed(2);
-    number.setAttribute("aria-label", `${item.artist} 정확한 가중치`);
-
-    const syncWeight = (value) => {
-      item.weight = clampStyleWeight(value);
-      slider.value = String(item.weight);
-      number.value = Number(item.weight).toFixed(2);
-      updateArtistPrompt();
-      saveFixedStyleArtists(styleState.artists);
-    };
-    slider.addEventListener("input", () => syncWeight(slider.value));
-    number.addEventListener("change", () => syncWeight(number.value));
-
-    const label = document.createElement("strong");
-    label.className = "weight-artist-label";
-    label.title = item.artist;
-    label.textContent = item.artist;
-
-    const score = document.createElement("span");
-    score.className = "weight-score";
-    score.textContent = item.score ? `평점 ${item.score}` : `#${index + 1}`;
-
-    const swap = document.createElement("select");
-    swap.className = "weight-swap";
-    swap.title = "다른 작가와 위치 바꾸기";
-    swap.setAttribute("aria-label", `${item.artist} 위치 바꾸기`);
-    swap.add(new Option("교체", ""));
-    styleState.artists.forEach((other, otherIndex) => {
-      if (otherIndex !== index) swap.add(new Option(String(otherIndex + 1), String(otherIndex)));
-    });
-    swap.addEventListener("change", () => swapStyleArtists(index, Number(swap.value)));
-
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "icon-button danger-button";
-    remove.title = "작가 삭제";
-    remove.setAttribute("aria-label", `${item.artist} 삭제`);
-    remove.textContent = "×";
-    remove.addEventListener("click", () => removeStyleArtist(index));
-
-    column.addEventListener("dragstart", (event) => {
-      if (styleState.pending) {
-        event.preventDefault();
-        return;
-      }
-      styleState.draggingIndex = index;
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", String(index));
-      column.classList.add("dragging");
-    });
-    column.addEventListener("dragend", () => {
-      styleState.draggingIndex = null;
-      column.classList.remove("dragging");
-    });
-    column.addEventListener("dragover", (event) => {
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-    });
-    column.addEventListener("drop", (event) => {
-      event.preventDefault();
-      if (styleState.pending) return;
-      const source = Number(event.dataTransfer.getData("text/plain"));
-      if (!Number.isInteger(source) || source === index) return;
-      styleState.artists = reorderArtists(styleState.artists, source, index);
-      renderWeightGraph();
-    });
-
-    column.append(drag, slider, number, label, score, swap, remove);
-    graph.append(column);
-  });
-  renderWeightGraphFixedArtistOverlays(graph);
+  renderWeightProfilePreview();
   updateArtistPrompt();
   refreshPromptPresetsForArtists();
   saveFixedStyleArtists(styleState.artists);
@@ -3643,6 +3887,8 @@ function handleStyleArtistAutocompleteKeydown(event, context = "main") {
 }
 
 function hidePromptTagAutocomplete() {
+  clearTimeout(styleState.promptTagAutocompleteTimer);
+  styleState.promptTagAutocompleteTimer = null;
   const input = styleState.promptTagAutocompleteInput;
   const box = styleState.promptTagAutocompleteBox;
   box?.classList.add("hidden");
@@ -3667,6 +3913,7 @@ function setPromptTagAutocompleteIndex(index) {
   const activeButton = box.querySelector("button.active");
   if (activeButton && styleState.promptTagAutocompleteInput) {
     styleState.promptTagAutocompleteInput.setAttribute("aria-activedescendant", activeButton.id);
+    activeButton.scrollIntoView?.({ block: "nearest" });
   }
 }
 
@@ -3727,7 +3974,7 @@ async function updatePromptTagAutocomplete(input) {
       const detail = document.createElement("span");
       detail.textContent = `${item.category_name || "other"} · ${item.post_count || 0}`;
       button.append(name, detail);
-      button.addEventListener("mouseenter", () => setPromptTagAutocompleteIndex(index));
+      button.addEventListener("mousemove", () => setPromptTagAutocompleteIndex(index));
       button.addEventListener("click", () => applyPromptTagAutocomplete(index));
       box.append(button);
     });
@@ -3827,6 +4074,7 @@ function addStyleArtist(context = "main") {
     styleState.artists = limitArtistsToTotalCount(
       inserted,
       Math.trunc(Number(styleElement("styleArtistCount")?.value || inserted.length)),
+      fixedArtistsOnlyEnabled(),
     );
   } catch (error) {
     showStyleStatus(error.message, "error");
@@ -4005,6 +4253,7 @@ function validateCharacterPromptLimit(model = currentGenerationModel(), values =
 }
 
 function syncNovelAiModelControls(model = currentGenerationModel()) {
+  syncGenerationMediumControls(model);
   const definition = novelAiModelDefinition(model);
   const row = styleElement("generationComplexityRow");
   const select = styleElement("generationComplexity");
@@ -4034,13 +4283,14 @@ function readCharacterPrompts() {
 
 function buildGenerationRequest(requestId = createRequestId()) {
   if (!styleState.artists.length) throw new Error("먼저 그림체 작가를 구성하세요.");
+  if (fixedArtistsOnlyEnabled()) readStyleOptions();
   const model = currentGenerationModel();
   const width = generationNumber("generationWidth", 832);
   const height = generationNumber("generationHeight", 1216);
   const steps = generationNumber("generationSteps", 28);
   const inputScale = generationNumber("generationScale", 5);
   const inputCfgRescale = generationNumber("generationCfgRescale", 0);
-  const sharedDependencyMode = styleElement("weightMode")?.value === "shared_dependency";
+  const sharedDependencyMode = !fixedArtistsOnlyEnabled() && styleElement("weightMode")?.value === "shared_dependency";
   const referenceScale = sharedDependencyParameterValue(styleState.sharedDependencyScale, 0, 10);
   const referenceCfgRescale = sharedDependencyParameterValue(styleState.sharedDependencyCfgRescale, 0, 1);
   const scale = sharedDependencyMode && referenceScale !== null ? referenceScale : inputScale;
@@ -4099,7 +4349,7 @@ function buildGenerationRequest(requestId = createRequestId()) {
     variety_plus: Boolean(styleElement("generationVarietyPlus")?.checked),
   };
   if (seedFixed) payload.seed = seed;
-  return payload;
+  return normalizeMediumGenerationSettings(payload);
 }
 
 function opusFreeGenerationIssues({ width, height, steps }) {
@@ -4150,7 +4400,8 @@ function selectedRandomTargets() {
   if (typeof document === "undefined") return new Set(["weights"]);
   return new Set([...document.querySelectorAll("[data-random-target][aria-pressed='true']")]
     .map((button) => button.dataset.randomTarget)
-    .filter((target) => RANDOM_STYLE_TARGETS.includes(target)));
+    .filter((target) => RANDOM_STYLE_TARGETS.includes(target)
+      && !(target === "negative" && isNovelAiMediumModel(currentGenerationModel()))));
 }
 
 function setRandomTargets(values, legacyMode = "weights") {
@@ -4181,7 +4432,9 @@ function setGenerationBusy(busy) {
   syncGenerationRemote();
 }
 
-function renderGenerationResult(result) {
+function renderGenerationResult(result, artists = result.artists || []) {
+  styleState.displayedStyleResult = normalizeStyleHistoryItem({ ...result, artists });
+  if (styleState.combinationSource === "result") renderCurrentStyleCombination();
   const target = styleElement("latestStyleResult");
   if (!target) return;
   target.replaceChildren();
@@ -4268,7 +4521,10 @@ function styleHistoryArtistPrompt(item) {
 
 function renderStyleHistorySelection(item) {
   const normalized = item ? normalizeStyleHistoryItem(item) : null;
+  styleState.displayedStyleResult = normalized;
   renderArtistPromptPreview(styleHistoryArtistPrompt(normalized));
+  const combination = styleElement("styleCombinationModal");
+  if (combination && !combination.classList.contains("hidden")) renderCurrentStyleCombination();
   const target = styleElement("latestStyleResult");
   if (!target) return;
   target.replaceChildren();
@@ -4324,12 +4580,36 @@ function renderStyleHistoryDetail(item) {
   confirm.setAttribute("aria-label", "선택한 히스토리를 확정 그림체로 저장");
   confirm.addEventListener("click", () => openConfirmedStyleModal(normalized, false, "generated"));
   actions.append(load, confirm);
-  target.append(heading, meta, actions);
+  const detail = document.createElement("button");
+  detail.type = "button";
+  detail.className = "ghost";
+  detail.textContent = "이미지·설정 상세";
+  detail.addEventListener("click", () => {
+    const body = styleElement("styleHistoryFullDetail");
+    body.replaceChildren();
+    if (normalized.image_url) {
+      const image = document.createElement("img");
+      image.src = normalized.image_url;
+      image.alt = `생성 #${normalized.id}`;
+      body.append(image);
+    }
+    appendMetaRow(body, "생성 설정", styleHistoryPreviewMeta(normalized));
+    appendMetaRow(body, "작가 프롬프트", styleHistoryArtistPrompt(normalized));
+    appendMetaRow(body, "선행 프롬프트", normalized.leading_prompt || "");
+    appendMetaRow(body, "퀄리티 프롬프트", normalized.base_prompt);
+    appendMetaRow(body, "고정 태그", normalized.fixed_prompt);
+    appendMetaRow(body, "네거티브", normalized.negative_prompt);
+    appendMetaRow(body, "캐릭터", normalized.character_prompts.join("\n"));
+    openWorkspaceModal("styleHistoryDetailModal");
+  });
+  target.append(heading, meta, actions, detail);
 }
 
 function renderStyleHistoryList() {
   const list = styleElement("styleHistoryList");
   if (!list) return;
+  const scroller = list.closest?.(".style-history-scroll");
+  const scrollTop = scroller?.scrollTop || 0;
   list.replaceChildren();
   if (!styleState.historyItems.length) {
     const empty = document.createElement("p");
@@ -4391,6 +4671,7 @@ function renderStyleHistoryList() {
     renderStyleHistoryDetail(selected);
   }
   if (selected && Number(styleState.historySelectedId) === Number(selected.id)) renderStyleHistorySelection(selected);
+  if (scroller) scroller.scrollTop = scrollTop;
 }
 
 async function loadStyleHistory({ force = false } = {}) {
@@ -4424,6 +4705,7 @@ function applyStyleHistoryItem(item) {
     return false;
   }
   styleState.artists = normalized.artists.map((artist) => ({ ...artist }));
+  syncGenerationMediumControls("");
   styleState.promptGroups = [];
   const characterList = styleElement("characterPromptList");
   characterList?.replaceChildren();
@@ -4485,7 +4767,7 @@ async function generateCurrentStyle() {
   showStyleStatus("NovelAI에서 이미지를 생성하는 중입니다...");
   try {
     const result = await apiFetch("/api/style-maker/generate", { method: "POST", body: JSON.stringify(payload) });
-    renderGenerationResult(result);
+    renderGenerationResult(result, payload.artists);
     if (result?.usage) renderNovelAiUsage(result);
     else if (shouldRefreshNovelAiUsageAfterGeneration(payload, result)) void loadNovelAiUsage({ silent: true });
     styleState.managerDirty = true;
@@ -5628,6 +5910,25 @@ function confirmedFormValue(id, value) {
   if (element) element.value = value === null || value === undefined ? "" : String(value);
 }
 
+function setConfirmedParameterValue(id, value) {
+  const element = styleElement(id);
+  if (!element) return;
+  const current = value === null || value === undefined ? "" : String(value);
+  // Keep imported settings that are not in the generation menu, without carrying
+  // another image's custom option into the next image's menu.
+  [...element.options].forEach((option) => {
+    if (option.dataset.imported && option.value !== current) option.remove();
+  });
+  if (current && ![...element.options].some((option) => option.value === current)) {
+    const option = document.createElement("option");
+    option.value = current;
+    option.textContent = `기존 값: ${current}`;
+    option.dataset.imported = "true";
+    element.append(option);
+  }
+  element.value = current;
+}
+
 function confirmedFormChecked(id, value) {
   const element = styleElement(id);
   if (element) element.checked = Boolean(value);
@@ -5677,6 +5978,10 @@ function syncConfirmedComplexityControl(model = styleElement("confirmedStyleMode
 }
 
 function syncComparisonComplexityControl(model = styleElement("comparisonDefaultModel")?.value) {
+  syncMediumControls(model, {
+    comparisonDefaultSteps: 14, comparisonDefaultSampler: "k_euler_ancestral", comparisonDefaultSchedule: "karras",
+    comparisonDefaultRescale: 0, comparisonDefaultVariety: "0", comparisonDefaultUcPreset: 2,
+  }, "comparisonMediumHint");
   const definition = novelAiModelDefinition(model);
   const row = styleElement("comparisonDefaultComplexityRow");
   const select = styleElement("comparisonDefaultComplexity");
@@ -6062,8 +6367,8 @@ function openConfirmedStyleModal(item = null, editing = false, sourceMode = styl
   confirmedFormValue("confirmedStyleFixedPrompt", source.fixed_prompt || "");
   confirmedFormValue("confirmedStyleCharacterPrompts", (source.character_prompts || []).map((entry) => typeof entry === "string" ? entry : entry?.prompt || "").filter(Boolean).join("\n"));
   confirmedFormValue("confirmedStyleNegativePrompt", source.negative_prompt || "");
-  confirmedFormValue("confirmedStyleSampler", source.sampler || "");
-  confirmedFormValue("confirmedStyleScheduler", source.noise_schedule || "");
+  setConfirmedParameterValue("confirmedStyleSampler", source.sampler || "");
+  setConfirmedParameterValue("confirmedStyleScheduler", source.noise_schedule || "");
   confirmedFormValue("confirmedStyleSteps", source.steps);
   confirmedFormValue("confirmedStyleScale", source.scale);
   confirmedFormValue("confirmedStyleCfgRescale", source.cfg_rescale);
@@ -6293,6 +6598,7 @@ function toggleComparisonColumn(column) {
 }
 
 async function openComparisonEditor(group = null) {
+  syncComparisonComplexityControl("");
   comparisonStyles = await apiFetch("/api/confirmed-styles");
   comparisonEditingGroupId = group?.id || null;
   comparisonSelectedStyleIds = new Set(
@@ -6321,8 +6627,8 @@ async function openComparisonEditor(group = null) {
   comparisonSetValue("comparisonDefaultUcPreset", normalizeUcPreset(defaults.uc_preset ?? defaults.ucPreset));
   comparisonSetValue("comparisonDefaultComplexity", defaults.complexity || "");
   comparisonSetValue("comparisonDefaultModel", defaults.model || "nai-diffusion-4-5-full");
-  syncComparisonComplexityControl();
   ["comparisonName", "comparisonFixedPrompt", "comparisonResolution", "comparisonWidth", "comparisonHeight", "comparisonSeedMode", "comparisonSeed", "comparisonDefaultSampler", "comparisonDefaultSchedule", "comparisonDefaultSteps", "comparisonDefaultScale", "comparisonDefaultRescale", "comparisonDefaultVariety", "comparisonDefaultQualityToggle", "comparisonDefaultUcPreset", "comparisonDefaultComplexity", "comparisonDefaultModel"].forEach((id) => { const element = styleElement(id); if (element) element.disabled = Boolean(group); });
+  syncComparisonComplexityControl();
   const save = styleElement("createComparison");
   if (save) save.textContent = group ? "선택 변경 저장" : "선택한 그림체 생성";
   styleElement("comparisonGroups")?.classList.add("hidden");
@@ -6694,8 +7000,8 @@ function applyExtractedConfirmedMetadata(metadata) {
   confirmedFormValue("confirmedStyleFixedPrompt", metadata.fixed_prompt || "");
   confirmedFormValue("confirmedStyleCharacterPrompts", (metadata.character_prompts || []).map((entry) => typeof entry === "string" ? entry : entry?.prompt || "").filter(Boolean).join("\n"));
   confirmedFormValue("confirmedStyleNegativePrompt", metadata.negative_prompt || "");
-  confirmedFormValue("confirmedStyleSampler", metadata.sampler || "");
-  confirmedFormValue("confirmedStyleScheduler", metadata.noise_schedule || "");
+  setConfirmedParameterValue("confirmedStyleSampler", metadata.sampler || "");
+  setConfirmedParameterValue("confirmedStyleScheduler", metadata.noise_schedule || "");
   confirmedFormValue("confirmedStyleSteps", metadata.steps);
   confirmedFormValue("confirmedStyleScale", metadata.scale);
   confirmedFormValue("confirmedStyleCfgRescale", metadata.cfg_rescale);
@@ -7027,9 +7333,14 @@ function toggleStyleSettings() {
   const button = styleElement("toggleStyleSettings");
   if (!layout || !button) return;
   const collapsed = layout.classList.toggle("settings-collapsed");
-  button.textContent = collapsed ? "›" : "‹";
-  button.title = collapsed ? "설정 패널 열기" : "설정 패널 닫기";
+  button.title = collapsed ? "설정 패널 열기" : "설정 패널 접기";
   button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-expanded", String(!collapsed));
+  if (!collapsed && window.innerWidth <= 760) {
+    setGenerationPanelCollapsed(true);
+    toggleStyleHistory(false);
+  }
+  if (collapsed) button.focus();
 }
 
 function syncGenerationRemote() {
@@ -7052,6 +7363,7 @@ function syncGenerationRemote() {
 function clampGenerationRemotePosition() {
   const remote = styleElement("generationRemote");
   if (!remote || remote.classList.contains("hidden")) return;
+  if (!remote.getClientRects().length) return;
   const rect = remote.getBoundingClientRect();
   const margin = 8;
   const left = Math.min(Math.max(margin, rect.left), Math.max(margin, window.innerWidth - rect.width - margin));
@@ -7083,17 +7395,24 @@ function setGenerationPanelCollapsed(collapsed) {
   const button = styleElement("toggleGenerationPanel");
   const remote = styleElement("generationRemote");
   const value = Boolean(collapsed);
-  if (value) styleState.generationRemoteClosed = false;
   layout?.classList.toggle("generation-collapsed", value);
   panel?.classList.toggle("is-collapsed", value);
   if (button) {
     button.setAttribute("aria-expanded", String(!value));
     button.setAttribute("aria-label", value ? "프롬프트와 생성 펼치기" : "프롬프트와 생성 접기");
     button.title = button.getAttribute("aria-label");
-    button.textContent = value ? "‹" : "›";
+    button.textContent = "프롬프트";
+  }
+  if (!value) {
+    if (window.innerWidth <= 1100) toggleStyleHistory(false);
+    if (window.innerWidth <= 760) {
+      layout?.classList.add("settings-collapsed");
+      styleElement("toggleStyleSettings")?.setAttribute("aria-expanded", "false");
+    }
   }
   if (remote) {
     remote.classList.toggle("hidden", !value || styleState.generationRemoteClosed);
+    styleElement("openGenerationRemote")?.setAttribute("aria-expanded", String(value && !styleState.generationRemoteClosed));
     if (value) {
       restoreGenerationRemotePosition();
       syncGenerationRemote();
@@ -7109,12 +7428,234 @@ function toggleStyleHistory(open) {
   const shouldOpen = open === undefined ? panel?.classList.contains("history-collapsed") : Boolean(open);
   panel?.classList.toggle("history-collapsed", !shouldOpen);
   layout?.classList.toggle("history-open", shouldOpen);
+  styleElement("styleHistoryRail")?.setAttribute("aria-expanded", String(shouldOpen));
+  if (shouldOpen && window.innerWidth <= 1100) {
+    // Collapse directly: history and prompt controls share the same overlay space.
+    layout?.classList.add("generation-collapsed");
+    styleElement("styleMakerGeneration")?.classList.add("is-collapsed");
+    styleElement("toggleGenerationPanel")?.setAttribute("aria-expanded", "false");
+    if (window.innerWidth <= 760) {
+      layout?.classList.add("settings-collapsed");
+      styleElement("toggleStyleSettings")?.setAttribute("aria-expanded", "false");
+    }
+  }
   if (button) {
     button.setAttribute("aria-expanded", String(shouldOpen));
     button.setAttribute("aria-label", shouldOpen ? "히스토리 닫기" : "히스토리 열기");
     button.title = button.getAttribute("aria-label");
   }
   if (shouldOpen) loadStyleHistory();
+}
+
+const workspaceModalOpeners = new Map();
+
+function updateWorkspaceSummaries() {
+  const generation = styleElement("openGenerationParameters")?.querySelector?.("small");
+  if (generation) {
+    generation.textContent = `${novelAiModelDisplayName(currentGenerationModel())} · ${styleNumber("generationWidth", 832)}×${styleNumber("generationHeight", 1216)} · ${styleNumber("generationSteps", 28)} Steps · CFG ${styleNumber("generationScale", 5)}`;
+    generation.title = generation.textContent;
+  }
+  const fixed = styleElement("openWeightTable")?.querySelector?.("small");
+  if (fixed) fixed.textContent = `${fixedStyleArtistEntries(styleState.artists).length}명 · 순서 · 가중치 · 랜덤`;
+  const rules = styleElement("openRatingTagRules")?.querySelector?.("small");
+  if (rules) rules.textContent = `공유 ${styleNumber("sharedStyleArtistMin", 0)}~${styleNumber("sharedStyleArtistMax", 0)}명 · 태그 ${ratingTagRuleCount(styleState.ratingTagRules)}명 지정`;
+}
+
+function openWorkspaceModal(id, source = "preview") {
+  const modal = styleElement(id);
+  if (!modal) return;
+  workspaceModalOpeners.set(id, document.activeElement);
+  if (id === "styleCombinationModal") {
+    styleState.combinationSource = source === "result" && styleState.displayedStyleResult ? "result" : "preview";
+    renderCurrentStyleCombination();
+  }
+  if (id === "styleGenerationParametersModal") styleElement("generationParameters")?.classList.remove("collapsed");
+  if (id === "stylePromptExtrasModal") renderAllPromptTokens();
+  modal.classList.remove("hidden");
+  modal.querySelector(".modal-head button")?.focus();
+}
+
+function renderCurrentStyleCombination() {
+  const list = styleElement("styleCurrentCombination");
+  if (!list) return;
+  const isResult = styleState.combinationSource === "result" && Boolean(styleState.displayedStyleResult);
+  const artists = isResult ? styleState.displayedStyleResult.artists : styleState.promptArtistPreview;
+  const fixedOnly = !isResult && fixedArtistsOnlyEnabled();
+  const candidates = fixedStyleArtistEntries(styleState.artists);
+  const selectedNames = new Set(artists.map((item) => item.artist));
+  const selectedFixed = candidates.filter(({ artist }) => selectedNames.has(artist.artist)).length;
+  const title = styleElement("styleCombinationModalTitle");
+  if (title) title.textContent = isResult ? "생성 결과의 작가 조합" : "현재 작가 조합";
+  const summary = styleElement("styleCombinationSummary");
+  if (summary) {
+    const heading = document.createElement("strong");
+    heading.textContent = `${isResult ? "생성에 사용한" : "미리보기에서 선택된"} ${artists.length}명`;
+    const detail = document.createElement("span");
+    detail.textContent = isResult ? "화면에 표시된 생성 결과 기준" : fixedOnly
+      ? `고정 후보 ${candidates.length}명 중 ${artists.length}명 추첨`
+      : `고정 후보에서 ${selectedFixed}명 · 자동 선택 ${artists.length - selectedFixed}명`;
+    summary.replaceChildren(heading, detail);
+  }
+  const hint = styleElement("styleCombinationHint");
+  if (hint) hint.textContent = isResult
+    ? "이 이미지에 실제 사용된 순서와 가중치입니다. 현재 설정의 후보 목록과는 별개입니다."
+    : "아래는 현재 미리보기입니다. 랜덤 작가·위치·가중치는 생성할 때 다시 추첨됩니다.";
+  const candidatePanel = styleElement("styleCombinationCandidates");
+  candidatePanel?.classList.toggle("hidden", isResult || candidates.length === 0);
+  const candidateSummary = styleElement("styleCombinationCandidatesSummary");
+  if (candidateSummary) candidateSummary.textContent = `고정 후보 전체 ${candidates.length}명 · 이번 선택 ${selectedFixed} / 대기 ${candidates.length - selectedFixed}`;
+  styleElement("styleArtistList")?.querySelectorAll(".style-artist-row").forEach((row) => {
+    const selected = selectedNames.has(row.dataset.artist);
+    row.dataset.selected = String(selected);
+    const status = row.querySelector(".combination-candidate-status");
+    if (status) status.textContent = selected ? "이번 미리보기에 선택됨" : "대기 · 이번 미리보기에는 미포함";
+  });
+  const preview = styleElement("artistPromptPreview");
+  if (preview) preview.value = artists.map((artist) => `${formatStyleWeight(artist.weight)}::artist:${formatArtistPromptTag(artist.artist)}::`).join(", ");
+  const footnote = styleElement("styleCombinationFootnote");
+  if (footnote) footnote.textContent = isResult ? "생성 결과의 기록을 보고 있습니다." : "고정 후보 편집은 아래에서 펼칠 수 있습니다.";
+  list.replaceChildren();
+  artists.forEach((artist, position) => {
+    const index = styleState.artists.findIndex((item) => item.artist === artist.artist);
+    const editable = !isResult && !fixedOnly && index !== -1;
+    const row = document.createElement("div");
+    row.className = `workspace-combination-row${editable ? "" : " is-readonly"}`;
+    row.dataset.artist = artist.artist;
+    const order = document.createElement("span");
+    order.className = "combination-position";
+    order.textContent = String(position + 1).padStart(2, "0");
+    const label = document.createElement("div");
+    label.className = "combination-artist";
+    const name = document.createElement("strong");
+    name.textContent = artist.artist;
+    const origin = document.createElement("span");
+    origin.className = "combination-origin";
+    origin.textContent = isResult ? "생성에 사용됨" : fixedOnly ? "고정 후보에서 추첨" : artist.fixed ? "고정 후보에서 선택" : "자동 선택";
+    label.append(name, origin);
+    const weight = document.createElement("span");
+    weight.className = "combination-weight";
+    weight.textContent = formatStyleWeight(artist.weight);
+    weight.setAttribute("aria-label", `가중치 ${formatStyleWeight(artist.weight)}`);
+    row.append(order, label, weight);
+    const actions = document.createElement("div");
+    actions.className = "combination-actions";
+    if (editable) {
+      [["↑", "앞으로", -1], ["↓", "뒤로", 1], ["×", "삭제", 0]].forEach(([text, action, delta]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = text;
+        button.setAttribute("aria-label", `${artist.artist} ${action}`);
+        button.disabled = styleState.pending || (delta !== 0 && !styleState.artists[index + delta]);
+        button.addEventListener("click", () => {
+          if (styleState.pending) return;
+          if (delta) swapStyleArtists(index, index + delta);
+          else removeStyleArtist(index);
+          renderCurrentStyleCombination();
+          list.querySelector("button:not(:disabled)")?.focus();
+        });
+        actions.append(button);
+      });
+      row.append(actions);
+    }
+    list.append(row);
+  });
+  if (!artists.length) list.textContent = isResult ? "이 생성 기록에 작가 정보가 없습니다." : "작가를 추가하거나 새 조합을 뽑아 주세요.";
+}
+
+function closeWorkspaceModal(id) {
+  styleElement(id)?.classList.add("hidden");
+  hidePromptTagAutocomplete();
+  const opener = workspaceModalOpeners.get(id);
+  if (opener?.isConnected) opener.focus({ preventScroll: true });
+  workspaceModalOpeners.delete(id);
+  updateWorkspaceSummaries();
+}
+
+function showGenerationRemote() {
+  styleState.generationRemoteClosed = false;
+  styleElement("generationRemote")?.classList.remove("hidden");
+  styleElement("openGenerationRemote")?.setAttribute("aria-expanded", "true");
+  restoreGenerationRemotePosition();
+  syncGenerationRemote();
+  requestAnimationFrame(clampGenerationRemotePosition);
+}
+
+function selectWorkspaceSettingsTab(name) {
+  document.querySelectorAll("[data-style-settings-tab]").forEach((button) => {
+    const selected = button.dataset.styleSettingsTab === name;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    styleElement(button.getAttribute("aria-controls"))?.classList.toggle("hidden", !selected);
+  });
+}
+
+function setupStyleWorkspace() {
+  document.addEventListener("change", updateWorkspaceSummaries);
+  const dialogs = {
+    openStyleAddArtist: "styleAddArtistModal", openStyleCombination: "styleCombinationModal",
+    openStyleCombinationResult: "styleCombinationModal", openPromptExtras: "stylePromptExtrasModal",
+    openGenerationParameters: "styleGenerationParametersModal", openSharedMix: "styleSharedMixModal",
+    openNovelAiUsage: "styleUsageModal",
+  };
+  Object.entries(dialogs).forEach(([button, modal]) => styleElement(button)?.addEventListener("click", () => openWorkspaceModal(modal, button === "openStyleCombinationResult" ? "result" : "preview")));
+  document.querySelectorAll("[data-close-workspace-modal]").forEach((button) => button.addEventListener("click", () => closeWorkspaceModal(button.dataset.closeWorkspaceModal)));
+  styleElement("closeStyleSettings")?.addEventListener("click", toggleStyleSettings);
+  styleElement("closeGenerationPanel")?.addEventListener("click", () => { setGenerationPanelCollapsed(true); styleElement("toggleGenerationPanel")?.focus(); });
+  styleElement("styleHistoryRail")?.addEventListener("click", () => toggleStyleHistory(true));
+  styleElement("openGenerationRemote")?.addEventListener("click", () => {
+    if (styleElement("generationRemote")?.classList.contains("hidden")) showGenerationRemote();
+    else {
+      styleState.generationRemoteClosed = true;
+      styleElement("generationRemote")?.classList.add("hidden");
+      styleElement("openGenerationRemote")?.setAttribute("aria-expanded", "false");
+    }
+  });
+  styleElement("showGenerationRemote")?.addEventListener("click", showGenerationRemote);
+  [["styleArtistCountDown", -1], ["styleArtistCountUp", 1]].forEach(([id, delta]) => {
+    styleElement(id)?.addEventListener("click", () => {
+      const input = styleElement("styleArtistCount");
+      if (!input || input.disabled || styleState.pending) return;
+      input.value = String(Math.max(1, Math.trunc(Number(input.value) || 1) + delta));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  });
+  document.querySelectorAll("[data-style-settings-tab]").forEach((button) => {
+    button.addEventListener("click", () => selectWorkspaceSettingsTab(button.dataset.styleSettingsTab));
+    button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const name = event.key === "Home" ? "artists" : event.key === "End" ? "weights" : button.dataset.styleSettingsTab === "artists" ? "weights" : "artists";
+      selectWorkspaceSettingsTab(name);
+      document.querySelector(`[data-style-settings-tab="${name}"]`)?.focus();
+    });
+  });
+  document.addEventListener("keydown", (event) => {
+    const modal = [...document.querySelectorAll(".workspace-modal:not(.hidden), #weightGraphModal:not(.hidden), #weightTableModal:not(.hidden), #ratingTagRulesModal:not(.hidden)")].at(-1);
+    if (!modal || !modal.contains(event.target)) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (modal.id === "weightGraphModal") closeWeightGraphModal();
+      else if (modal.id === "weightTableModal") closeWeightTableModal();
+      else if (modal.id === "ratingTagRulesModal") closeRatingTagRulesModal();
+      else closeWorkspaceModal(modal.id);
+    }
+    if (event.key !== "Tab") return;
+    const focusable = [...modal.querySelectorAll('button,input,select,textarea,a[href],[tabindex="0"]')].filter((el) => !el.disabled && el.getClientRects().length);
+    const first = focusable[0], last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  });
+  window.addEventListener("resize", () => {
+    clampGenerationRemotePosition();
+    if (!styleElement("weightGraphModal")?.classList.contains("hidden")) renderWeightProfileGraph(styleElement("weightGraph"));
+  });
+  if (window.innerWidth <= 760) {
+    styleElement("styleMakerLayout")?.classList.add("settings-collapsed");
+    styleElement("toggleStyleSettings")?.setAttribute("aria-expanded", "false");
+  }
+  restoreGenerationRemotePosition();
+  requestAnimationFrame(clampGenerationRemotePosition);
+  updateWorkspaceSummaries();
 }
 
 function setupGenerationRemoteDrag() {
@@ -7138,6 +7679,7 @@ function setupGenerationRemoteDrag() {
     remote.style.top = `${originTop + event.clientY - startY}px`;
     remote.style.right = "auto";
     remote.style.bottom = "auto";
+    clampGenerationRemotePosition();
   };
   handle.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || event.target.closest("button")) return;
@@ -7153,6 +7695,7 @@ function setupGenerationRemoteDrag() {
     event.preventDefault();
   });
   handle.addEventListener("keydown", (event) => {
+    if (event.target !== handle) return;
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
     const rect = remote.getBoundingClientRect();
     const delta = event.shiftKey ? 40 : 10;
@@ -7300,14 +7843,21 @@ function initializeStyleMaker() {
     persistAndRenderPromptControls();
   });
   styleElement("addPromptGroup")?.addEventListener("click", addPromptGroup);
+  styleElement("restoreAllExcludedPrompts")?.addEventListener("click", () => {
+    restoreExcludedPromptTags(styleState.excludedPromptTags.map((_, index) => index));
+    styleElement("excludedPromptTab")?.focus();
+  });
+  renderExcludedPromptTags();
   document.querySelectorAll("[data-prompt-tab]").forEach((button) => {
     button.addEventListener("click", () => selectPromptTab(button.dataset.promptTab));
     button.addEventListener("keydown", (event) => {
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
       event.preventDefault();
-      const next = button.dataset.promptTab === "base" ? "negative" : "base";
-      selectPromptTab(next);
-      styleElement(next === "base" ? "basePromptTab" : "negativePromptTab")?.focus();
+      const tabs = [...document.querySelectorAll("[data-prompt-tab]")];
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const next = tabs[(tabs.indexOf(button) + direction + tabs.length) % tabs.length];
+      selectPromptTab(next.dataset.promptTab);
+      next.focus();
     });
   });
   styleElement("togglePromptView")?.addEventListener("click", (event) => {
@@ -7422,7 +7972,7 @@ function initializeStyleMaker() {
     "sharedDependencyOtherRatio",
     "sharedDependencyArtistPolicy",
   ].forEach((id) => styleElement(id)?.addEventListener("change", () => {
-    savePromptDraft();
+    if (!sharedRangeBeforeRules || !["sharedStyleArtistMin", "sharedStyleArtistMax"].includes(id)) savePromptDraft();
     renderRatingTagRuleCountSummary();
     if (id === "sharedDependencyArtistPolicy") {
       styleState.sharedDependencyArtistPolicy = normalizeSharedDependencyArtistPolicy(styleElement(id)?.value);
@@ -7433,9 +7983,18 @@ function initializeStyleMaker() {
   styleElement("styleArtistCount")?.addEventListener("change", () => {
     renderWeightGraph();
     renderRatingTagRuleCountSummary();
+    savePromptDraft();
+  });
+  styleElement("styleFixedArtistsOnly")?.addEventListener("change", () => {
+    syncSharedDependencyControls();
+    savePromptDraft();
+    renderWeightGraph();
+    try { updateArtistPrompt(); } catch (error) { showStyleStatus(error.message, "error"); }
   });
   styleElement("openWeightGraph")?.addEventListener("click", openWeightGraphModal);
   styleElement("closeWeightGraph")?.addEventListener("click", closeWeightGraphModal);
+  styleElement("cancelWeightGraph")?.addEventListener("click", closeWeightGraphModal);
+  styleElement("applyWeightGraph")?.addEventListener("click", applyWeightGraphModal);
   document.querySelectorAll("[data-close-weight-graph]").forEach((item) => item.addEventListener("click", closeWeightGraphModal));
 
   const storedPrompts = loadPromptDraft();
@@ -7464,6 +8023,7 @@ function initializeStyleMaker() {
   styleState.artists = loadFixedStyleArtists();
   loadStyleArtists();
   renderQueueState();
+  updateWorkspaceSummaries();
 }
 
 if (typeof document !== "undefined") {
@@ -7556,7 +8116,7 @@ if (typeof document !== "undefined") {
   styleElement("comparisonResolution")?.addEventListener("change", (event) => { const [width, height] = event.target.value.split("x"); if (width && height) { styleElement("comparisonWidth").value = width; styleElement("comparisonHeight").value = height; } syncComparisonResolutionFields(); });
   styleElement("comparisonSeedMode")?.addEventListener("change", syncComparisonResolutionFields);
   styleElement("comparisonDefaultModel")?.addEventListener("change", () => syncComparisonComplexityControl());
-  styleElement("confirmedStyleModel")?.addEventListener("change", () => syncConfirmedComplexityControl());
+  styleElement("confirmedStyleModel")?.addEventListener("change", (event) => setConfirmedModelValue(event.target.value));
   bindPromptTagAutocomplete(styleElement("comparisonFixedPrompt"));
   styleElement("addComparisonCharacterPrompt")?.addEventListener("click", addComparisonCharacterPrompt);
   styleElement("createComparison")?.addEventListener("click", createComparison);
@@ -7675,6 +8235,8 @@ if (typeof document !== "undefined") {
   styleElement("closeGenerationRemote")?.addEventListener("click", () => {
     styleState.generationRemoteClosed = true;
     styleElement("generationRemote")?.classList.add("hidden");
+    styleElement("openGenerationRemote")?.setAttribute("aria-expanded", "false");
+    styleElement("openGenerationRemote")?.focus();
   });
   styleElement("remoteGenerateOne")?.addEventListener("click", () => generateOneRandomizedStyle().catch(() => {}));
   styleElement("remoteStartContinuous")?.addEventListener("click", runContinuousGeneration);
@@ -7688,10 +8250,16 @@ if (typeof document !== "undefined") {
     renderQueueState();
   });
   setupGenerationRemoteDrag();
+  setupStyleWorkspace();
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    readGenerationSettings,
+    isNovelAiMediumModel,
+    normalizeMediumGenerationSettings,
+    syncMediumControls,
+    syncGenerationMediumControls,
     STYLE_REQUEST_CONTROL_IDS,
     CUSTOM_RANGE_FIELDS,
     STYLE_FIXED_ARTISTS_STORAGE_KEY,
@@ -7749,6 +8317,7 @@ if (typeof module !== "undefined" && module.exports) {
     toggleSelectedStyleId,
     managerCombinedPromptText,
     confirmedGeneratedSourceValues,
+    setConfirmedParameterValue,
     normalizeConfirmedModelName,
     confirmedArtistPromptSignature,
     groupConfirmedImportItems,

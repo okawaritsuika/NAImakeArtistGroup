@@ -41,8 +41,8 @@ class SharedImagePackTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def build(self):
-        return build_archive(self.seed,[(self.seed,self.source_images)],self.root / 'pack',workers=1)
+    def build(self, **kwargs):
+        return build_archive(self.seed,[(self.seed,self.source_images)],self.root / 'pack',workers=1,**kwargs)
 
     def install(self, info):
         return archive_module.install_image_archive(
@@ -56,6 +56,7 @@ class SharedImagePackTest(unittest.TestCase):
         with closing(sqlite3.connect(self.local)) as db, db:
             db.execute("INSERT INTO arca_style_images(id,item_id,image_url,metadata_status,created_at) VALUES(31,20,?,'ok','now')",(self.url,))
         info = self.build()
+        self.assertEqual(info['filename'], 'NAImakeArtistGroup_shared_images_20260914_webp.zip')
         result = self.install(info)
         self.assertEqual(result, {'installed':1,'reused':0,'updated_rows':2,'skipped_rows':0})
         self.assertEqual(archive_module._missing_seed_images(self.local,self.images,self.seed),0)
@@ -67,6 +68,24 @@ class SharedImagePackTest(unittest.TestCase):
         self.assertTrue(representative.endswith('.webp'))
         self.assertEqual(hashlib.sha256((self.source_images/'original.png').read_bytes()).hexdigest(),before)
         self.assertEqual(self.install(info)['reused'],1)
+
+    def test_custom_archive_filename_and_digest_match_written_pack(self):
+        filename = 'NAImakeArtistGroup_shared_images_20261010_webp.zip'
+        info = self.build(filename=filename)
+        archive_bytes = (self.root / 'pack' / filename).read_bytes()
+        self.assertEqual(info['filename'], filename)
+        self.assertEqual(info['bytes'], len(archive_bytes))
+        self.assertEqual(info['sha256'], hashlib.sha256(archive_bytes).hexdigest())
+        self.assertEqual(json.loads((self.root / 'pack' / 'archive_info.json').read_text()), info)
+        self.assertEqual(self.install(info)['installed'], 1)
+
+    def test_archive_filename_rejects_paths_and_non_zip_before_writing(self):
+        for filename in ('../outside.zip', r'..\outside.zip', '/outside.zip',
+                         r'C:\outside.zip', 'C:outside.zip', 'nested/inside.zip',
+                         'archive.tar', '', '.zip'):
+            with self.subTest(filename=filename), self.assertRaisesRegex(ValueError, 'ZIP filename'):
+                self.build(filename=filename)
+        self.assertFalse((self.root / 'pack').exists())
 
     def test_modern_pack_rejects_newer_seed_with_uncovered_images(self):
         info = self.build()

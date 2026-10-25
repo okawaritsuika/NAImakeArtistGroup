@@ -32,6 +32,7 @@ from novelai_metadata import (
     extract_complexity,
     extract_prompt_parts as extract_structured_prompt_parts,
     model_filter_sql,
+    model_filter_value,
 )
 
 
@@ -65,7 +66,7 @@ UNSUPPORTED_IMAGE_TYPES = {
     ".tiff": "image/tiff",
 }
 SUPPORTED_ARCHIVE_IMAGE_TYPES = {"image/png", "image/webp"}
-MODEL_COLUMN_BACKFILL_REVISION = "model-columns-v1"
+MODEL_COLUMN_BACKFILL_REVISION = "model-columns-v3-v5-source-hashes"
 METADATA_VALIDATION_REVISION = "metadata-validation-v1"
 SEED_IMPORT_STATE_KEY = "arca_style_seed"
 
@@ -754,6 +755,12 @@ def _iso_date(value, name):
         raise ArcaCollectorError(f"{name} 형식은 YYYY-MM-DD여야 합니다.")
 
 
+def _webp_compression_enabled(value):
+    if type(value) is not bool:
+        raise ArcaCollectorError("WebP 압축 옵션은 체크 여부로 지정해 주세요.")
+    return value
+
+
 def normalize_collect_payload(payload, *, allow_empty_keyword=False):
     payload = payload if isinstance(payload, dict) else {}
     today = date.today()
@@ -777,7 +784,10 @@ def normalize_collect_payload(payload, *, allow_empty_keyword=False):
         keyword = str(raw_keyword or DEFAULT_KEYWORD).strip()
     if (not keyword and not allow_empty_keyword) or len(keyword) > 200:
         raise ArcaCollectorError("검색어를 확인해 주세요.")
-    return {"keyword": keyword, "tabs": tabs, "start_date": start.isoformat(), "end_date": end.isoformat(), "max_pages": max_pages, "max_posts": max_posts}
+    result = {"keyword": keyword, "tabs": tabs, "start_date": start.isoformat(), "end_date": end.isoformat(), "max_pages": max_pages, "max_posts": max_posts}
+    if _webp_compression_enabled(payload.get("webp_compress", False)):
+        result["webp_compress"] = True
+    return result
 
 
 def merge_date_intervals(intervals):
@@ -952,6 +962,8 @@ def resume_collection_job(db_path, image_dir, job_id, seed_db_path=None):
         return start_image_restore_job(db_path, image_dir)
     if job.get("job_type") == "image_url_refresh":
         return start_image_url_refresh_job(db_path, image_dir)
+    if job.get("job_type") == "stats_refresh":
+        return start_stats_refresh_job(db_path, model=_stats_refresh_model(job))
     if job.get("job_type") == "image_archive":
         from arca_image_archive import resume_archive_job
         return resume_archive_job(
@@ -961,6 +973,8 @@ def resume_collection_job(db_path, image_dir, job_id, seed_db_path=None):
         payload = json.loads(job["request_json"])
     except (TypeError, json.JSONDecodeError):
         raise ArcaCollectorError("이전 수집 조건을 읽지 못했습니다.")
+    if payload.get("source_url"):
+        return start_url_collection_job(db_path, image_dir, payload["source_url"], webp_compress=payload.get("webp_compress", False))
     return start_collection_job(db_path, image_dir, payload)
 
 
@@ -995,13 +1009,16 @@ def start_collection_job(db_path, image_dir, payload):
     return job_id
 
 
-def create_url_collection_job(db_path, source_url):
+def create_url_collection_job(db_path, source_url, *, webp_compress=False):
     canonical = normalize_arca_article_url(source_url)
+    payload = {"source_url": canonical}
+    if _webp_compression_enabled(webp_compress):
+        payload["webp_compress"] = True
     now = datetime.now().isoformat(timespec="seconds")
     with closing(_connect(db_path)) as conn, conn:
         return conn.execute(
             "INSERT INTO arca_collection_jobs(request_json,status,stage,total_pages,total_posts,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (json.dumps({"source_url": canonical}, ensure_ascii=False), "queued", "queued", 1, 1, now, now),
+            (json.dumps(payload, ensure_ascii=False), "queued", "queued", 1, 1, now, now),
         ).lastrowid
 
 
@@ -1041,7 +1058,8 @@ def _reusable_direct_item_id(db_path, image_dir, source_url):
     return item["id"] if any(_local_image_exists(image_dir, row["image_path"]) for row in rows) else None
 
 
-def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=None):
+def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=None, *, webp_compress=False):
+    webp_compress = _webp_compression_enabled(webp_compress)
     canonical = normalize_arca_article_url(source_url)
     init_arca_style_tables(db_path)
     reusable_item_id = _reusable_direct_item_id(db_path, image_dir, canonical)
@@ -1069,7 +1087,7 @@ def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=
     if job_id:
         update_collection_job(db_path, job_id, stage="downloading", scanned_pages=1, scanned_posts=1)
     summary = {"saved": 0, "updated": 0, "metadata_ok": 0, "no_metadata": 0, "items": []}
-    downloaded_count, item_id = _save_article(db_path, image_dir, session, article, summary)
+    downloaded_count, item_id = _save_article(db_path, image_dir, session, article, summary, **({"webp_compress": True} if webp_compress else {}))
     result = {
         "ok": True, "item_id": item_id, "saved": summary["saved"], "updated": summary["updated"],
         "downloaded_images": downloaded_count,
@@ -1083,17 +1101,17 @@ def collect_arca_style_url(db_path, image_dir, source_url, job_id=None, session=
     return result
 
 
-def _run_url_collection_job(db_path, image_dir, source_url, job_id):
+def _run_url_collection_job(db_path, image_dir, source_url, job_id, webp_compress=False):
     try:
-        collect_arca_style_url(db_path, image_dir, source_url, job_id=job_id)
+        collect_arca_style_url(db_path, image_dir, source_url, job_id=job_id, webp_compress=webp_compress)
     except Exception as exc:
         update_collection_job(db_path, job_id, status="failed", stage="failed", error=str(exc)[:1000])
 
 
-def start_url_collection_job(db_path, image_dir, source_url):
+def start_url_collection_job(db_path, image_dir, source_url, *, webp_compress=False):
     canonical = normalize_arca_article_url(source_url)
-    job_id = create_url_collection_job(db_path, canonical)
-    Thread(target=_run_url_collection_job, args=(db_path, image_dir, canonical, job_id), daemon=True).start()
+    job_id = create_url_collection_job(db_path, canonical, webp_compress=webp_compress)
+    Thread(target=_run_url_collection_job, args=(db_path, image_dir, canonical, job_id, webp_compress), daemon=True).start()
     return job_id
 
 
@@ -1287,6 +1305,244 @@ def start_image_url_refresh_job(db_path, image_dir):
     return job_id
 
 
+def _stats_refresh_model(job):
+    try:
+        payload = json.loads(job["request_json"])
+    except (TypeError, json.JSONDecodeError):
+        raise ArcaCollectorError("이전 갱신 조건을 읽지 못했습니다.")
+    if not isinstance(payload, dict):
+        raise ArcaCollectorError("이전 갱신 조건을 읽지 못했습니다.")
+    return payload.get("model", "all")
+
+
+def _stats_refresh_items(db_path, model="all"):
+    try:
+        model_clause, model_args = model_filter_sql(model, "image")
+    except ValueError as exc:
+        raise ArcaCollectorError(str(exc)) from exc
+    where = (
+        " WHERE EXISTS (SELECT 1 FROM arca_style_images image "
+        "WHERE image.item_id=arca_style_items.id AND " + model_clause + ")"
+        if model_clause else ""
+    )
+    with closing(_connect(db_path)) as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT id,source_url,board_tab FROM arca_style_items" + where + " ORDER BY id", model_args,
+        )]
+
+
+def _stats_refresh_searches(db_path, targets):
+    target_ids = {item["id"] for item in targets}
+    origins = defaultdict(set)
+    with closing(_connect(db_path)) as conn:
+        keywords = [row[0] for row in conn.execute("SELECT DISTINCT keyword FROM arca_collection_runs")]
+        for raw_keyword in keywords:
+            keyword = " ".join(str(raw_keyword or "").split())
+            if keyword == DEFAULT_KEYWORD or not any(char.isalnum() for char in keyword):
+                continue
+            # Start with matching runs so the (run_id,item_id) index avoids
+            # repeatedly scanning the complete collection history per item.
+            linked_ids = {row[0] for row in conn.execute(
+                "SELECT DISTINCT links.item_id FROM arca_collection_runs AS runs "
+                "CROSS JOIN arca_collection_run_items AS links ON links.run_id=runs.id "
+                "WHERE runs.keyword=?", (raw_keyword,),
+            )}
+            origins[keyword].update(linked_ids & target_ids)
+    origins = {keyword: ids for keyword, ids in origins.items() if ids}
+    default_words = set(DEFAULT_KEYWORD.casefold().split())
+    broader = [keyword for keyword in origins if set(keyword.casefold().split()) < default_words]
+    primary = min(broader, key=lambda keyword: (len(keyword.split()), keyword)) if broader else DEFAULT_KEYWORD
+    searches = [(primary, target_ids)]
+    searches.extend((keyword, ids) for keyword, ids in origins.items() if keyword != primary)
+    return searches
+
+
+def create_stats_refresh_job(db_path, model="all"):
+    try:
+        model = model_filter_value(model)
+    except ValueError as exc:
+        raise ArcaCollectorError(str(exc)) from exc
+    init_arca_style_tables(db_path)
+    items = _stats_refresh_items(db_path, model)
+    if any(item.get("board_tab") == "R18_NAI" for item in items):
+        if not get_arca_browser_session_status()["connected"]:
+            raise ArcaBrowserSessionRequired(
+                "R18 게시글의 조회수·추천수를 갱신하려면 먼저 Chrome 로그인을 연결해 주세요."
+            )
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect(db_path)) as conn, conn:
+        job_id = conn.execute(
+            "INSERT INTO arca_collection_jobs(request_json,job_type,status,stage,total_pages,total_posts,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (json.dumps({"mode": "stats_refresh", "model": model}), "stats_refresh", "queued", "queued", 0, len(items), now, now),
+        ).lastrowid
+    return job_id, items
+
+
+def refresh_arca_style_stats(db_path, job_id, items=None):
+    targets = list(items if items is not None else _stats_refresh_items(
+        db_path, _stats_refresh_model(get_collection_job(db_path, job_id)),
+    ))
+    update_collection_job(
+        db_path, job_id, status="running", stage="refreshing_stats",
+        total_pages=0, total_posts=len(targets), scanned_posts=0, updated=0,
+    )
+    if not targets:
+        update_collection_job(db_path, job_id, status="completed", stage="completed", skipped_existing=1)
+        return {"updated": 0, "failed_posts": 0, "skipped_existing": True}
+    targets_by_url = defaultdict(list)
+    for item in targets:
+        try:
+            targets_by_url[normalize_arca_article_url(item["source_url"])].append(item)
+        except ArcaCollectorError:
+            continue
+    pending_ids = {item["id"] for item in targets}
+    updated = scanned_pages = 0
+    started = time.monotonic()
+
+    def save_statistics(entries):
+        nonlocal updated
+        now = datetime.now().isoformat(timespec="seconds")
+        with closing(_connect(db_path)) as conn, conn:
+            for entry in entries:
+                recommendations, views = entry["recommendation_count"], entry["view_count"]
+                if recommendations is None and views is None:
+                    continue
+                for item in targets_by_url.get(entry["source_url"], ()):
+                    if item["id"] not in pending_ids:
+                        continue
+                    changed = conn.execute(
+                        "UPDATE arca_style_items SET recommendation_count=COALESCE(?,recommendation_count),"
+                        "view_count=COALESCE(?,view_count),updated_at=? WHERE id=? AND source_url=?",
+                        (recommendations, views, now, item["id"], item["source_url"]),
+                    ).rowcount
+                    updated += int(bool(changed))
+                    pending_ids.remove(item["id"])
+
+    def record_progress(stage):
+        processed = len(targets) - len(pending_ids)
+        update_collection_job(
+            db_path, job_id, stage=stage, scanned_pages=scanned_pages,
+            scanned_posts=processed, updated=updated,
+            average_post_seconds=(time.monotonic() - started) / processed if processed else None,
+        )
+
+    if targets_by_url:
+        searches = _stats_refresh_searches(db_path, targets)
+        session = create_arca_session()
+        if get_arca_browser_session_status()["connected"]:
+            _apply_imported_arca_cookies(session)
+        list_session = _clone_arca_session(session, use_retries=False)
+        session.close()
+        pacer = _RequestPacer(ARTICLE_REFRESH_INTERVAL_SECONDS)
+        denied_posts = 0
+
+        def fetch_statistics(url, stage):
+            nonlocal denied_posts
+
+            def fetch():
+                _wait_for_collection_control(db_path, job_id, stage)
+                return fetch_html(list_session, url)
+
+            try:
+                html = _with_transient_retries(fetch, pacer, transient_attempts=2, rate_limit_attempts=1)
+            except requests.RequestException as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status == 429:
+                    raise ArcaCollectorError(
+                        "아카라이브 요청 제한으로 갱신을 멈췄습니다. 잠시 후 다시 시도해 주세요. "
+                        "이미 갱신한 값은 저장되어 있습니다."
+                    ) from exc
+                if _is_transient_request_error(exc) or (status is not None and 500 <= status < 600):
+                    raise ArcaCollectorError(
+                        "아카라이브 연결이 불안정해 갱신을 멈췄습니다. 잠시 후 다시 시도해 주세요. "
+                        "이미 갱신한 값은 저장되어 있습니다."
+                    ) from exc
+                denied_posts = denied_posts + 1 if status in {401, 403} else 0
+                if denied_posts and (stage == "refreshing_stats" or denied_posts >= 3):
+                    raise ArcaCollectorError(
+                        "아카라이브 접근이 제한되어 갱신을 멈췄습니다. Chrome 로그인 연결을 확인해 주세요. "
+                        "이미 갱신한 값은 저장되어 있습니다."
+                    ) from exc
+                return None
+            denied_posts = 0
+            return html
+
+        try:
+            for keyword, search_ids in searches:
+                remaining_ids = search_ids & pending_ids
+                remaining_urls = [url for url, rows in targets_by_url.items()
+                                  if any(item["id"] in remaining_ids for item in rows)]
+                if not remaining_urls:
+                    continue
+                oldest_target = min(int(url.rsplit("/", 1)[-1]) for url in remaining_urls)
+                seen_pages = set()
+                for page in range(1, MAX_ARCHIVE_SEARCH_PAGE + 1):
+                    _wait_for_collection_control(db_path, job_id, "refreshing_stats")
+                    list_url = build_search_urls(keyword, [], page)[0]
+                    html = fetch_statistics(list_url, "refreshing_stats")
+                    if html is None:
+                        break
+                    scanned_pages += 1
+                    entries = extract_search_statistics(html)
+                    page_key = tuple(entry["source_url"] for entry in entries)
+                    _wait_for_collection_control(db_path, job_id, "refreshing_stats")
+                    if not entries or page_key in seen_pages:
+                        record_progress("refreshing_stats")
+                        break
+                    seen_pages.add(page_key)
+                    save_statistics(entries)
+                    record_progress("refreshing_stats")
+                    oldest_listed = min(int(entry["source_url"].rsplit("/", 1)[-1]) for entry in entries)
+                    if not (search_ids & pending_ids) or oldest_listed <= oldest_target:
+                        break
+
+            for source_url, rows in targets_by_url.items():
+                remaining_ids = {item["id"] for item in rows} & pending_ids
+                if not remaining_ids:
+                    continue
+                _wait_for_collection_control(db_path, job_id, "refreshing_stats_posts")
+                record_progress("refreshing_stats_posts")
+                html = fetch_statistics(source_url, "refreshing_stats_posts")
+                _wait_for_collection_control(db_path, job_id, "refreshing_stats_posts")
+                if html is not None:
+                    save_statistics([{"source_url": source_url, **extract_article_statistics(html)}])
+                pending_ids.difference_update(remaining_ids)
+                record_progress("refreshing_stats_posts")
+        finally:
+            list_session.close()
+    failed = len(targets) - updated
+    error = (
+        f"검색 목록과 개별 게시글에서 {failed}개 게시글의 조회수·추천수를 확인하지 못했습니다. 기존 값은 유지했습니다."
+        if failed else ""
+    )
+    update_collection_job(
+        db_path, job_id, status="completed", stage="completed",
+        scanned_pages=scanned_pages, scanned_posts=len(targets), updated=updated, error=error,
+    )
+    return {"updated": updated, "failed_posts": failed, "skipped_existing": False}
+
+
+def _run_stats_refresh_job(db_path, job_id, items):
+    try:
+        refresh_arca_style_stats(db_path, job_id, items)
+    except ArcaCollectionStopped as exc:
+        update_collection_job(db_path, job_id, status="stopped", stage="stopped", error=str(exc))
+    except ArcaCollectorError as exc:
+        update_collection_job(db_path, job_id, status="failed", stage="failed", error=str(exc))
+    except Exception:
+        update_collection_job(db_path, job_id, status="failed", stage="failed", error="조회수·추천수 갱신 중 오류가 발생했습니다.")
+    finally:
+        _remove_collection_control(job_id)
+
+
+def start_stats_refresh_job(db_path, model="all"):
+    job_id, items = create_stats_refresh_job(db_path, model=model)
+    _register_collection_control(job_id)
+    Thread(target=_run_stats_refresh_job, args=(db_path, job_id, items), daemon=True).start()
+    return job_id
+
+
 def get_image_restore_estimate(db_path, image_dir):
     """Estimate a one-time image restore from local samples without slow network probes."""
     init_arca_style_tables(db_path)
@@ -1474,8 +1730,21 @@ def start_image_restore_job(db_path, image_dir):
 
 def _get_completed_coverage_intervals(db_path, params):
     with closing(_connect(db_path)) as conn:
-        rows = conn.execute("SELECT start_date,end_date FROM arca_collection_runs WHERE keyword=? AND tabs=? AND max_pages=? AND max_posts=? AND search_scope=? AND status='completed'", (params["keyword"], _tabs_key(params["tabs"]), params["max_pages"], params["max_posts"], SEARCH_SCOPE)).fetchall()
-    return merge_date_intervals([(_iso_date(row[0], "start_date"), _iso_date(row[1], "end_date")) for row in rows])
+        rows = conn.execute("SELECT start_date,end_date,created_at FROM arca_collection_runs WHERE keyword=? AND tabs=? AND max_pages=? AND max_posts=? AND search_scope=? AND status='completed'", (params["keyword"], _tabs_key(params["tabs"]), params["max_pages"], params["max_posts"], SEARCH_SCOPE)).fetchall()
+    intervals = []
+    today = date.today()
+    for row in rows:
+        start, end = _iso_date(row[0], "start_date"), _iso_date(row[1], "end_date")
+        try:
+            collected_on = datetime.fromisoformat(row[2]).date()
+        except (TypeError, ValueError):
+            collected_on = today
+        # A day's later posts cannot be covered by a search started that day,
+        # even when the next collection happens after midnight.
+        end = min(end, min(collected_on, today) - timedelta(days=1))
+        if start <= end:
+            intervals.append((start, end))
+    return merge_date_intervals(intervals)
 
 
 def get_completed_coverage(db_path, params):
@@ -1525,6 +1794,8 @@ class _CategoryLinkParser(HTMLParser):
 
 
 class _SearchResultParser(HTMLParser):
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.current = None
@@ -1535,16 +1806,22 @@ class _SearchResultParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
         classes = set((attributes.get("class") or "").split())
-        if self.current is None:
-            if tag == "a" and {"vrow", "column"} <= classes and "notice" not in classes:
-                self.current = {"href": attributes.get("href", ""), "title": [], "badge": [], "posted_at": ""}
+        if tag == "a" and {"vrow", "column"} <= classes:
+            # A new row must never inherit fields from a malformed previous row.
+            self.current, self.depth, self.roles = None, 0, []
+            if "notice" not in classes:
+                self.current = {"href": attributes.get("href", ""), "title": [], "badge": [], "posted_at": "", "view_count": [], "recommendation_count": []}
                 self.depth = 1
                 self.roles = [None]
             return
-        if tag in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}:
+        if self.current is None or tag in self.VOID_TAGS:
             return
         self.depth += 1
         role = "title" if "title" in classes else ("badge" if "badge" in classes else None)
+        if "col-view" in classes:
+            role = "view_count"
+        elif "col-rate" in classes:
+            role = "recommendation_count"
         self.roles.append(role)
         if tag == "time" and attributes.get("datetime"):
             self.current["posted_at"] = attributes["datetime"][:10]
@@ -1556,8 +1833,14 @@ class _SearchResultParser(HTMLParser):
             self.current["title"].append(data)
         elif "badge" in self.roles:
             self.current["badge"].append(data)
+        elif "view_count" in self.roles:
+            self.current["view_count"].append(data)
+        elif "recommendation_count" in self.roles:
+            self.current["recommendation_count"].append(data)
 
     def handle_endtag(self, tag):
+        if tag in self.VOID_TAGS:
+            return
         if self.current is None:
             return
         if tag == "a" and self.depth == 1:
@@ -1671,6 +1954,26 @@ def extract_search_results(html, base_url=ARCA_BASE_URL, keyword=DEFAULT_KEYWORD
     return results
 
 
+def extract_search_statistics(html, base_url=ARCA_BASE_URL):
+    parser = _SearchResultParser()
+    parser.feed(html)
+    results, seen = [], set()
+    for raw in parser.results:
+        try:
+            source_url = normalize_arca_article_url(_safe_url(raw["href"], base_url))
+        except ArcaCollectorError:
+            continue
+        if source_url in seen:
+            continue
+        seen.add(source_url)
+        entry = {"source_url": source_url}
+        for field in ("view_count", "recommendation_count"):
+            value = "".join(raw[field]).strip()
+            entry[field] = int(value.replace(",", "")) if re.fullmatch(r"-?\d+(?:,\d{3})*", value) else None
+        results.append(entry)
+    return results
+
+
 def extract_image_candidates(html, article_url):
     parser = _HTMLScan(); parser.feed(html)
     return _image_candidates_from_tags(parser.tags, article_url)
@@ -1695,6 +1998,14 @@ def _image_candidates_from_tags(tags, article_url):
     return result
 
 
+def extract_article_statistics(html):
+    def article_stat(label):
+        match = re.search(rf'<span[^>]*class=["\'][^"\']*head[^"\']*["\'][^>]*>\s*{label}\s*</span>\s*<span[^>]*class=["\'][^"\']*body[^"\']*["\'][^>]*>([^<]*)</span>', html, re.I)
+        value = match.group(1).strip() if match else ""
+        return int(value.replace(",", "")) if re.fullmatch(r"-?\d+(?:,\d{3})*", value) else None
+    return {"recommendation_count": article_stat("추천"), "view_count": article_stat("조회수")}
+
+
 def extract_article_data(html, article_url):
     parser = _HTMLScan(); parser.feed(html)
     full_text = "\n".join(part.strip() for part in parser.text if part.strip())
@@ -1706,10 +2017,7 @@ def extract_article_data(html, article_url):
     date_match = re.search(r"(20\d{2}-\d{2}-\d{2})", full_text)
     tab = "R18_NAI" if "🔞 NAI" in full_text or "R18_NAI" in full_text else ("NAI" if re.search(r"\bNAI\b", full_text) else "")
     image_urls = _image_candidates_from_tags(content.tags, article_url) if content.found else extract_image_candidates(html, article_url)
-    def article_stat(label):
-        match = re.search(rf'<span[^>]*class=["\'][^"\']*head[^"\']*["\'][^>]*>\s*{label}\s*</span>\s*<span[^>]*class=["\'][^"\']*body[^"\']*["\'][^>]*>\s*([\d,]+)', html, re.I)
-        return int(match.group(1).replace(",", "")) if match else None
-    return {"source_url": article_url, "article_id": article_url.rstrip("/").split("/")[-1], "title": title, "posted_at": date_match.group(1) if date_match else "", "board_tab": tab, "author": "", "body_text": text, "image_urls": image_urls, "recommendation_count": article_stat("추천"), "view_count": article_stat("조회수")}
+    return {"source_url": article_url, "article_id": article_url.rstrip("/").split("/")[-1], "title": title, "posted_at": date_match.group(1) if date_match else "", "board_tab": tab, "author": "", "body_text": text, "image_urls": image_urls, **extract_article_statistics(html)}
 
 
 def extract_png_text_chunks(data):
@@ -1897,20 +2205,21 @@ def _extract_prompt_parts(values):
 def _extract_quality_options(values):
     """Read only NovelAI's wire keys, with strict scalar types.
 
-    ``qualityToggle`` and ``ucPreset`` are shared by the V4.5/V5 metadata
+    ``qualityToggle``/``ucPreset`` and newer ``tag_hint_*`` keys identify
+    the quality and negative presets in the V4.5/V5 metadata
     payloads.  They are optional, so malformed or absent values stay ``None``
     instead of being inferred from prompt text or silently defaulted.
     """
     if not isinstance(values, dict):
         return None, None
-    quality_value = values.get("qualityToggle") if "qualityToggle" in values else None
+    quality_value = values.get("qualityToggle", values.get("tag_hint_qt"))
     if isinstance(quality_value, bool):
         quality_toggle = quality_value
     elif type(quality_value) is int and quality_value in (0, 1):
         quality_toggle = bool(quality_value)
     else:
         quality_toggle = None
-    uc_value = values.get("ucPreset") if "ucPreset" in values else None
+    uc_value = values.get("ucPreset", values.get("tag_hint_uc_preset"))
     uc_preset = uc_value if type(uc_value) is int and 0 <= uc_value <= 4 else None
     return quality_toggle, uc_preset
 
@@ -1962,7 +2271,7 @@ def extract_novelai_metadata(image_bytes, content_type=""):
     model_fields = classify_model(raw_model)
     complexity = extract_complexity(prompt, model_fields["model_family"])
     quality_toggle, uc_preset = _extract_quality_options(values)
-    base.update({"metadata_status": "ok", "prompt": str(prompt), "base_prompt": str(prompt), "negative_prompt": str(negative), "character_prompts": characters, "seed": str(pick("seed")), "sampler": str(pick("sampler")), "steps": pick("steps") or None, "scale": pick("scale") or None, "cfg_rescale": pick("cfg_rescale") or None, "noise_schedule": str(pick("noise_schedule")), "model": raw_model, "model_id": model_fields["model_id"], "model_family": model_fields["model_family"], "model_generation": model_fields["model_generation"], "model_variant": model_fields["model_variant"], "complexity": complexity, "quality_toggle": quality_toggle, "uc_preset": uc_preset, "width": pick("width") or None, "height": pick("height") or None, "variety_plus": bool(skip_cfg) if has_variety else None, "skip_cfg_above_sigma": skip_cfg, "raw_metadata_json": json.dumps(values, ensure_ascii=False)})
+    base.update({"metadata_status": "ok", "prompt": str(prompt), "base_prompt": str(prompt), "negative_prompt": str(negative), "character_prompts": characters, "seed": str(pick("seed")), "sampler": str(pick("sampler")), "steps": pick("steps") or None, "scale": pick("scale") if pick("scale") != "" else None, "cfg_rescale": pick("cfg_rescale") if pick("cfg_rescale") != "" else None, "noise_schedule": str(pick("noise_schedule")), "model": raw_model, "model_id": model_fields["model_id"], "model_family": model_fields["model_family"], "model_generation": model_fields["model_generation"], "model_variant": model_fields["model_variant"], "complexity": complexity, "quality_toggle": quality_toggle, "uc_preset": uc_preset, "width": pick("width") or None, "height": pick("height") or None, "variety_plus": bool(skip_cfg) if has_variety else None, "skip_cfg_above_sigma": skip_cfg, "raw_metadata_json": json.dumps(values, ensure_ascii=False)})
     return base
 
 
@@ -2459,7 +2768,9 @@ def _is_transient_request_error(exc):
     return status in {429, 500, 502, 503, 504} or status is None
 
 
-def _with_transient_retries(operation, pacer):
+def _with_transient_retries(operation, pacer, *, transient_attempts=None, rate_limit_attempts=None):
+    transient_limit = TRANSIENT_REQUEST_ATTEMPTS if transient_attempts is None else transient_attempts
+    rate_limit = RATE_LIMIT_REQUEST_ATTEMPTS if rate_limit_attempts is None else rate_limit_attempts
     attempt = 0
     while True:
         pacer.wait()
@@ -2468,7 +2779,7 @@ def _with_transient_retries(operation, pacer):
         except requests.RequestException as exc:
             response = getattr(exc, "response", None)
             status = getattr(response, "status_code", None)
-            limit = RATE_LIMIT_REQUEST_ATTEMPTS if status == 429 else TRANSIENT_REQUEST_ATTEMPTS
+            limit = rate_limit if status == 429 else transient_limit
             if not _is_transient_request_error(exc) or attempt + 1 >= limit:
                 raise
             delay = TRANSIENT_RETRY_DELAYS[min(attempt, len(TRANSIENT_RETRY_DELAYS) - 1)]
@@ -3661,7 +3972,7 @@ def collect_arca_styles(
                     summary["skipped"] += 1
                     continue
                 _wait_for_collection_control(db_path, job_id, "downloading")
-                downloaded_count, _ = _save_article(db_path, image_dir, session, article, summary, run_id=run_id)
+                downloaded_count, _ = _save_article(db_path, image_dir, session, article, summary, run_id=run_id, **({"webp_compress": True} if params.get("webp_compress") else {}))
                 if job_id:
                     previous = get_collection_job(db_path, job_id)
                     elapsed = max(fetch_seconds + time.monotonic() - post_started, 0.001)
@@ -3701,7 +4012,7 @@ def collect_arca_styles(
     return summary
 
 
-def _save_article(db_path, image_dir, session, article, summary, run_id=None):
+def _save_article(db_path, image_dir, session, article, summary, run_id=None, *, webp_compress=False):
     image_root = Path(image_dir).resolve()
     with closing(_connect(db_path)) as conn:
         rows = conn.execute(
@@ -3761,6 +4072,14 @@ def _save_article(db_path, image_dir, session, article, summary, run_id=None):
             if data is None:
                 return image_url, None, content_type, extract_novelai_metadata(b"")
             meta = extract_novelai_metadata(data, content_type)
+            if webp_compress and meta["metadata_status"] == "ok" and content_type != "image/webp":
+                from shared_style_webp import verified_webp
+                try:
+                    encoded = verified_webp(data, quality=90)
+                except (ValueError, OSError):
+                    pass  # Keep original bytes when metadata-preserving conversion fails.
+                else:
+                    data, content_type = encoded, "image/webp"
             return image_url, data if meta["metadata_status"] == "ok" else None, content_type, meta
         except (requests.RequestException, ArcaCollectorError, zlib.error):
             return None

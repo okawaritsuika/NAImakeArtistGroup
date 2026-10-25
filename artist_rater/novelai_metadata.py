@@ -8,16 +8,18 @@ metadata.
 
 import re
 
-from model_definitions import MODEL_DEFINITIONS
+from model_definitions import MODEL_ALIASES, MODEL_DEFINITIONS
 
 
 MODEL_IDS = (
+    "nai-diffusion-5-full-medium",
     "nai-diffusion-5-full",
     "nai-diffusion-5-curated",
     "nai-diffusion-4-5-full",
     "nai-diffusion-4-5-curated",
 )
-KNOWN_MODEL_IDS = tuple(MODEL_DEFINITIONS)
+KNOWN_MODEL_IDS = tuple(sorted(MODEL_DEFINITIONS, key=len, reverse=True))
+KNOWN_MODEL_ALIASES = {alias.casefold(): model_id for alias, model_id in MODEL_ALIASES.items()}
 UNKNOWN_MODEL_ID = ""
 UNKNOWN_MODEL_FAMILY = "unknown"
 UNKNOWN_MODEL_VARIANT = "unknown"
@@ -35,8 +37,8 @@ def classify_model(value):
 
     Exact NovelAI model ids are preferred.  Older exported images sometimes
     contain a source string such as ``NovelAI Diffusion V4.5 <hash>``.  That
-    proves the generation family but does not prove Full versus Curated, so the
-    variant is deliberately left ``unknown`` instead of guessed.
+    proves the generation family but does not prove the variant unless the
+    exact source hash is mapped by the official NovelAI client.
     """
     raw = _clean_model_text(value)
     folded = raw.casefold()
@@ -52,8 +54,9 @@ def classify_model(value):
 
     # Canonical ids may be embedded in a server response/source string, but
     # only an actual model value reaches this function.
+    canonical = KNOWN_MODEL_ALIASES.get(folded, folded)
     for model_id in KNOWN_MODEL_IDS:
-        if re.search(r"(?<![a-z0-9])" + re.escape(model_id) + r"(?![a-z0-9])", folded):
+        if canonical == model_id or re.search(r"(?<![a-z0-9_-])" + re.escape(model_id) + r"(?![a-z0-9_-])", folded):
             definition = MODEL_DEFINITIONS[model_id]
             generation = str(definition.generation or "").casefold()
             family = generation if generation in {"v5", "v4.5", "v4", "v3"} else "unknown"
@@ -75,6 +78,8 @@ def classify_model(value):
         return result
     if re.search(r"(?:^|[\s._-])curated(?:$|[\s._-])", folded):
         variant = "curated"
+    elif family == "v5" and re.search(r"(?:^|[\s._-])full[\s._-]+medium(?:$|[\s._-])", folded):
+        variant = "full-medium"
     elif re.search(r"(?:^|[\s._-])full(?:$|[\s._-])", folded):
         variant = "full"
     else:
@@ -105,6 +110,7 @@ def model_filter_value(value):
         "v5": "v5", "5": "v5", "v4.5": "v4.5", "v4-5": "v4.5", "4.5": "v4.5",
         "unknown": "unknown", "none": "unknown",
         "v5-full": "nai-diffusion-5-full", "v5-curated": "nai-diffusion-5-curated",
+        "v5-full-medium": "nai-diffusion-5-full-medium", "v5 full medium": "nai-diffusion-5-full-medium",
         "v4.5-full": "nai-diffusion-4-5-full", "v4.5-curated": "nai-diffusion-4-5-curated",
         "v4-5-full": "nai-diffusion-4-5-full", "v4-5-curated": "nai-diffusion-4-5-curated",
         "v5 full": "nai-diffusion-5-full", "v5 curated": "nai-diffusion-5-curated",

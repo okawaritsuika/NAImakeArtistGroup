@@ -27,16 +27,16 @@ from arca_style_collector import (
 )
 
 
-ARCHIVE_FILENAME = "NAImakeArtistGroup_shared_images_20260914_webp.zip"
+ARCHIVE_FILENAME = "NAImakeArtistGroup_shared_images_20261024_webp.zip"
 ARCHIVE_DOWNLOAD_URL = (
-    "https://huggingface.co/datasets/okawaritsuika/nai-shared-styles/resolve/30a53b41204e9cfd8ef73cc4276f53402911f11c/"
+    "https://huggingface.co/datasets/okawaritsuika/nai-shared-styles/resolve/fb08d21298d0176592d2292c08c33791c5470f16/"
     + ARCHIVE_FILENAME + "?download=true"
 )
-ARCHIVE_BYTES = 566_181_633
-ARCHIVE_SHA256 = "0ae1fc6211013c9372361147e3c3abe77e852b86b2a2951e2f02cf3e865cce46"
-ARCHIVE_IMAGE_COUNT = 3_617
-ARCHIVE_IMAGE_BYTES = 563_876_948
-ARCHIVE_SEED_SHA256 = "424dfa55e32897047a4fed1f1ef3768087ca828139498ffc7dfb3a8d2aeaa826"
+ARCHIVE_BYTES = 693_983_676
+ARCHIVE_SHA256 = "212398f7be51a8ca945b332af162b0f53c24dec436384288ddd01d668191c7b3"
+ARCHIVE_IMAGE_COUNT = 4_425
+ARCHIVE_IMAGE_BYTES = 691_163_540
+ARCHIVE_SEED_SHA256 = "24bb6a2a76def6602441ebe5f4c0cc16a9e83a8af278a7b8314d159a87efc022"
 ARCHIVE_FORMAT = "naimakeartistgroup-shared-images"
 DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024
 LOCAL_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024

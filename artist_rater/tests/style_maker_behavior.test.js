@@ -5,6 +5,96 @@ const test = require("node:test");
 
 const styleMakerSource = fs.readFileSync(path.join(__dirname, "../static/style_maker.js"), "utf8");
 
+test("confirmed setting menus preserve imported values and clear stale custom choices", () => {
+  const { setConfirmedParameterValue } = require("../static/style_maker.js");
+  const previous = global.document;
+  const fields = {};
+  for (const [id, known] of [["confirmedStyleSampler", "k_euler_ancestral"], ["confirmedStyleScheduler", "karras"]]) {
+    fields[id] = {
+      options: [{ value: "", dataset: {} }, { value: known, dataset: {} }],
+      append(option) {
+        option.remove = () => { this.options = this.options.filter((entry) => entry !== option); };
+        this.options.push(option);
+      },
+      set value(value) { this.selected = this.options.find((option) => option.value === value)?.value || ""; },
+      get value() { return this.selected; },
+    };
+  }
+  global.document = { getElementById: (id) => fields[id], createElement: () => ({ dataset: {} }) };
+  try {
+    for (const [id, field] of Object.entries(fields)) {
+      const known = field.options[1].value;
+      const imported = "legacy_<setting>";
+      setConfirmedParameterValue(id, imported);
+      assert.equal(field.value, imported);
+      assert.equal(field.options[2].textContent, `기존 값: ${imported}`);
+      setConfirmedParameterValue(id, imported);
+      assert.equal(field.options.length, 3);
+      setConfirmedParameterValue(id, known);
+      assert.equal(field.value, known);
+      assert.equal(field.options.length, 2);
+      setConfirmedParameterValue(id, imported);
+      setConfirmedParameterValue(id, null);
+      assert.equal(field.value, "");
+      assert.equal(field.options.length, 2);
+      setConfirmedParameterValue(id, imported);
+      assert.equal(field.value, imported);
+    }
+  } finally {
+    if (previous === undefined) delete global.document;
+    else global.document = previous;
+  }
+});
+
+test("V5 Medium retains its model through metadata aliases and saved generation settings", () => {
+  const { normalizeNovelAiModel, normalizeMediumGenerationSettings, novelAiModelDefinition, novelAiModelFilterMatches } = require("../static/style_maker.js");
+  const model = "nai-diffusion-5-full-medium";
+  for (const alias of [model, "V5 Full Medium", "NovelAI Diffusion V5 Full Medium", "NovelAI Diffusion V5 70AB5786", "NovelAI Diffusion V5 93F4BD30"]) {
+    assert.equal(normalizeNovelAiModel(alias), model);
+  }
+  assert.equal(novelAiModelDefinition(model).maxCharacterPrompts, 22);
+  assert.equal(novelAiModelFilterMatches(model, "v5"), true);
+  assert.equal(novelAiModelFilterMatches(model, "nai-diffusion-5-full"), false);
+  const high = { model: "nai-diffusion-5-full", base_prompt: "test scene", character_prompts: ["test character"], negative_prompt: "custom negative", scale: 4.5, steps: 28, sampler: "k_euler", noise_schedule: "native", cfg_rescale: 0.6, variety_plus: true, uc_preset: 1, seed: 42 };
+  const medium = normalizeMediumGenerationSettings({ ...high, model });
+  assert.deepEqual(medium, { ...high, model, negative_prompt: "", steps: 14, sampler: "k_euler_ancestral", noise_schedule: "karras", cfg_rescale: 0, variety_plus: false, uc_preset: 2 });
+  assert.deepEqual(normalizeMediumGenerationSettings(high), high);
+});
+
+test("Medium locks fixed controls and restores High values without locking Guidance or positive prompts", () => {
+  const { syncGenerationMediumControls, readGenerationSettings } = require("../static/style_maker.js");
+  const previous = global.document;
+  const fields = {
+    generationSteps: { value: "28" }, generationSampler: { value: "k_euler" }, generationScheduler: { value: "native" },
+    generationCfgRescale: { value: "0.6" }, generationCfgRescaleRange: { value: "0.6" },
+    generationVarietyPlus: { type: "checkbox", checked: true }, negativePrompt: { value: "saved negative" },
+    generationScale: { value: "4.5" }, basePrompt: { value: "scene" },
+  };
+  Object.values(fields).forEach((field) => { field.disabled = false; });
+  global.document = { getElementById: (id) => fields[id], querySelectorAll: () => [] };
+  try {
+    syncGenerationMediumControls("nai-diffusion-5-full-medium");
+    syncGenerationMediumControls("nai-diffusion-5-full-medium");
+    assert.equal(fields.generationSteps.value, 14);
+    assert.equal(fields.generationSteps.disabled, true);
+    assert.equal(fields.negativePrompt.disabled, true);
+    assert.equal(fields.negativePrompt.value, "saved negative");
+    assert.equal(fields.generationVarietyPlus.checked, false);
+    assert.equal(fields.generationScale.disabled, false);
+    assert.equal(fields.basePrompt.disabled, false);
+    assert.equal(readGenerationSettings().steps, 28);
+    assert.equal(readGenerationSettings().cfg_rescale, 0.6);
+    assert.equal(readGenerationSettings().variety_plus, true);
+    syncGenerationMediumControls("nai-diffusion-5-full");
+    assert.equal(fields.generationSteps.value, "28");
+    assert.equal(fields.generationSampler.value, "k_euler");
+    assert.equal(fields.generationCfgRescale.value, "0.6");
+    assert.equal(fields.generationVarietyPlus.checked, true);
+    assert.equal(fields.negativePrompt.disabled, false);
+    assert.equal(fields.negativePrompt.value, "saved negative");
+  } finally { if (previous === undefined) delete global.document; else global.document = previous; }
+});
+
 const {
   CUSTOM_RANGE_FIELDS,
   STYLE_FIXED_ARTISTS_STORAGE_KEY,
@@ -797,6 +887,25 @@ test("prompt autocomplete exposes a reusable global API and category-aware query
   assert.ok(styleMakerSource.includes("/^\\{\\{\\s*artist\\s*\\}\\}$/i"));
 });
 
+test("closing prompt autocomplete cancels an input debounce before it can reopen suggestions", (t) => {
+  const pending = new Map();
+  let timerId = 0;
+  t.mock.method(globalThis, "setTimeout", (callback) => { pending.set(++timerId, callback); return timerId; });
+  t.mock.method(globalThis, "clearTimeout", (id) => pending.delete(id));
+  const listeners = {};
+  const box = { id: "worldcup-tags-autocomplete", setAttribute() {} };
+  const input = {
+    dataset: {}, closest: () => ({ querySelector: () => box }),
+    setAttribute() {}, getAttribute() { return null; },
+    addEventListener(name, listener) { listeners[name] = listener; },
+  };
+  bindPromptTagAutocomplete(input);
+  listeners.input();
+  assert.equal(pending.size, 1);
+  hidePromptTagAutocomplete();
+  assert.equal(pending.size, 0);
+});
+
 test("prompt storage preserves generation settings from the website", () => {
   const stored = promptStoragePayload(
     "base",
@@ -890,6 +999,29 @@ test("manual style artist entry accepts weighted NovelAI artist prompt lists", (
   assert.equal(chooseArtistsForPrompt(insertStyleArtistsAtPosition([], entries, { position: 1 })).length, 7);
 });
 
+test("manual artist entry preserves mixed prefixed and unprefixed names and weights", () => {
+  const entries = parseStyleArtistEntries(
+    "0.7::hiten (hitenkei)::, 0.71::artist:wagashi, 0.6::as109 ::, 0.9::anmi ::, 0.7::torino aqua ::, artist:maron maron",
+  );
+  assert.deepEqual(entries, [
+    { artist: "hiten (hitenkei)", weight: 0.7 },
+    { artist: "wagashi", weight: 0.71 },
+    { artist: "as109", weight: 0.6 },
+    { artist: "anmi", weight: 0.9 },
+    { artist: "torino aqua", weight: 0.7 },
+    { artist: "maron maron" },
+  ]);
+  assert.deepEqual(
+    insertStyleArtistsAtPosition([], entries, { position: 1, weight: 1 })
+      .map(({ artist, weight }) => ({ artist, weight })),
+    entries.map((entry) => ({ weight: 1, ...entry })),
+  );
+  assert.deepEqual(
+    parseStyleArtistEntries("plain; 0.5::alpha, artist:beta:: artist:tail\nalpha"),
+    [{ artist: "plain" }, { artist: "alpha", weight: 0.5 }, { artist: "beta", weight: 0.5 }, { artist: "tail" }],
+  );
+});
+
 test("prompt preset detail shows edited quality followed by every excluded tag", () => {
   assert.equal(
     promptPresetFullText({
@@ -940,6 +1072,70 @@ test("manual style artists insert at a one-based prompt position", () => {
     { artist: "last", weight: 2.0 },
   ]);
   assert.deepEqual(current.map((item) => item.artist), ["first", "last"]);
+});
+
+test("fixed-only mode keeps excess candidates and samples only the requested fixed artists", () => {
+  const pool = [
+    { artist: "alpha", weight: 0.7, fixed: true, slot: 1 },
+    { artist: "beta", weight: 0.8, fixed: true, slot: 1 },
+    { artist: "gamma", weight: 0.9, fixed: true, slot: 3 },
+    { artist: "rated", weight: 1 },
+  ];
+  const before = JSON.stringify(pool);
+  assert.equal(limitArtistsToTotalCount(pool, 2, true).length, 3);
+  const first = chooseArtistsForPrompt(pool, () => 0, { fixedOnly: true, count: 2 });
+  const last = chooseArtistsForPrompt(pool, () => 0.999, { fixedOnly: true, count: 2 });
+  assert.deepEqual(first.map((item) => item.artist), ["alpha", "beta"]);
+  assert.deepEqual(last.map((item) => item.artist), ["alpha", "gamma"]);
+  assert.deepEqual(first.map((item) => item.weight), [0.7, 0.8]);
+  assert.equal(JSON.stringify(pool), before);
+  assert.equal(chooseArtistsForPrompt(pool, () => 0, { fixedOnly: true, count: 4 }).length, 3);
+  assert.throws(() => limitArtistsToTotalCount(pool, 2), /고정 작가/);
+});
+
+test("fixed-only rerolls keep the candidate pool, bypass other sources, and validate shortages", async () => {
+  const vm = require("node:vm");
+  const context = vm.createContext({ module: { exports: {} } });
+  vm.runInContext(styleMakerSource, context);
+  await vm.runInContext(`(async () => {
+    const fields = {
+      styleFixedArtistsOnly: { checked: true }, styleArtistCount: { value: "2" },
+      styleMinWeight: { value: "0.1" }, styleMaxWeight: { value: "2.3" },
+      weightMode: { value: "shared_dependency" },
+      sharedStyleArtistMin: { value: "10" }, sharedStyleArtistMax: { value: "1" },
+      styleMakerStatus: {}, styleSettingsError: {},
+    };
+    globalThis.document = { getElementById: (id) => fields[id] || null, querySelectorAll: () => [] };
+    globalThis.calls = 0;
+    apiFetch = () => { throw new Error("Unexpected external source request"); };
+    renderWeightGraph = () => {};
+    updateArtistPrompt = () => { globalThis.calls += 1; };
+    styleState.artists = ["alpha", "beta", "gamma"].map((artist) => ({ artist, weight: 1, fixed: true }));
+    globalThis.success = await loadStyleArtists("all");
+    globalThis.remaining = styleState.artists.length;
+    globalThis.options = readStyleOptions();
+    fields.styleArtistCount.value = "4";
+    globalThis.shortage = await loadStyleArtists("all");
+    globalThis.errorMessage = fields.styleMakerStatus.textContent;
+    globalThis.stored = readGenerationSettings();
+    fields.styleArtistCount.value = "1";
+    fields.styleFixedArtistsOnly.checked = false;
+    // Isolate settings restoration from unrelated UI rendering.
+    syncGenerationMediumControls = () => {};
+    renderRatingTagRulesSummary = () => {};
+    setRandomTargets = () => {};
+    syncSharedDependencyControls = () => {};
+    applyGenerationSettings(globalThis.stored);
+    globalThis.restored = fields.styleFixedArtistsOnly.checked && fields.styleArtistCount.value === "4";
+  })()`, context);
+  assert.equal(context.success, true);
+  assert.equal(context.calls, 1);
+  assert.equal(context.remaining, 3);
+  assert.equal(context.options.count, 2);
+  assert.equal(context.shortage, false);
+  assert.match(context.errorMessage, /후보/);
+  assert.equal(context.stored.fixed_artists_only, true);
+  assert.equal(context.restored, true);
 });
 
 test("manual artists with the same slot stack and choose one prompt candidate", () => {
@@ -1506,4 +1702,198 @@ test("only the latest style request can mutate state or clear pending controls",
   assert.deepEqual(pending, [true, true, false]);
   assert.equal(requestState.requestToken, 2);
   assert.equal(requestState.pending, false);
+});
+
+test("shared-range modal draft cannot leak into continuous generation or saved settings", () => {
+  const vm = require("node:vm");
+  const context = vm.createContext({ module: { exports: {} } });
+  vm.runInContext(styleMakerSource, context);
+  vm.runInContext(`
+    const fields = {
+      styleArtistCount: { value: "20" }, weightMode: { value: "balanced" },
+      styleMinWeight: { value: "0.1" }, styleMaxWeight: { value: "2.3" },
+      sharedStyleArtistMin: { value: "1" }, sharedStyleArtistMax: { value: "2" },
+      ratingTagRulesModal: { classList: { add() {}, remove() {} } },
+      ratingTagRulesStatus: {},
+    };
+    globalThis.document = { getElementById: id => fields[id] || null, querySelectorAll: () => [] };
+    renderRatingTagRuleRows = () => {}; renderRatingTagExclusionRows = () => {};
+    renderRatingTagRulesSummary = () => {}; hidePromptTagAutocomplete = () => {};
+    savePromptDraft = () => { globalThis.saved = readGenerationSettings(); };
+    openRatingTagRulesModal();
+    fields.sharedStyleArtistMin.value = "7";
+    fields.sharedStyleArtistMax.value = "3";
+    globalThis.during = readStyleOptions();
+    globalThis.storedDuring = readGenerationSettings();
+    closeRatingTagRulesModal();
+    globalThis.afterCancel = readStyleOptions();
+    globalThis.cancelledFields = [fields.sharedStyleArtistMin.value, fields.sharedStyleArtistMax.value];
+    openRatingTagRulesModal();
+    fields.sharedStyleArtistMin.value = "3";
+    fields.sharedStyleArtistMax.value = "4";
+    styleState.ratingTagRuleDraft = [];
+    saveRatingTagRules();
+    globalThis.afterApply = readStyleOptions();
+  `, context);
+  assert.equal(context.during.shared_artist_min, 1);
+  assert.equal(context.during.shared_artist_max, 2);
+  assert.equal(context.storedDuring.shared_artist_min, 1);
+  assert.equal(context.storedDuring.shared_artist_max, 2);
+  assert.deepEqual(Array.from(context.cancelledFields), ["1", "2"]);
+  assert.equal(context.afterCancel.shared_artist_min, 1);
+  assert.equal(context.afterApply.shared_artist_min, 3);
+  assert.equal(context.afterApply.shared_artist_max, 4);
+  assert.equal(context.saved.shared_artist_min, 3);
+  assert.equal(context.saved.shared_artist_max, 4);
+});
+
+function styleWorkspaceSession() {
+  const vm = require("node:vm");
+  const context = vm.createContext({});
+  vm.runInContext(styleMakerSource, context);
+  const element = () => {
+    const classes = new Set();
+    return {
+      children: [], dataset: {}, attributes: {}, value: "", textContent: "", className: "",
+      classList: {
+        add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name),
+        toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+      },
+      append(...items) { this.children.push(...items); },
+      replaceChildren(...items) { this.children = items; },
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
+    };
+  };
+  const fields = Object.fromEntries([
+    "styleFixedArtistsOnly", "styleArtistCount", "styleMinWeight", "styleMaxWeight", "weightMode",
+    "styleCombinationModal", "styleCurrentCombination", "styleCombinationSummary", "styleCombinationCandidates",
+    "styleCombinationCandidatesSummary", "artistPromptPreview", "basePrompt", "negativePrompt", "fixedPrompt",
+    "leadingPrompt", "excludedPromptTags", "excludedPromptTagList", "excludedPromptCount", "restoreAllExcludedPrompts",
+    "excludedPromptTab", "promptPresetStatus", "styleMakerHistory",
+  ].map(id => [id, element()]));
+  fields.styleFixedArtistsOnly.checked = true;
+  fields.styleArtistCount.value = "10";
+  fields.styleMinWeight.value = "0.1";
+  fields.styleMaxWeight.value = "2.3";
+  fields.weightMode.value = "balanced";
+  fields.styleCombinationModal.classList.add("hidden");
+  fields.styleMakerHistory.classList.add("history-collapsed");
+  context.document = { getElementById: id => fields[id] || null, createElement: element, querySelectorAll: () => [], activeElement: null };
+  const saved = new Map();
+  context.localStorage = { setItem: (key, value) => saved.set(key, value), getItem: key => saved.get(key) || null };
+  const api = vm.runInContext(`({
+    state: styleState, update: updateArtistPrompt, open: openWorkspaceModal, render: renderCurrentStyleCombination,
+    history: renderStyleHistorySelection, result: renderGenerationResult, generate: generateCurrentStyle,
+    restore: restoreExcludedPromptTags, restoreOne: restoreExcludedPromptTag, exclude: excludeBasePromptToken,
+  })`, context);
+  return { ...api, fields, saved, run: source => vm.runInContext(source, context) };
+}
+
+const workspacePlain = value => JSON.parse(JSON.stringify(value));
+
+test("combination separates ten preview picks from thirty fixed candidates without rerolling on view", () => {
+  const workspace = styleWorkspaceSession();
+  const candidates = Array.from({ length: 30 }, (_, index) => ({ artist: `candidate_${index}`, weight: 1 + index / 100, fixed: true, slot: index + 1 }));
+  workspace.state.artists = workspacePlain(candidates);
+  workspace.run("Math.random = () => 0;");
+  workspace.update();
+  const picked = workspacePlain(workspace.state.promptArtistPreview);
+  assert.equal(picked.length, 10);
+  assert.deepEqual(picked.map(item => item.artist), candidates.slice(0, 10).map(item => item.artist));
+  workspace.run("Math.random = () => { throw new Error('Viewing the combination must not reroll'); };");
+  workspace.open("styleCombinationModal");
+  workspace.render();
+  workspace.open("styleCombinationModal");
+  assert.deepEqual(workspacePlain(workspace.state.artists), candidates);
+  assert.deepEqual(workspacePlain(workspace.state.promptArtistPreview), picked);
+  assert.equal(workspace.fields.styleCurrentCombination.children.length, 10);
+  assert.deepEqual(workspace.fields.styleCurrentCombination.children.map(row => row.dataset.artist), picked.map(item => item.artist));
+  assert.match(workspace.fields.styleCombinationCandidatesSummary.textContent, /30.*10.*20/);
+  assert.equal(workspace.fields.styleCombinationCandidates.classList.contains("hidden"), false);
+  assert.ok(workspace.fields.styleCurrentCombination.children.every(row => row.className.includes("is-readonly")), "preview picks must not expose candidate deletion actions");
+});
+
+test("history and result combinations keep the current candidate pool and preview separate", () => {
+  const workspace = styleWorkspaceSession();
+  const candidates = [{ artist: "current_candidate", weight: 1.2, fixed: true, slot: 1 }];
+  workspace.state.artists = workspacePlain(candidates);
+  workspace.update();
+  const preview = workspacePlain(workspace.state.promptArtistPreview);
+  workspace.history({ id: 45, artists: [{ artist: "history_artist", weight: 0.66 }], model: "nai-diffusion-4-5-full" });
+  workspace.open("styleCombinationModal", "result");
+  assert.equal(workspace.fields.styleCurrentCombination.children[0].dataset.artist, "history_artist");
+  assert.equal(workspace.fields.styleCombinationCandidates.classList.contains("hidden"), true);
+  assert.match(workspace.fields.artistPromptPreview.value, /0.66::artist:history artist::/);
+  workspace.result({ style_id: 46, model: "nai-diffusion-4-5-full" }, [{ artist: "request_artist", weight: 1.37 }]);
+  assert.equal(workspace.fields.styleCurrentCombination.children[0].dataset.artist, "request_artist");
+  assert.deepEqual(workspacePlain(workspace.state.artists), candidates);
+  assert.deepEqual(workspacePlain(workspace.state.promptArtistPreview), preview);
+  workspace.open("styleCombinationModal", "preview");
+  assert.equal(workspace.fields.styleCurrentCombination.children[0].dataset.artist, "current_candidate");
+  assert.match(workspace.fields.artistPromptPreview.value, /1.2::artist:current candidate::/);
+  workspace.history({ id: 47, artists: [{ artist: "late_history_artist", weight: 0.9 }] });
+  assert.equal(workspace.fields.styleCurrentCombination.children[0].dataset.artist, "current_candidate");
+  assert.match(workspace.fields.artistPromptPreview.value, /1.2::artist:current candidate::/, "late history refresh must not replace the open preview's prompt");
+});
+
+test("successful generation records the submitted artists even when current candidates change in flight", async () => {
+  const workspace = styleWorkspaceSession();
+  workspace.run(`
+    buildGenerationRequest = () => ({ model: "nai-diffusion-4-5-full", artists: [{ artist: "submitted_artist", weight: 1.43 }] });
+    setGenerationBusy = busy => { styleState.generating = busy; };
+    showStyleStatus = () => {};
+    apiFetch = (url, options) => {
+      globalThis.submitted = JSON.parse(options.body);
+      return new Promise(resolve => { globalThis.completeRequest = resolve; });
+    };
+  `);
+  workspace.state.artists = [{ artist: "candidate_before", weight: 1, fixed: true }];
+  const generation = workspace.generate();
+  workspace.state.artists = [{ artist: "candidate_after", weight: 2, fixed: true }];
+  workspace.run("completeRequest({ style_id: 100, model: 'nai-diffusion-4-5-full' });");
+  await generation;
+  assert.deepEqual(workspacePlain(workspace.state.displayedStyleResult.artists), [{ artist: "submitted_artist", weight: 1.43 }]);
+  assert.equal(workspace.state.artists[0].artist, "candidate_after");
+  const previousResult = workspacePlain(workspace.state.displayedStyleResult);
+  workspace.run("apiFetch = async () => { throw new Error('fixture failure'); };");
+  await assert.rejects(workspace.generate(), /fixture failure/);
+  assert.deepEqual(workspacePlain(workspace.state.displayedStyleResult), previousResult, "failed generation must not replace the last displayed result");
+});
+
+test("single and bulk prompt restoration deduplicate tokens without changing other prompts or artist state", () => {
+  const workspace = styleWorkspaceSession();
+  workspace.fields.basePrompt.value = "soft lighting, MASTERPIECE";
+  workspace.fields.negativePrompt.value = "blurry, text";
+  workspace.fields.fixedPrompt.value = "standing";
+  const groups = [{ id: "fixture-group", name: "lighting", enabled: false, expanded: true, items: [{ field: "base", character_id: "", token: "soft lighting" }] }];
+  const candidates = [{ artist: "fixed_candidate", weight: 1, fixed: true }];
+  workspace.state.promptGroups = workspacePlain(groups);
+  workspace.state.artists = workspacePlain(candidates);
+  workspace.state.promptArtistPreview = workspacePlain(candidates);
+  workspace.state.excludedPromptTags = [
+    { tag: "masterpiece", prompt: "masterpiece" }, { tag: "portrait", prompt: "1girl" },
+    { tag: "portrait duplicate", prompt: " 1GIRL " }, { tag: "soft shading", prompt: "soft shading" },
+  ];
+  assert.equal(workspace.restoreOne(1), true);
+  assert.equal(workspace.fields.basePrompt.value, "soft lighting, MASTERPIECE, 1girl");
+  assert.equal(workspace.state.excludedPromptTags.length, 3);
+  assert.equal(workspace.restore([0, 1, 2, 2, 99]), true);
+  assert.equal(workspace.fields.basePrompt.value, "soft lighting, MASTERPIECE, 1girl, soft shading");
+  assert.deepEqual(workspacePlain(workspace.state.excludedPromptTags), []);
+  assert.equal(workspace.fields.restoreAllExcludedPrompts.disabled, true);
+  assert.equal(workspace.fields.excludedPromptCount.textContent, "0");
+  assert.equal(workspace.restore([0]), false);
+  assert.deepEqual(workspacePlain(workspace.state.promptGroups), groups);
+  assert.deepEqual(workspacePlain(workspace.state.artists), candidates);
+  assert.deepEqual(workspacePlain(workspace.state.promptArtistPreview), candidates);
+  assert.equal(workspace.fields.negativePrompt.value, "blurry, text");
+  assert.equal(workspace.fields.fixedPrompt.value, "standing");
+  const saved = JSON.parse(workspace.saved.get("naiArtistRater.prompts.v1"));
+  assert.equal(saved.base_prompt, workspace.fields.basePrompt.value);
+  assert.equal(saved.negative_prompt, "blurry, text");
+  assert.deepEqual(saved.prompt_groups, groups);
+  assert.equal(workspace.exclude("soft shading"), true);
+  assert.equal(workspace.restoreOne(0), true);
+  assert.equal(workspace.fields.basePrompt.value, "soft lighting, MASTERPIECE, 1girl, soft shading");
 });

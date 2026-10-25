@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from contextlib import closing
 from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
@@ -53,6 +54,7 @@ from arca_style_collector import (
     revalidate_stored_metadata,
     start_collection_job,
     start_image_restore_job,
+    start_stats_refresh_job,
     start_url_collection_job,
     resume_collection_job,
     stop_collection_job,
@@ -99,6 +101,7 @@ from style_store import (
     release_generation_request,
     reserve_generation_request,
     save_app_key,
+    save_external_injection_result,
     save_skip_delete_confirmation,
     save_prompt_preset_override,
     save_generated_result,
@@ -115,6 +118,16 @@ from confirmed_style_store import (
     list_confirmed_styles,
     normalize_confirmed_model_name,
     update_confirmed_style,
+)
+from style_worldcup_store import (
+    WorldcupConflict,
+    choose_winner as choose_worldcup_winner,
+    create_worldcup,
+    get_worldcup,
+    init_worldcup_tables,
+    list_candidates as list_worldcup_candidates,
+    list_worldcups,
+    preview_candidates as preview_worldcup_candidates,
 )
 from comparison_store import (
     create_group,
@@ -142,6 +155,8 @@ from nai_artist_test_store import (
     get_test as get_nai_artist_test,
     get_test_artist_source,
     init_nai_artist_test_tables,
+    append_external_injection_image,
+    normalize_external_injection_artist,
     list_generated_image_sources,
     latest_direct_rating_map,
     list_tests as list_nai_artist_tests,
@@ -498,6 +513,7 @@ def init_db():
     init_nai_artist_test_tables(DB_PATH)
     init_style_group_tables(DB_PATH)
     init_arca_style_tables(DB_PATH)
+    init_worldcup_tables(DB_PATH)
     import_arca_style_seed(DB_PATH, ARCA_STYLE_SEED_PATH)
     if MERGE_SOURCE_DIRS:
         merge_data_directories(DATA_DIR, MERGE_SOURCE_DIRS)
@@ -1601,6 +1617,68 @@ def _nai_artist_test_config(payload):
     return normalized
 
 
+def _external_injection_request_is_local():
+    """Allow the upload endpoint only from this machine and local origins."""
+    remote_addr = request.remote_addr
+    if remote_addr not in {"127.0.0.1", "::1"}:
+        return False
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+    try:
+        parsed = urlparse(origin)
+        hostname = (parsed.hostname or "").casefold()
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+@app.route("/api/external-injection", methods=["POST"])
+def api_external_injection():
+    """Import one local PNG into the persistent external-injection test."""
+    if not _external_injection_request_is_local():
+        return json_response({"error": "이 API는 같은 PC에서만 사용할 수 있습니다."}, 403)
+    artist_name = request.form.get("artist_name", "")
+    upload = request.files.get("image")
+    if upload is None:
+        return json_response({"error": "artist_name과 image 파일이 필요합니다."}, 400)
+    try:
+        artist_name = normalize_external_injection_artist(artist_name)
+        image_bytes = upload.stream.read(MAX_CONFIRMED_IMAGE_BYTES + 1)
+        image_info = inspect_image(image_bytes)
+        if image_info["suffix"] != ".png":
+            raise ValueError("외부 주입 API는 PNG 이미지만 지원합니다.")
+        request_id = f"external-injection-{uuid.uuid4().hex}"
+        saved = save_external_injection_result(
+            DB_PATH,
+            GENERATED_DIR,
+            request_id=request_id,
+            artist_tag=artist_name,
+            png_bytes=image_bytes,
+            width=image_info["width"],
+            height=image_info["height"],
+        )
+        try:
+            result = append_external_injection_image(
+                DB_PATH, artist_name, saved["image_id"]
+            )
+        except Exception:
+            # The generated-image store commits its file/DB pair before the
+            # test link transaction.  Remove both if linking cannot commit.
+            delete_generated_image_batch(DB_PATH, GENERATED_DIR, [saved["image_id"]])
+            raise
+        result["image_url"] = f"/generated/{saved['image_path']}"
+        return json_response(result, 201)
+    except LookupError as exc:
+        return json_response({"error": str(exc)}, 404)
+    except RuntimeError as exc:
+        return json_response({"error": str(exc)}, 409)
+    except (TypeError, ValueError, OverflowError, Image.DecompressionBombError) as exc:
+        return json_response({"error": str(exc)}, 400)
+    except (OSError, sqlite3.Error):
+        return json_response({"error": "외부 이미지를 저장하지 못했습니다."}, 500)
+
+
 @app.route("/api/nai-artist-tests", methods=["GET", "POST"])
 def api_nai_artist_tests():
     if request.method == "GET":
@@ -1756,6 +1834,8 @@ def api_generate_next_nai_artist_test_item(test_id):
         return json_response({"error": "NAI 작가 테스트를 찾을 수 없습니다."}, 404)
     if state in {"paused", "cancelled"}:
         return json_response({"error": "테스트가 중단된 상태입니다.", "status": state}, 409)
+    if state == "external_injection":
+        return json_response({"error": "외부 주입 테스트에서는 NovelAI 생성을 사용할 수 없습니다."}, 409)
     if state == "awaiting_rating":
         return json_response({
             "done": False,
@@ -3822,10 +3902,10 @@ def _validate_generation_request(payload):
             "title": reference.get("title") or "",
             "source_url": reference.get("source_url") or "",
         }
-    normalized = normalize_generation_data(generation_payload)
+    normalized_artists = normalize_style_artists(payload.get("artists"))
+    normalized = normalize_generation_data(generation_payload, artist_prompt=build_artist_prompt(normalized_artists))
     normalized["request_id"] = request_id
     normalized["seed_provided"] = "seed" in payload
-    normalized_artists = normalize_style_artists(payload.get("artists"))
     normalized["artists"] = normalized_artists
     return normalized
 
@@ -4555,6 +4635,7 @@ def _generate_comparison_style(group, style_id):
     if not key:
         raise ValueError("NovelAI App Key가 설정되어 있지 않습니다.")
     data, model = _comparison_generation_data(group, style)
+    data = normalize_generation_data(data, artist_prompt=style.get("artist_prompt") or "")
     common_seed = group.get("seed")
     if group["seed_mode"] == "none":
         data["seed"] = style.get("seed") or random.SystemRandom().randint(1, 4294967295)
@@ -4666,6 +4747,64 @@ def api_delete_comparison_group(group_id):
     return json_response({"deleted": True, "id": group_id})
 
 
+def _worldcup_request_payload():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ValueError("월드컵 조건을 JSON 객체로 입력해 주세요.")
+    return payload
+
+
+def _worldcup_response(action, status=200):
+    try:
+        result = action()
+        if result is None:
+            return json_response({"error": "월드컵을 찾을 수 없습니다."}, 404)
+        return json_response(result, status)
+    except WorldcupConflict as exc:
+        return json_response({"error": str(exc)}, 409)
+    except LookupError:
+        return json_response({"error": "월드컵을 찾을 수 없습니다."}, 404)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return json_response({"error": str(exc)}, 400)
+    except sqlite3.Error:
+        return json_response({"error": "월드컵을 불러오거나 저장하지 못했습니다."}, 500)
+
+
+@app.route("/api/style-worldcups", methods=["GET", "POST"])
+def api_style_worldcups():
+    if request.method == "GET":
+        return _worldcup_response(lambda: list_worldcups(DB_PATH, ARCA_STYLE_IMAGE_DIR, confirmed_image_root=CONFIRMED_STYLE_IMAGE_DIR))
+    return _worldcup_response(
+        lambda: create_worldcup(DB_PATH, ARCA_STYLE_IMAGE_DIR, _worldcup_request_payload(), confirmed_image_root=CONFIRMED_STYLE_IMAGE_DIR), 201
+    )
+
+
+@app.route("/api/style-worldcups/preview", methods=["POST"])
+def api_style_worldcup_preview():
+    return _worldcup_response(
+        lambda: preview_worldcup_candidates(DB_PATH, ARCA_STYLE_IMAGE_DIR, _worldcup_request_payload(), confirmed_image_root=CONFIRMED_STYLE_IMAGE_DIR)
+    )
+
+
+@app.route("/api/style-worldcups/candidates", methods=["POST"])
+def api_style_worldcup_candidates():
+    return _worldcup_response(
+        lambda: list_worldcup_candidates(DB_PATH, ARCA_STYLE_IMAGE_DIR, _worldcup_request_payload(), confirmed_image_root=CONFIRMED_STYLE_IMAGE_DIR)
+    )
+
+
+@app.route("/api/style-worldcups/<int:worldcup_id>")
+def api_style_worldcup_detail(worldcup_id):
+    return _worldcup_response(lambda: get_worldcup(DB_PATH, ARCA_STYLE_IMAGE_DIR, worldcup_id, confirmed_image_root=CONFIRMED_STYLE_IMAGE_DIR))
+
+
+@app.route("/api/style-worldcups/<int:worldcup_id>/choose", methods=["POST"])
+def api_style_worldcup_choose(worldcup_id):
+    return _worldcup_response(
+        lambda: choose_worldcup_winner(DB_PATH, ARCA_STYLE_IMAGE_DIR, worldcup_id, _worldcup_request_payload(), confirmed_image_root=CONFIRMED_STYLE_IMAGE_DIR)
+    )
+
+
 @app.route("/api/arca-styles/collect", methods=["POST"])
 def api_collect_arca_styles():
     try:
@@ -4682,6 +4821,20 @@ def api_collect_arca_styles():
     except Exception:
         app.logger.exception("Unexpected Arca collection failure")
         return json_response({"error": "수집 중 오류가 발생했습니다."}, 500)
+
+
+@app.route("/api/arca-styles/refresh-stats", methods=["POST"])
+def api_refresh_arca_style_stats():
+    try:
+        payload = request.get_json(silent=True)
+        if payload is None and not request.data:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ArcaCollectorError("갱신할 모델을 확인해 주세요.")
+        job_id = start_stats_refresh_job(DB_PATH, model=payload.get("model", "all"))
+        return json_response({"job_id": job_id, "status": "queued"}, 202)
+    except ArcaCollectorError as exc:
+        return json_response({"error": str(exc)}, 400)
 
 
 @app.route("/api/arca-styles/restore-images", methods=["POST"])
@@ -4803,7 +4956,8 @@ def api_collect_arca_style_url():
         if not isinstance(payload, dict):
             raise ArcaCollectorError("요청 데이터가 올바르지 않습니다.")
         source_url = normalize_arca_article_url(payload.get("source_url"))
-        job_id = start_url_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, source_url)
+        options = {"webp_compress": payload["webp_compress"]} if "webp_compress" in payload else {}
+        job_id = start_url_collection_job(DB_PATH, ARCA_STYLE_IMAGE_DIR, source_url, **options)
         return json_response({"job_id": job_id, "status": "queued"}, 202)
     except ArcaCollectorError as exc:
         return json_response({"error": str(exc)}, 400)
@@ -5006,7 +5160,7 @@ def confirmed_style_image(filename):
         return json_response({"error": "Invalid confirmed image path."}, 400)
     target = (CONFIRMED_STYLE_IMAGE_DIR / path).resolve()
     root = CONFIRMED_STYLE_IMAGE_DIR.resolve()
-    if target.parent != root:
+    if root not in target.parents:
         return json_response({"error": "Invalid confirmed image path."}, 400)
     return send_from_directory(root, path.as_posix())
 

@@ -771,6 +771,33 @@ def list_all_generated_images(db_path):
     return _decode_generated_rows(rows)
 
 
+def save_external_injection_result(db_path, generated_dir, *, request_id, artist_tag, png_bytes, width, height):
+    """Store one local API image using the normal generated-image tables."""
+    artist_tag = str(artist_tag or "").strip()
+    if not artist_tag:
+        raise ValueError("artist_tag is required.")
+    if type(width) is not int or type(height) is not int or width < 1 or height < 1:
+        raise ValueError("Image dimensions are required.")
+    return save_generated_result(
+        db_path,
+        generated_dir,
+        request_id=request_id,
+        artists=[{"artist": artist_tag, "weight": 1.0}],
+        png_bytes=png_bytes,
+        base_prompt="{{artist}}",
+        combined_prompt=artist_tag,
+        seed=0,
+        width=width,
+        height=height,
+        sampler="external-upload",
+        noise_schedule="native",
+        steps=0,
+        scale=0.0,
+        cfg_rescale=0.0,
+        model="external-upload",
+    )
+
+
 def list_generated_images(db_path):
     """Return direct style-maker images, excluding NAI test samples."""
     conn = connect_db(db_path)

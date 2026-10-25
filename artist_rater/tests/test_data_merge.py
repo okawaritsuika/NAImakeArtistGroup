@@ -174,6 +174,47 @@ class DataMergeTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 normalize_data_dirs([root / "a"], root / "outside")
 
+    def test_duplicate_run_items_merge_without_repeated_full_table_scans(self):
+        source = sqlite3.connect(":memory:")
+        destination = sqlite3.connect(":memory:")
+        self.addCleanup(source.close)
+        self.addCleanup(destination.close)
+        for connection in (source, destination):
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.executescript("""
+                CREATE TABLE arca_collection_runs (
+                    id INTEGER PRIMARY KEY, job_id INTEGER, keyword TEXT, created_at TEXT
+                );
+                CREATE TABLE arca_collection_run_items (
+                    run_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+                    PRIMARY KEY(run_id,item_id),
+                    FOREIGN KEY(run_id) REFERENCES arca_collection_runs(id)
+                );
+            """)
+        destination.execute("INSERT INTO arca_collection_runs VALUES (100,NULL,'primary','now')")
+        destination.execute("INSERT INTO arca_collection_run_items VALUES (100,10)")
+        # Adjacent historical runs differ only by job/time and map to the
+        # same parent.  Each pair consequently contributes one child row.
+        source.executemany(
+            "INSERT INTO arca_collection_runs VALUES (?,?,?,?)",
+            [(index, index, f"keyword-{(index + 1) // 2}", str(index)) for index in range(1, 81)],
+        )
+        source.executemany(
+            "INSERT INTO arca_collection_run_items VALUES (?,1)",
+            [(index,) for index in range(1, 81)],
+        )
+        for attempt in range(2):
+            id_maps = {"arca_style_items": {1: 10}}
+            data_merge._merge_table(destination, source, "arca_collection_runs", id_maps, {})
+            with patch.object(data_merge, "_existing_index", wraps=data_merge._existing_index) as index_scan:
+                data_merge._merge_table(destination, source, "arca_collection_run_items", id_maps, {})
+            self.assertEqual(index_scan.call_count, 1, f"attempt {attempt}")
+            rows = destination.execute("SELECT run_id,item_id FROM arca_collection_run_items").fetchall()
+            self.assertEqual({tuple(row) for row in rows}, {(run_id, 10) for run_id in range(100, 141)})
+            self.assertEqual(destination.execute("PRAGMA foreign_key_check").fetchall(), [])
+        self.assertEqual(source.execute("SELECT COUNT(*) FROM arca_collection_run_items").fetchone()[0], 80)
+
     def test_merge_maps_relationships_deduplicates_and_keeps_source_read_only(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

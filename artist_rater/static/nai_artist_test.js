@@ -1055,7 +1055,16 @@
       steps: Number($("naiArtistTestSteps")?.value), scale: Number($("naiArtistTestScale")?.value), cfg_rescale: Number($("naiArtistTestCfgRescale")?.value),
       variety_plus: Boolean($("naiArtistTestVariety")?.checked), quality_toggle: Boolean($("naiArtistTestQualityToggle")?.checked), uc_preset: Number($("naiArtistTestUcPreset")?.value || 0), complexity: $("naiArtistTestComplexity")?.value || "",
     };
-    if (seedValue) config.seed = Number(seedValue); return config;
+    if (seedValue) config.seed = Number(seedValue);
+    return globalThis.novelAiMedium ? globalThis.novelAiMedium.normalize(config) : config;
+  }
+
+  function syncMediumSettings() {
+    return globalThis.novelAiMedium?.syncControls($("naiArtistTestModel")?.value, {
+      naiArtistTestSteps: 14, naiArtistTestSampler: "k_euler_ancestral", naiArtistTestScheduler: "karras",
+      naiArtistTestCfgRescale: 0, naiArtistTestVariety: false, naiArtistTestUcPreset: 2,
+      naiArtistTestNegativePrompt: null,
+    }, "naiArtistTestMediumHint");
   }
 
   async function createTest() {
@@ -1193,6 +1202,8 @@
   async function cancelTest() { state.stopRequested = true; if (state.selectedTest) { try { state.selectedTest = await api(`/api/nai-artist-tests/${state.selectedTest.id}/cancel`, { method: "POST" }); state.ratingWaiting = !hasPendingGeneration(state.selectedTest) && Boolean(activeAwaitingItem(state.selectedTest)); state.nextStatus = ""; renderResults(); renderCurrentWorkspace(); renderProgress(); renderDetailControls(); } catch (error) { setStatus(error.message, "error"); } } }
 
   if (typeof document !== "undefined" && !(typeof module !== "undefined" && module.exports)) {
+    $("naiArtistTestModel")?.addEventListener("change", syncMediumSettings);
+    syncMediumSettings();
     $("naiArtistTestAdd")?.addEventListener("click", () => { state.selectedTest = null; state.selectedArtists = []; showView("editor"); renderArtists(); refreshPromptVariantLabels(); void loadArtists(); });
     $("naiArtistTestBackToList")?.addEventListener("click", () => showView("list"));
     $("naiArtistTestBackFromDetail")?.addEventListener("click", () => showView("list"));
@@ -1262,5 +1273,5 @@
   if (typeof globalThis !== "undefined") {
     globalThis.naiArtistTestGenerationPreflight = (test, mode = "single") => confirmGenerationWithUsage(mode, test || null);
   }
-  if (typeof module !== "undefined" && module.exports) module.exports = { readResolution, artistMarkerCount, normalizeDelay, normalizeHistoryCardSize, sortArtistCandidates, artistSelectionPayload, toggleArtistSelection, mergeArtistSelections, isMarqueeDrag, marqueeAutoScrollDelta, marqueeSelectedArtistKeys, uniquePreviewImages, cyclePreviewIndex, cycleResultViewerIndex, filterNaiArtistTestResults, promptVariantTabs, promptVariantTotal, hasPendingGeneration, generationEvaluationReady, isEvaluationPending, settingsExpanded, activeAwaitingItem, preferredInteractiveItem, remainingDelayMs, averageScores, FULL_CAPACITY_IMAGES, isV5Model, pendingGenerationCount, appendTargetArtists, estimateV5Usage, usageEstimateForConfig, v5AnlasRisk, generationControlState, startConfirmationPlan, startWarningSummary, naiArtistTestViews, deleteConfirmationMessage, confirmGenerationWithUsage, bindNaiArtistTestPromptAutocomplete, isNaiArtistMarkerCursor };
+  if (typeof module !== "undefined" && module.exports) module.exports = { readConfig, syncMediumSettings, readResolution, artistMarkerCount, normalizeDelay, normalizeHistoryCardSize, sortArtistCandidates, artistSelectionPayload, toggleArtistSelection, mergeArtistSelections, isMarqueeDrag, marqueeAutoScrollDelta, marqueeSelectedArtistKeys, uniquePreviewImages, cyclePreviewIndex, cycleResultViewerIndex, filterNaiArtistTestResults, promptVariantTabs, promptVariantTotal, hasPendingGeneration, generationEvaluationReady, isEvaluationPending, settingsExpanded, activeAwaitingItem, preferredInteractiveItem, remainingDelayMs, averageScores, FULL_CAPACITY_IMAGES, isV5Model, pendingGenerationCount, appendTargetArtists, estimateV5Usage, usageEstimateForConfig, v5AnlasRisk, generationControlState, startConfirmationPlan, startWarningSummary, naiArtistTestViews, deleteConfirmationMessage, confirmGenerationWithUsage, bindNaiArtistTestPromptAutocomplete, isNaiArtistMarkerCursor };
 })();

@@ -14,6 +14,9 @@ from arca_style_collector import _image_identity, extract_novelai_metadata
 from shared_style_webp import verified_webp
 
 
+DEFAULT_ARCHIVE_FILENAME = "NAImakeArtistGroup_shared_images_20260914_webp.zip"
+
+
 def read_images(db_path):
     with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
@@ -59,8 +62,14 @@ def _convert_entry(task):
     }
 
 
-def build_archive(seed, sources, output, quality=90, workers=4):
+def build_archive(seed, sources, output, quality=90, workers=4, *, filename=DEFAULT_ARCHIVE_FILENAME):
     """Sources are (DB, image directory) pairs; all are strictly read-only."""
+    if (
+        not isinstance(filename, str)
+        or any(character in filename for character in '/\\:')
+        or Path(filename).suffix.lower() != ".zip"
+    ):
+        raise ValueError("Archive filename must be a ZIP filename without a directory.")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     cache = output / "webp_cache"
@@ -97,17 +106,18 @@ def build_archive(seed, sources, output, quality=90, workers=4):
         "seed_sha256": hashlib.sha256(Path(seed).read_bytes()).hexdigest(),
         "files": [{k: v for k, v in entry.items() if k != "cache_path"} for entry in files],
     }
-    filename = "NAImakeArtistGroup_shared_images_20260914_webp.zip"
     archive_path = output / filename
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
         for entry in files:
             archive.write(entry["cache_path"], "arca_style_images/" + entry["name"])
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
+    archive_digest = hashlib.sha256()
     with archive_path.open("rb") as handle:
-        archive_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            archive_digest.update(chunk)
     result = {
         "filename": filename, "bytes": archive_path.stat().st_size,
-        "sha256": archive_hash, "image_count": len(files),
+        "sha256": archive_digest.hexdigest(), "image_count": len(files),
         "image_bytes": manifest["total_bytes"], "original_bytes": original_bytes,
         "quality": quality, "metadata_verified": len(files),
         "seed_sha256": manifest["seed_sha256"],
@@ -121,10 +131,13 @@ def main():
     parser.add_argument("--seed", type=Path, required=True)
     parser.add_argument("--source", nargs=2, action="append", required=True, metavar=("DB", "IMAGES"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--filename", default=DEFAULT_ARCHIVE_FILENAME)
     parser.add_argument("--quality", type=int, default=90, choices=range(1, 101))
     parser.add_argument("--workers", type=int, default=4, choices=range(1, 17))
     args = parser.parse_args()
-    print(json.dumps(build_archive(args.seed, args.source, args.output, args.quality, args.workers)))
+    print(json.dumps(build_archive(
+        args.seed, args.source, args.output, args.quality, args.workers, filename=args.filename,
+    )))
 
 
 if __name__ == "__main__":

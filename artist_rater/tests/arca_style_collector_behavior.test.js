@@ -10,7 +10,7 @@ test("statistics model tabs ignore late responses from the previous model", asyn
     dataset: { arcaStatisticsModel: model }, classList: { toggle() {} },
     setAttribute(name, value) { this[name] = value; },
   }));
-  const context = vm.createContext({ URLSearchParams, document: {
+  const context = vm.createContext({ URLSearchParams, setInterval: () => 1, clearInterval() {}, document: {
     addEventListener() {}, querySelectorAll: () => tabs,
     getElementById: id => id === "arcaStatisticsModelFilter" ? filter : null,
   }});
@@ -29,6 +29,50 @@ test("statistics model tabs ignore late responses from the previous model", asyn
   assert.deepEqual(rendered.filter(row => row.model), [{ model: "v5" }]);
   assert.equal(tabs[1]["aria-selected"], "true");
   assert.equal(tabs[0].tabIndex, -1);
+});
+
+test("statistics loading, failure and retry do not render a false empty result", async () => {
+  const nodes = new Map(), timers = new Map(), rendered = [], pending = [];
+  let timerId = 0;
+  function element(id) {
+    if (!nodes.has(id)) {
+      const classes = new Set();
+      nodes.set(id, { value: id === "arcaStatisticsModelFilter" ? "v5" : "", textContent: "", classes,
+        classList: { toggle(name, active) { active ? classes.add(name) : classes.delete(name); } },
+        setAttribute(name, value) { this[name] = value; },
+      });
+    }
+    return nodes.get(id);
+  }
+  const context = vm.createContext({ URLSearchParams,
+    setInterval: fn => { timers.set(++timerId, fn); return timerId; },
+    clearInterval: id => timers.delete(id),
+    document: { addEventListener() {}, getElementById: element },
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "../static/arca_style_collector.js"), "utf8"), context);
+  context.arcaFetch = () => new Promise((resolve, reject) => pending.push({ resolve, reject }));
+  context.renderArcaStyleStatistics = result => rendered.push(result);
+  context.arcaSetStatus = (id, text) => { element(id).textContent = text; };
+  const loading = context.loadArcaStyleStatistics();
+  assert.equal(rendered.length, 0);
+  assert.equal(element("arcaStatisticsFeedbackTitle").textContent, "V5 통계 집계 중");
+  assert.equal(element("arcaStatisticsContent").classes.has("hidden"), true);
+  assert.equal(element("arcaStyleStatistics")["aria-busy"], "true");
+  [...timers.values()][0]();
+  assert.match(element("arcaStatisticsElapsed").textContent, /초 경과/);
+  pending[0].reject(new Error("연결 실패"));
+  await loading;
+  assert.equal(rendered.length, 0);
+  assert.equal(element("retryArcaStatistics").classes.has("hidden"), false);
+  assert.equal(element("arcaStyleStatistics")["aria-busy"], "false");
+  assert.equal(timers.size, 0);
+  const retry = context.loadArcaStyleStatistics();
+  pending[1].resolve({ analyzed_image_count: 0 });
+  await retry;
+  assert.equal(rendered.length, 1);
+  assert.equal(element("arcaStatisticsContent").classes.has("hidden"), false);
+  assert.equal(element("arcaStatisticsFeedback").classes.has("hidden"), true);
+  assert.equal(timers.size, 0);
 });
 const {
   normalizeArcaPayload, arcaSummaryText, collectionProgress, durationText,
@@ -80,6 +124,10 @@ test("Arca list query sends image-model filters without changing the all default
 });
 
 test("Arca model badges collapse NovelAI source build suffixes without mixing generations", () => {
+  for (const value of ["NovelAI Diffusion V5 70AB5786", "NovelAI Diffusion V5 93F4BD30", "NovelAI Diffusion V5 Full Medium", "nai-diffusion-5-full-medium"]) {
+    assert.equal(normalizeArcaModel(value), "nai-diffusion-5-full-medium");
+    assert.equal(arcaModelDisplayName(value), "V5 Full Medium");
+  }
   assert.equal(normalizeArcaModel("NovelAI Diffusion V4.5 4BDE2A90"), "nai-diffusion-4-5-full");
   assert.equal(normalizeArcaModel("NovelAI Diffusion V4.5 Curated 4BDE2A90"), "nai-diffusion-4-5-curated");
   assert.equal(normalizeArcaModel("NovelAI Diffusion V5 4BDE2A90"), "nai-diffusion-5-full");
@@ -271,9 +319,255 @@ test("direct URL payload trims one article link", () => {
   });
 });
 
+test("WebP compression is opt-in for search and direct-link collection", () => {
+  assert.equal(normalizeArcaPayload({}).webp_compress, undefined);
+  assert.equal(normalizeArcaPayload({ webp_compress: true }).webp_compress, true);
+  assert.equal(normalizeArcaUrlPayload('https://arca.live/b/aiart/123', true).webp_compress, true);
+  assert.equal(normalizeArcaUrlPayload('https://arca.live/b/aiart/123', false).webp_compress, undefined);
+});
+
 test("summary explains when an existing search was skipped", () => {
   assert.equal(arcaSummaryText({ skipped_existing: true }), "이미 검색한 범위입니다. 저장된 목록을 표시합니다.");
   assert.equal(arcaSummaryText({ error: "partial collection" }), "partial collection");
+});
+
+function statsRefreshContext() {
+  const nodes = new Map();
+  const modalControls = ["closeArcaStatsRefresh", "arcaStatsRefreshModel", "cancelArcaStatsRefresh", "startArcaStatsRefresh"];
+  const document = {
+    activeElement: null, addEventListener() {}, querySelector: () => null,
+    querySelectorAll: selector => selector === "[data-close-arca-stats-refresh]" ? [nodes.get("statsBackdrop")] : [],
+    getElementById: id => nodes.get(id) || null,
+  };
+  for (const id of ["refreshArcaStats", "collectArcaStyles", "arcaCollectorStatus", "arcaCollectionProgressPanel",
+    "arcaCollectionState", "arcaCollectionProgress", "arcaCollectionCounts", "arcaCollectionElapsed", "arcaCollectionEta",
+    "pauseArcaCollection", "resumeArcaCollection", "stopArcaCollection", "arcaStatsRefreshModal", "arcaStatsRefreshStatus",
+    "statsBackdrop", ...modalControls]) {
+    const classes = new Set(id === "arcaStatsRefreshModal" ? ["hidden"] : []);
+    nodes.set(id, { id, value: id === "arcaStatsRefreshModel" ? "v5" : "", disabled: false, textContent: "", dataset: {}, listeners: {}, classes,
+      addEventListener(name, callback) { this.listeners[name] = callback; },
+      setAttribute(name, value) { this[name] = value; },
+      removeAttribute(name) { delete this[name]; },
+      focus() { if (!this.disabled) document.activeElement = this; },
+      contains(element) { return this === element || (id === "arcaStatsRefreshModal" && modalControls.includes(element?.id)); },
+      classList: { toggle(name, active) { active ? classes.add(name) : classes.delete(name); },
+        add(name) { classes.add(name); }, remove(name) { classes.delete(name); }, contains(name) { return classes.has(name); } },
+    });
+  }
+  const context = vm.createContext({ URLSearchParams, setTimeout: () => 1, clearTimeout() {}, document });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, "../static/arca_style_collector.js"), "utf8"), context);
+  context.loadArcaBrowserSession = async () => {};
+  context.loadArcaSearchCoverage = async () => {};
+  context.loadCurrentArcaCollectionJob = async () => {};
+  context.applyArcaCardSize = () => {};
+  context.bindArcaCollector();
+  return { context, nodes, document };
+}
+
+function statsModalKey(key, shiftKey = false) {
+  return { key, shiftKey, prevented: false, stopped: false,
+    preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } };
+}
+
+test("stats refresh opens with V5 and all cancel paths retain the model without making a request", () => {
+  const { context, nodes, document } = statsRefreshContext();
+  context.arcaFetch = () => assert.fail("opening or cancelling must not make a request");
+  const modal = nodes.get("arcaStatsRefreshModal"), model = nodes.get("arcaStatsRefreshModel");
+  const trigger = nodes.get("refreshArcaStats");
+  trigger.listeners.click();
+  assert.equal(modal.classes.has("hidden"), false);
+  assert.equal(model.value, "v5");
+  assert.equal(document.activeElement, model);
+  model.value = "v4.5";
+  model.listeners.change({ target: model });
+  for (const closeId of ["cancelArcaStatsRefresh", "closeArcaStatsRefresh", "statsBackdrop"]) {
+    nodes.get(closeId).listeners.click();
+    assert.equal(modal.classes.has("hidden"), true);
+    assert.equal(document.activeElement, trigger);
+    trigger.listeners.click();
+    assert.equal(model.value, "v4.5");
+  }
+  const escape = statsModalKey("Escape");
+  modal.listeners.keydown(escape);
+  assert.equal(escape.prevented, true);
+  assert.equal(escape.stopped, true);
+  assert.equal(modal.classes.has("hidden"), true);
+  assert.equal(document.activeElement, trigger);
+});
+
+test("stats refresh modal traps Tab and Shift Tab within its controls", () => {
+  const { nodes, document } = statsRefreshContext();
+  nodes.get("refreshArcaStats").listeners.click();
+  const modal = nodes.get("arcaStatsRefreshModal");
+  const first = nodes.get("closeArcaStatsRefresh"), last = nodes.get("startArcaStatsRefresh");
+  last.focus();
+  const forward = statsModalKey("Tab");
+  modal.listeners.keydown(forward);
+  assert.equal(forward.prevented, true);
+  assert.equal(document.activeElement, first);
+  const backward = statsModalKey("Tab", true);
+  modal.listeners.keydown(backward);
+  assert.equal(backward.prevented, true);
+  assert.equal(document.activeElement, last);
+});
+
+test("stats refresh confirmation sends the selected model once and locks closing during the request", async () => {
+  const { context, nodes, document } = statsRefreshContext();
+  const requests = [], polled = [];
+  let finishRequest;
+  context.arcaFetch = (url, options) => {
+    requests.push({ url, ...options });
+    return new Promise(resolve => { finishRequest = resolve; });
+  };
+  context.pollArcaCollectionJob = async id => polled.push(id);
+  context.importArcaBrowserSession = async () => assert.fail("public-only refresh must not require login");
+  const refreshButton = nodes.get("refreshArcaStats");
+  const modal = nodes.get("arcaStatsRefreshModal");
+  refreshButton.listeners.click();
+  assert.equal(requests.length, 0);
+  nodes.get("arcaStatsRefreshModel").value = "nai-diffusion-5-full-medium";
+  const started = nodes.get("startArcaStatsRefresh").listeners.click();
+  assert.equal(refreshButton.disabled, true);
+  assert.equal(nodes.get("collectArcaStyles").disabled, true);
+  assert.equal(vm.runInContext("arcaState.collecting", context), true);
+  assert.equal(nodes.get("arcaStatsRefreshStatus").textContent, "선택한 모델의 저장된 글을 확인하는 중…");
+  assert.equal(modal["aria-busy"], "true");
+  assert.equal(nodes.get("arcaStatsRefreshModel").disabled, true);
+  assert.equal(document.activeElement, modal);
+  await refreshButton.listeners.click();
+  await nodes.get("startArcaStatsRefresh").listeners.click();
+  for (const id of ["closeArcaStatsRefresh", "cancelArcaStatsRefresh", "statsBackdrop"]) nodes.get(id).listeners.click();
+  modal.listeners.keydown(statsModalKey("Escape"));
+  assert.equal(modal.classes.has("hidden"), false);
+  const tab = statsModalKey("Tab");
+  modal.listeners.keydown(tab);
+  assert.equal(tab.prevented, true);
+  assert.equal(document.activeElement, modal);
+  assert.deepEqual(requests, [{ url: "/api/arca-styles/refresh-stats", method: "POST", body: '{"model":"nai-diffusion-5-full-medium"}' }]);
+  finishRequest({ job_id: 73, status: "queued" });
+  await started;
+  assert.deepEqual(polled, [73]);
+  assert.equal(vm.runInContext("arcaState.activeJobId", context), 73);
+  assert.equal(modal.classes.has("hidden"), true);
+  assert.equal(document.activeElement, nodes.get("arcaCollectionProgressPanel"));
+});
+
+test("stats refresh respects pending collection and keeps a failed model selection ready for retry", async () => {
+  const { context, nodes, document } = statsRefreshContext();
+  let requests = 0;
+  context.arcaFetch = async (url, options) => {
+    requests++;
+    assert.equal(JSON.parse(options.body).model, "all");
+    if (requests === 1) throw new Error("Chrome 로그인을 연결해 주세요.");
+    return { job_id: 76, status: "queued" };
+  };
+  context.pollArcaCollectionJob = async () => {};
+  vm.runInContext("arcaState.pendingCollectionPayload = { tabs: ['R18_NAI'] }", context);
+  await nodes.get("refreshArcaStats").listeners.click();
+  assert.equal(requests, 0);
+  assert.equal(nodes.get("arcaStatsRefreshModal").classes.has("hidden"), true);
+  vm.runInContext("arcaState.pendingCollectionPayload = null", context);
+  await nodes.get("refreshArcaStats").listeners.click();
+  nodes.get("arcaStatsRefreshModel").value = "all";
+  await nodes.get("startArcaStatsRefresh").listeners.click();
+  assert.equal(requests, 1);
+  assert.equal(vm.runInContext("arcaState.collecting", context), false);
+  assert.equal(nodes.get("refreshArcaStats").disabled, false);
+  assert.equal(nodes.get("collectArcaStyles").disabled, false);
+  assert.equal(nodes.get("arcaStatsRefreshStatus").textContent, "Chrome 로그인을 연결해 주세요.");
+  assert.equal(nodes.get("arcaStatsRefreshStatus").className, "status error");
+  assert.equal(nodes.get("arcaStatsRefreshModal").classes.has("hidden"), false);
+  assert.equal(nodes.get("arcaStatsRefreshModel").value, "all");
+  assert.equal(nodes.get("startArcaStatsRefresh").disabled, false);
+  assert.equal(document.activeElement, nodes.get("startArcaStatsRefresh"));
+  await nodes.get("startArcaStatsRefresh").listeners.click();
+  assert.equal(requests, 2);
+  assert.equal(nodes.get("arcaStatsRefreshModal").classes.has("hidden"), true);
+});
+
+test("stats refresh progress reports search pages and unconfirmed posts and handles an empty archive", () => {
+  const running = { job_type: "stats_refresh", status: "running", stage: "refreshing_stats", scanned_posts: 2, total_posts: 5, updated: 2,
+    scanned_pages: 4, progress: { posts: [2, 5], pages: [4, null] } };
+  assert.equal(collectionCountsText(running), "목록 4페이지 · 게시글 2/5 · 갱신 2개 · 미확인 0개");
+  assert.deepEqual(collectionProgress(running), { determinate: true, percent: 40 });
+  const completed = { ...running, status: "completed", scanned_posts: 5, progress: { posts: [5, 5], pages: [8, null] },
+    error: "3개 게시글의 조회·추천을 확인하지 못했습니다." };
+  assert.equal(collectionCountsText(completed), "목록 8페이지 · 게시글 5/5 · 갱신 2개 · 미확인 3개");
+  assert.equal(arcaSummaryText(completed),
+    "조회·추천 갱신 완료 · 갱신 2개 · 미확인 3개. 3개 게시글의 조회·추천을 확인하지 못했습니다.");
+  const empty = { job_type: "stats_refresh", status: "completed", skipped_existing: 1, scanned_posts: 0, updated: 0 };
+  assert.equal(collectionCountsText(empty), "갱신할 저장된 글 없음 · 새 요청 없음");
+  assert.equal(arcaSummaryText(empty), "선택한 모델에 해당하는 저장된 글이 없습니다.");
+  assert.deepEqual(collectionProgress(empty), { determinate: true, percent: 100 });
+  const { context, nodes } = statsRefreshContext();
+  context.renderArcaCollectionProgress(running);
+  assert.equal(nodes.get("arcaCollectionState").textContent, "검색 목록에서 조회·추천 갱신 중");
+  assert.equal(nodes.get("arcaCollectionProgress").value, 40);
+  assert.equal(nodes.get("pauseArcaCollection").classes.has("hidden"), false);
+  assert.equal(nodes.get("stopArcaCollection").classes.has("hidden"), false);
+  context.renderArcaCollectionProgress({ ...running, stage: "refreshing_stats_posts" });
+  assert.equal(nodes.get("arcaCollectionState").textContent, "남은 게시글 조회·추천 확인 중");
+  assert.equal(nodes.get("arcaCollectionCounts").textContent, "목록 4페이지 · 게시글 2/5 · 갱신 2개 · 미확인 0개");
+});
+
+test("completed stats refresh reloads saved lists and statistics and returns focus from progress", async () => {
+  const { context, nodes, document } = statsRefreshContext();
+  const requests = [], reloads = [];
+  context.arcaFetch = async (url, options) => {
+    requests.push({ url, method: options?.method || "GET" });
+    return url.endsWith("refresh-stats") ? { job_id: 74, status: "queued" } : {
+      id: 74, job_type: "stats_refresh", status: "completed", scanned_posts: 5, total_posts: 5, updated: 5,
+      progress: { posts: [5, 5] },
+    };
+  };
+  context.loadArcaStyles = async () => reloads.push("list");
+  context.loadArcaStyleStatistics = async () => reloads.push("statistics");
+  context.loadArcaImageRestoreEstimate = async () => reloads.push("local-estimate");
+  await nodes.get("refreshArcaStats").listeners.click();
+  await nodes.get("startArcaStatsRefresh").listeners.click();
+  assert.deepEqual(requests, [
+    { url: "/api/arca-styles/refresh-stats", method: "POST" },
+    { url: "/api/arca-styles/collection-jobs/74", method: "GET" },
+  ]);
+  assert.deepEqual(reloads, ["list", "statistics", "local-estimate"]);
+  assert.equal(nodes.get("refreshArcaStats").disabled, false);
+  assert.equal(vm.runInContext("arcaState.collecting", context), false);
+  assert.equal(vm.runInContext("arcaState.activeJobId", context), null);
+  assert.equal(nodes.get("arcaCollectorStatus").textContent, "조회·추천 갱신 완료 · 갱신 5개 · 미확인 0개");
+  assert.equal(document.activeElement, nodes.get("refreshArcaStats"));
+});
+
+test("stats refresh completion leaves focus alone after the user moves away from progress", async () => {
+  const { context, nodes, document } = statsRefreshContext();
+  context.arcaFetch = async () => ({ id: 77, job_type: "stats_refresh", status: "completed", scanned_posts: 1, updated: 1 });
+  context.loadArcaStyles = async () => {};
+  context.loadArcaStyleStatistics = async () => {};
+  context.loadArcaImageRestoreEstimate = async () => {};
+  vm.runInContext("arcaState.collecting = true; arcaState.activeJobId = 77", context);
+  nodes.get("collectArcaStyles").focus();
+  await context.pollArcaCollectionJob(77);
+  assert.equal(document.activeElement, nodes.get("collectArcaStyles"));
+});
+
+test("failed, stopped and interrupted stats refreshes reload updates already saved", async () => {
+  for (const status of ["failed", "stopped", "interrupted"]) {
+    const { context, nodes } = statsRefreshContext();
+    const reloads = [];
+    context.arcaFetch = async () => ({
+      id: 75, job_type: "stats_refresh", status, scanned_posts: 2, total_posts: 5, updated: 2,
+      scanned_pages: 4, progress: { posts: [2, 5], pages: [4, null] }, error: "갱신이 중단되었습니다.",
+    });
+    context.loadArcaStyles = async () => reloads.push("list");
+    context.loadArcaStyleStatistics = async () => reloads.push("statistics");
+    context.loadArcaImageRestoreEstimate = async () => assert.fail("stats interruption must not check image restoration");
+    vm.runInContext("arcaState.collecting = true; arcaState.activeJobId = 75", context);
+    await context.pollArcaCollectionJob(75);
+    assert.deepEqual(reloads, ["list", "statistics"], status);
+    assert.equal(nodes.get("refreshArcaStats").disabled, false, status);
+    assert.equal(vm.runInContext("arcaState.activeJobId", context), 75, status);
+    assert.equal(nodes.get("arcaCollectorStatus").textContent, "갱신이 중단되었습니다.", status);
+    assert.equal(nodes.get("resumeArcaCollection").classes.has("hidden"), false, status);
+  }
 });
 
 test("collection payload defaults and preserves the user search without page or post limits", () => {

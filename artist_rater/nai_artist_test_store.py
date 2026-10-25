@@ -8,6 +8,7 @@ the result of a particular local generation test.
 import json
 import math
 import sqlite3
+import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,9 @@ MAX_TOTAL_ITEMS = 10000
 MAX_DELAY_SECONDS = 24 * 60 * 60
 TEST_STATUSES = {"pending", "running", "paused", "cancelled", "completed"}
 ITEM_STATUSES = {"pending", "processing", "complete", "cancelled"}
+EXTERNAL_INJECTION_GROUP_NAME = "외부 주입"
+EXTERNAL_INJECTION_MARKER = "external_injection"
+EXTERNAL_INJECTION_MARKER_VERSION = 1
 
 
 def now_text():
@@ -201,6 +205,30 @@ def _test_row(row):
     return item
 
 
+def is_external_injection_test(test):
+    """Return whether a test row carries the local external-upload marker."""
+    if test is None:
+        return False
+    try:
+        keys = test.keys()
+        config = test["config"] if "config" in keys else None
+        if config is None:
+            config = _json(test["config_json"] if "config_json" in keys else "{}")
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return False
+    marker = config.get(EXTERNAL_INJECTION_MARKER) if isinstance(config, dict) else None
+    if marker is True:
+        return True
+    return isinstance(marker, dict) and marker.get("version") == EXTERNAL_INJECTION_MARKER_VERSION
+
+
+def normalize_external_injection_artist(artist_tag):
+    artist_tag = str(artist_tag or "").strip()
+    if not artist_tag or len(artist_tag) > 200:
+        raise ValueError("artist_name must be a nonempty string up to 200 characters.")
+    return artist_tag
+
+
 def _update_status(conn, test_id, status, timestamp=None):
     if status not in TEST_STATUSES:
         raise ValueError("Invalid NAI artist test status.")
@@ -277,6 +305,130 @@ def create_test(db_path, name, config, artists, images_per_artist, delay_seconds
     return get_test(db_path, test_id)
 
 
+def append_external_injection_image(db_path, artist_tag, generated_image_id):
+    """Append one already-stored image to the dedicated external test batch.
+
+    The image row is created by the generated-image store before this function
+    is called.  This transaction owns test discovery/creation, item creation,
+    and the canonical image link, so concurrent uploads cannot create two
+    external batches or reuse an ordinal.
+    """
+    artist_tag = normalize_external_injection_artist(artist_tag)
+    if type(generated_image_id) is not int or generated_image_id < 1:
+        raise ValueError("generated_image_id must be a positive integer.")
+    timestamp = now_text()
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        image = conn.execute(
+            "SELECT id FROM generated_images WHERE id=?", (generated_image_id,)
+        ).fetchone()
+        if image is None:
+            conn.rollback()
+            raise LookupError("Generated image was not found.")
+        if conn.execute(
+            "SELECT 1 FROM nai_artist_test_images WHERE generated_image_id=?",
+            (generated_image_id,),
+        ).fetchone() is not None:
+            conn.rollback()
+            raise ValueError("Generated image is already linked to an NAI artist test.")
+
+        external_test = None
+        for candidate in conn.execute(
+            "SELECT * FROM nai_artist_tests ORDER BY id"
+        ).fetchall():
+            if is_external_injection_test(candidate):
+                external_test = candidate
+                break
+        if external_test is None:
+            config = {
+                "base_prompt": MARKER,
+                "prompt_variants": [{"prompt": MARKER, "images_per_artist": 1}],
+                EXTERNAL_INJECTION_MARKER: {
+                    "version": EXTERNAL_INJECTION_MARKER_VERSION,
+                },
+            }
+            cursor = conn.execute(
+                """
+                INSERT INTO nai_artist_tests
+                    (name,config_json,images_per_artist,delay_seconds,status,created_at,updated_at)
+                VALUES (?,?,1,0,'paused',?,?)
+                """,
+                (
+                    EXTERNAL_INJECTION_GROUP_NAME,
+                    json.dumps(config, ensure_ascii=False, separators=(",", ":")),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            test_id = cursor.lastrowid
+            test_name = EXTERNAL_INJECTION_GROUP_NAME
+        else:
+            test_id = external_test["id"]
+            test_name = external_test["name"]
+        current_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM nai_artist_test_items WHERE test_id=?",
+                (test_id,),
+            ).fetchone()[0]
+        )
+        if current_count >= MAX_TOTAL_ITEMS:
+            conn.rollback()
+            raise ValueError("The total number of test images is too large.")
+        ordinal = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(ordinal),0) FROM nai_artist_test_items WHERE test_id=?",
+                (test_id,),
+            ).fetchone()[0]
+        ) + 1
+        cursor = conn.execute(
+            """
+            INSERT INTO nai_artist_test_items
+                (test_id,artist_tag,ordinal,status,request_id,generated_image_id,
+                 prompt_index,prompt_template,error,created_at,updated_at)
+            VALUES (?,?,?,'complete',?,?,?,?,?,?,?)
+            """,
+            (
+                test_id,
+                artist_tag,
+                ordinal,
+                f"external-injection-item-{generated_image_id}-{uuid.uuid4().hex}",
+                generated_image_id,
+                0,
+                MARKER,
+                "",
+                timestamp,
+                timestamp,
+            ),
+        )
+        item_id = cursor.lastrowid
+        conn.execute(
+            """
+            INSERT INTO nai_artist_test_images
+                (test_id,item_id,generated_image_id,artist_tag,created_at)
+            VALUES (?,?,?,?,?)
+            """,
+            (test_id, item_id, generated_image_id, artist_tag, timestamp),
+        )
+        conn.execute(
+            """
+            UPDATE nai_artist_tests
+            SET status='paused',completed_at=NULL,updated_at=?
+            WHERE id=?
+            """,
+            (timestamp, test_id),
+        )
+        conn.commit()
+    return {
+        "test_id": int(test_id),
+        "item_id": int(item_id),
+        "generated_image_id": int(generated_image_id),
+        "test_name": str(test_name or EXTERNAL_INJECTION_GROUP_NAME),
+        "artist_name": artist_tag,
+    }
+
+
 def append_test_items(db_path, test_id, prompt_variants, target_scope="all"):
     """Append prompt rows to an existing batch without rewriting its history."""
     if target_scope not in {"all", "remaining"}:
@@ -292,6 +444,9 @@ def append_test_items(db_path, test_id, prompt_variants, target_scope="all"):
         if test is None:
             conn.rollback()
             raise LookupError("NAI artist test was not found.")
+        if is_external_injection_test(test):
+            conn.rollback()
+            raise RuntimeError("외부 주입 테스트에는 프롬프트를 추가할 수 없습니다.")
         if test["status"] == "running":
             active_generation = conn.execute(
                 "SELECT 1 FROM nai_artist_test_items WHERE test_id=? AND status!='complete' LIMIT 1",
@@ -386,6 +541,9 @@ def append_test_artist(db_path, test_id, artist_tag, danbooru_score=None):
         if test is None:
             conn.rollback()
             raise LookupError("NAI artist test was not found.")
+        if is_external_injection_test(test):
+            conn.rollback()
+            raise RuntimeError("외부 주입 테스트에는 작가를 추가할 수 없습니다.")
         if test["status"] == "running":
             conn.rollback()
             raise RuntimeError("실행 중인 테스트에는 작가를 추가할 수 없습니다. 먼저 일시정지하세요.")
@@ -437,9 +595,11 @@ def prepare_test_artist_item(db_path, test_id, artist_tag, danbooru_score=None):
         raise ValueError("artist_tag is required.")
     with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = sqlite3.Row
-        test = conn.execute("SELECT status FROM nai_artist_tests WHERE id=?", (test_id,)).fetchone()
+        test = conn.execute("SELECT status,config_json FROM nai_artist_tests WHERE id=?", (test_id,)).fetchone()
         if test is None:
             raise LookupError("NAI artist test was not found.")
+        if is_external_injection_test(test):
+            raise RuntimeError("외부 주입 테스트에서는 NovelAI 생성을 사용할 수 없습니다.")
         matching = conn.execute(
             "SELECT artist_tag FROM nai_artist_test_items WHERE test_id=?",
             (test_id,),
@@ -758,6 +918,9 @@ def claim_next_item(db_path, test_id):
         if test is None:
             conn.rollback()
             return None, "missing"
+        if is_external_injection_test(test):
+            conn.commit()
+            return None, "external_injection"
         if test["status"] not in {"running", "pending"}:
             conn.commit()
             return None, test["status"]

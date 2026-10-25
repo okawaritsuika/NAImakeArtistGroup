@@ -52,6 +52,10 @@ MODEL_DEFINITIONS = {
         "nai-diffusion-5-full", "V5", "full", "NovelAI Diffusion V5 Full", 22,
         supports_complexity=True, complexity_is_prompt_tag=True,
     ),
+    "nai-diffusion-5-full-medium": _definition(
+        "nai-diffusion-5-full-medium", "V5", "full-medium", "NovelAI Diffusion V5 Full Medium", 22,
+        supports_complexity=True, complexity_is_prompt_tag=True,
+    ),
     "nai-diffusion-5-curated": _definition(
         "nai-diffusion-5-curated", "V5", "curated", "NovelAI Diffusion V5 Curated", 22,
         supports_complexity=True, complexity_is_prompt_tag=True,
@@ -79,6 +83,14 @@ MODEL_DEFINITIONS = {
 }
 
 MODEL_ALIASES = {
+    "NovelAI Diffusion V5 Full Medium": "nai-diffusion-5-full-medium",
+    "V5 Full Medium": "nai-diffusion-5-full-medium",
+    # Exact source hashes mapped by NovelAI's official image client.
+    "NovelAI Diffusion V5 93F4BD30": "nai-diffusion-5-full-medium",
+    "NovelAI Diffusion V5 70AB5786": "nai-diffusion-5-full-medium",
+    "NovelAI Diffusion V5 0ADF9AB7": "nai-diffusion-5-full",
+    "NovelAI Diffusion V5 657484A5": "nai-diffusion-5-full",
+    "NovelAI Diffusion V5 DB276663": "nai-diffusion-5-curated",
     "NovelAI Diffusion V5 Full": "nai-diffusion-5-full",
     "NovelAI Diffusion V5 Curated": "nai-diffusion-5-curated",
     "V5 Full": "nai-diffusion-5-full",

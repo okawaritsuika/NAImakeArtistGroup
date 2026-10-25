@@ -2,6 +2,41 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+
+test("NAI artist tests use the same Medium controls and keep editable prompts and Guidance", () => {
+  require("../static/style_maker.js");
+  const { syncMediumSettings, readConfig } = require("../static/nai_artist_test.js");
+  const previous = global.document;
+  const fields = {
+    naiArtistTestModel: { value: "nai-diffusion-5-full-medium" },
+    naiArtistTestSteps: { value: "28" }, naiArtistTestSampler: { value: "k_euler" }, naiArtistTestScheduler: { value: "native" },
+    naiArtistTestCfgRescale: { value: "0.6" }, naiArtistTestVariety: { type: "checkbox", checked: true },
+    naiArtistTestUcPreset: { value: "0" }, naiArtistTestNegativePrompt: { value: "saved negative" },
+    naiArtistTestScale: { value: "4.5" }, naiArtistTestBasePrompt: { value: "{{artist}}, test scene" },
+    naiArtistTestCharacterPrompts: { value: "test character" },
+  };
+  Object.values(fields).forEach((field) => { field.disabled = false; });
+  global.document = { getElementById: (id) => fields[id], querySelectorAll: () => [] };
+  try {
+    syncMediumSettings();
+    assert.equal(fields.naiArtistTestNegativePrompt.disabled, true);
+    assert.equal(fields.naiArtistTestSteps.disabled, true);
+    assert.equal(fields.naiArtistTestScale.disabled, false);
+    assert.equal(fields.naiArtistTestCharacterPrompts.disabled, false);
+    const config = readConfig();
+    assert.equal(config.steps, 14);
+    assert.equal(config.scale, 4.5);
+    assert.equal(config.base_prompt, "{{artist}}, test scene");
+    assert.deepEqual(config.character_prompts, ["test character"]);
+    assert.equal(config.negative_prompt, "");
+    assert.equal(config.uc_preset, 2);
+    fields.naiArtistTestModel.value = "nai-diffusion-5-full";
+    syncMediumSettings();
+    assert.equal(fields.naiArtistTestNegativePrompt.disabled, false);
+    assert.equal(readConfig().negative_prompt, "saved negative");
+    assert.equal(fields.naiArtistTestSteps.value, "28");
+  } finally { if (previous === undefined) delete global.document; else global.document = previous; }
+});
 const {
   artistMarkerCount,
   normalizeDelay,

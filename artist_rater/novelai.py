@@ -37,6 +37,13 @@ MAX_ERROR_BODY_BYTES = 16 * 1024
 SAFE_SAMPLER = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SAFE_NOISE_SCHEDULES = {"native", "karras", "exponential", "polyexponential"}
 COMPLEXITY_TAGS = {value: f"{value} complexity" for value in COMPLEXITY_VALUES}
+V5_MEDIUM_MODEL = "nai-diffusion-5-full-medium"
+# Fixed Heavy UC preset from NovelAI's official V5 Medium client.
+NAI_V5_MEDIUM_NEGATIVE_PROMPT = (
+    "lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, "
+    "jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, "
+    "screentone, multiple views, logo, too many watermarks, negative space, blank page"
+)
 
 
 class NovelAIError(Exception):
@@ -133,12 +140,25 @@ def _normalize_complexity(data, definition):
     return value
 
 
-def normalize_generation_data(data):
+def normalize_generation_data(data, *, artist_prompt=""):
     if not isinstance(data, dict):
         raise ValueError("Request body must be a JSON object.")
 
     model = normalize_model_id(data.get("model"), default=MODEL)
     definition = get_model_definition(model)
+    if model == V5_MEDIUM_MODEL:
+        # Apply the mode's fixed settings even to restored records and direct
+        # API requests; the caller's High-mode settings remain untouched.
+        data = dict(data)
+        data.update({
+            "steps": 14,
+            "sampler": "k_euler_ancestral",
+            "cfg_rescale": 0.0,
+            "noise_schedule": "karras",
+            "variety_plus": False,
+            "uc_preset": 2,
+            "negative_prompt": NAI_V5_MEDIUM_NEGATIVE_PROMPT,
+        })
     width = _required_int(data, "width", 64, 2048)
     height = _required_int(data, "height", 64, 2048)
     if width % 64 or height % 64:
@@ -219,7 +239,16 @@ def normalize_generation_data(data):
             "complexity": complexity,
         }
     )
+    if model == V5_MEDIUM_MODEL:
+        normalized["negative_prompt"] = _medium_negative_prompt(combine_generation_prompt(normalized, artist_prompt))
     return normalized
+
+
+def _medium_negative_prompt(prompt):
+    # The official Heavy preset suppresses nsfw unless the base prompt asks
+    # for it. Character prompts do not participate in this preset selection.
+    prefix = "" if "nsfw" in prompt.lower() else "nsfw, "
+    return prefix + NAI_V5_MEDIUM_NEGATIVE_PROMPT
 
 
 def combine_generation_prompt(data, artist_prompt):
@@ -243,13 +272,14 @@ def build_generation_payload(data, artist_prompt, seed=None, model=None):
         normalized["seed"] = seed
     actual_seed = normalized["seed"]
     combined = combine_generation_prompt(normalized, artist_prompt)
-    negative = normalized["negative_prompt"]
+    is_medium = model == V5_MEDIUM_MODEL
+    negative = _medium_negative_prompt(combined) if is_medium else normalized["negative_prompt"]
     char_captions = [
         {"char_caption": prompt, "centers": [{"x": 0.5, "y": 0.5}]}
         for prompt in normalized["character_prompts"]
     ]
     negative_char_captions = [
-        {"char_caption": negative, "centers": entry["centers"]}
+        {"char_caption": "" if is_medium else negative, "centers": entry["centers"]}
         for entry in char_captions
     ]
     payload = {
@@ -300,6 +330,10 @@ def build_generation_payload(data, artist_prompt, seed=None, model=None):
             },
         },
     }
+    if is_medium:
+        payload["parameters"]["tag_hint_uc_preset"] = 2
+        for key in ("cfg_rescale", "sm", "sm_dyn"):
+            payload["parameters"].pop(key)
     if normalized["variety_plus"]:
         payload["parameters"]["skip_cfg_above_sigma"] = normalized["skip_cfg_above_sigma"]
     return payload

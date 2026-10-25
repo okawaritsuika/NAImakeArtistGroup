@@ -50,6 +50,42 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json(), {"job_id": 17, "status": "queued"})
 
+    @patch("app.start_stats_refresh_job", return_value=18)
+    def test_refresh_stats_route_starts_a_job_for_the_whole_archive(self, start_job):
+        response = self.client.post("/api/arca-styles/refresh-stats", json={})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"job_id": 18, "status": "queued"})
+        start_job.assert_called_once_with(app.DB_PATH, model="all")
+
+    @patch("app.start_stats_refresh_job", return_value=19)
+    def test_refresh_stats_route_passes_selected_model(self, start_job):
+        response = self.client.post("/api/arca-styles/refresh-stats", json={"model": "v5"})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json(), {"job_id": 19, "status": "queued"})
+        start_job.assert_called_once_with(app.DB_PATH, model="v5")
+
+    @patch("app.start_stats_refresh_job", return_value=18)
+    def test_refresh_stats_route_rejects_non_object_payloads(self, start_job):
+        for payload in ("[]", '"v5"', "5", "null"):
+            with self.subTest(payload=payload):
+                response = self.client.post("/api/arca-styles/refresh-stats", data=payload, content_type="application/json")
+                self.assertEqual(response.status_code, 400)
+        start_job.assert_not_called()
+
+    @patch("arca_style_collector.Thread")
+    def test_refresh_stats_route_rejects_invalid_model_without_starting_worker(self, worker):
+        response = self.client.post("/api/arca-styles/refresh-stats", json={"model": "unsupported-model"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("모델", response.get_json()["error"])
+        worker.assert_not_called()
+
+    @patch("app.start_stats_refresh_job")
+    def test_refresh_stats_route_reports_login_requirement(self, start_job):
+        start_job.side_effect = app.ArcaCollectorError("R18 게시글 갱신 전에 Chrome 로그인을 연결해 주세요.")
+        response = self.client.post("/api/arca-styles/refresh-stats", json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("로그인", response.get_json()["error"])
+
     @patch("app.start_url_collection_job")
     def test_collect_one_url_route(self, start_job):
         start_job.return_value = 23
@@ -65,6 +101,14 @@ class ArcaStyleApiTest(unittest.TestCase):
     def test_collect_one_url_rejects_invalid_payload(self):
         response = self.client.post("/api/arca-styles/collect-url", json={"source_url": "https://example.com/x"})
         self.assertEqual(response.status_code, 400)
+
+    @patch("app.start_url_collection_job", return_value=24)
+    def test_collect_url_passes_webp_option(self, start_job):
+        response = self.client.post('/api/arca-styles/collect-url', json={
+            'source_url': 'https://arca.live/b/aiart/123', 'webp_compress': True,
+        })
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(start_job.call_args.kwargs['webp_compress'])
 
     @patch("app.get_arca_browser_session_status")
     def test_browser_session_status_exposes_only_safe_fields(self, get_status):

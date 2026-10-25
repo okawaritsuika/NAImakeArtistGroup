@@ -19,7 +19,7 @@ from arca_style_collector import (
     init_arca_style_tables,
     list_arca_styles,
 )
-from novelai_metadata import classify_model
+from novelai_metadata import classify_model, model_filter_value
 
 
 def png_text(key, value):
@@ -71,6 +71,173 @@ class NovelAiMetadataTest(unittest.TestCase):
         self.assertEqual(old_export["model_id"], "")
         self.assertEqual(classify_model("nai-diffusion-4-full")["model_family"], "v4")
         self.assertEqual(classify_model("nai-diffusion-3")["model_generation"], "v3")
+
+    def test_medium_classification_precedes_full_and_only_maps_known_source_hashes(self):
+        for model in (
+            "nai-diffusion-5-full-medium",
+            "NovelAI Diffusion V5 Full Medium",
+            "V5 Full Medium",
+            "NovelAI Diffusion V5 93F4BD30",
+            "NovelAI Diffusion V5 70AB5786",
+        ):
+            with self.subTest(model=model):
+                result = classify_model(model)
+                self.assertEqual(result["model_id"], "nai-diffusion-5-full-medium")
+                self.assertEqual(result["model_variant"], "full-medium")
+                self.assertEqual(result["model_family"], "v5")
+                self.assertEqual(result["model_display_name"], "NovelAI Diffusion V5 Full Medium")
+        self.assertEqual(classify_model("nai-diffusion-5-full")["model_variant"], "full")
+        unknown = classify_model("NovelAI Diffusion V5 ABCDEF12")
+        self.assertEqual(unknown["model_id"], "")
+        self.assertEqual(unknown["model_variant"], "unknown")
+        self.assertEqual(classify_model("nai-diffusion-5-full-medium-unknown")["model_id"], "")
+        self.assertEqual(model_filter_value("V5 Full Medium"), "nai-diffusion-5-full-medium")
+
+    def test_official_v5_full_and_curated_hashes_are_classified_without_guessing_other_hashes(self):
+        expected = {
+            "0ADF9AB7": "full", "657484A5": "full", "DB276663": "curated",
+        }
+        for source_hash, variant in expected.items():
+            source = "NovelAI Diffusion V5 " + source_hash
+            with self.subTest(source=source):
+                for value in (source, source.lower(), "  " + source + "  "):
+                    fields = classify_model(value)
+                    self.assertEqual(fields["model_id"], "nai-diffusion-5-" + variant)
+                    self.assertEqual(fields["model_family"], "v5")
+                    self.assertEqual(fields["model_variant"], variant)
+                result = extract_novelai_metadata(png_stealth({
+                    "Source": source, "Comment": json.dumps({"prompt": "synthetic landscape", "steps": 23}),
+                }), "image/png")
+                self.assertEqual(result["model"], source)
+                self.assertEqual(result["model_id"], "nai-diffusion-5-" + variant)
+                self.assertEqual(result["base_prompt"], "synthetic landscape")
+        for source in ("NovelAI Diffusion V5 ABCDEF12", "NovelAI Diffusion V5 0ADF9AB8", "NovelAI Diffusion V5"):
+            with self.subTest(unknown=source):
+                self.assertEqual(classify_model(source)["model_id"], "")
+                self.assertEqual(classify_model(source)["model_variant"], "unknown")
+
+    def test_v5_full_hash_backfill_repairs_medium_revision_and_preserves_source_metadata(self):
+        hashes = ("0ADF9AB7", "657484A5", "DB276663", "ABCDEF12")
+        expected_ids = ("nai-diffusion-5-full", "nai-diffusion-5-full", "nai-diffusion-5-curated", "")
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / "v5-hash-index.sqlite"
+            init_arca_style_tables(db)
+            originals = []
+            with closing(sqlite3.connect(db)) as conn, conn:
+                for number, source_hash in enumerate(hashes, 1):
+                    source = "NovelAI Diffusion V5 " + source_hash
+                    raw = json.dumps({"model": source, "prompt": "synthetic landscape", "uc": "synthetic negative"}, indent=2)
+                    originals.append((source, raw))
+                    conn.execute(
+                        "INSERT INTO arca_style_items(id,source_url,title,board_tab,collected_at,updated_at,metadata_status,prompt,model,model_family,model_generation,raw_metadata_json) "
+                        "VALUES(?,?,'그림체 공유 테스트','NAI','now','now','ok','synthetic landscape',?,'v5','v5',?)",
+                        (number, f"https://example.invalid/{number}", source, raw),
+                    )
+                    conn.execute(
+                        "INSERT INTO arca_style_images(id,item_id,image_url,metadata_status,prompt,base_prompt,model,model_family,model_generation,raw_metadata_json,created_at) "
+                        "VALUES(?,?,?,'ok','synthetic landscape','synthetic landscape',?,'v5','v5',?,'now')",
+                        (number, number, f"https://images.example/{number}.png", source, raw),
+                    )
+                conn.execute("UPDATE arca_maintenance_state SET revision='model-columns-v2-medium' WHERE name='model_columns'")
+            self.assertEqual(list_arca_styles(db, {"model": "nai-diffusion-5-full"}), [])
+            for _ in range(2):
+                init_arca_style_tables(db)
+                with closing(sqlite3.connect(db)) as conn:
+                    for table in ("arca_style_items", "arca_style_images"):
+                        rows = conn.execute(f"SELECT model,raw_metadata_json,model_id,model_family,prompt FROM {table} ORDER BY id").fetchall()
+                        self.assertEqual([row[:2] for row in rows], originals)
+                        self.assertEqual([row[2] for row in rows], list(expected_ids))
+                        self.assertEqual([row[3:] for row in rows], [("v5", "synthetic landscape")] * 4)
+                self.assertEqual({row["id"] for row in list_arca_styles(db, {"model": "nai-diffusion-5-full"})}, {1, 2})
+                self.assertEqual({row["id"] for row in list_arca_styles(db, {"model": "nai-diffusion-5-curated"})}, {3})
+                self.assertEqual(len(list_arca_styles(db, {"model": "v5"})), 4)
+
+    def test_medium_stealth_source_restores_fixed_options_without_changing_raw_metadata(self):
+        source = "NovelAI Diffusion V5 70AB5786"
+        comment = {
+            "steps": 14, "scale": 4.5, "cfg_rescale": 0,
+            "sampler": "k_euler_ancestral", "noise_schedule": "karras",
+            "tag_hint_qt": 0, "tag_hint_uc_preset": 2,
+            "v4_prompt": {"caption": {
+                "base_caption": "landscape, high complexity",
+                "char_captions": [{"char_caption": f"character {index}", "centers": []} for index in range(22)],
+            }},
+            "v4_negative_prompt": {"caption": {
+                "base_caption": "synthetic preserved negative",
+                "char_captions": [{"char_caption": "", "centers": []} for _ in range(22)],
+            }},
+        }
+        payload = {"Source": source, "Comment": json.dumps(comment)}
+        result = extract_novelai_metadata(png_stealth(payload), "image/png")
+        self.assertEqual(result["model"], source)
+        self.assertEqual(result["model_id"], "nai-diffusion-5-full-medium")
+        self.assertEqual(result["steps"], 14)
+        self.assertEqual(result["scale"], 4.5)
+        self.assertEqual(result["cfg_rescale"], 0)
+        self.assertIs(result["quality_toggle"], False)
+        self.assertEqual(result["uc_preset"], 2)
+        self.assertEqual(result["complexity"], "high")
+        self.assertEqual(len(result["character_prompts"]), 22)
+        self.assertEqual(result["negative_prompt"], "synthetic preserved negative")
+        raw = json.loads(result["raw_metadata_json"])
+        self.assertEqual(raw["source"], source)
+        for key, value in comment.items():
+            with self.subTest(raw_field=key):
+                self.assertEqual(raw[key], value)
+
+    def test_medium_is_not_inferred_from_step_count_or_prompt_text(self):
+        payload = {
+            "model": "NovelAI Diffusion V5 ABCDEF12", "steps": 14,
+            "sampler": "k_euler_ancestral", "noise_schedule": "karras",
+            "prompt": "V5 Full Medium, landscape",
+        }
+        result = extract_novelai_metadata(png_text("Comment", json.dumps(payload)), "image/png")
+        self.assertEqual(result["model_id"], "")
+        self.assertEqual(result["model_variant"], "unknown")
+
+    def test_medium_backfill_updates_previous_index_revision_without_rewriting_source(self):
+        source = "NovelAI Diffusion V5 70AB5786"
+        raw = json.dumps({
+            "model": source, "prompt": "landscape", "tag_hint_qt": 0, "tag_hint_uc_preset": 2,
+        }, indent=2)
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / "previous-index.sqlite"
+            init_arca_style_tables(db)
+            with closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute(
+                    "INSERT INTO arca_style_items(id,source_url,title,board_tab,collected_at,updated_at,image_count,metadata_status,prompt,model,model_family,model_generation,raw_metadata_json) "
+                    "VALUES(1,'https://arca.live/b/aiart/medium-fixture','그림체 공유 테스트','NAI','now','now',1,'ok','landscape',?,'v5','v5',?)",
+                    (source, raw),
+                )
+                conn.execute(
+                    "INSERT INTO arca_style_images(id,item_id,image_url,metadata_status,prompt,base_prompt,model,model_family,model_generation,raw_metadata_json,created_at) "
+                    "VALUES(1,1,'https://images.example/medium.png','ok','landscape','landscape',?,'v5','v5',?,'now')",
+                    (source, raw),
+                )
+                conn.execute(
+                    "UPDATE arca_maintenance_state SET revision='model-columns-v1' WHERE name='model_columns'"
+                )
+            self.assertEqual(list_arca_styles(db, {"model": "nai-diffusion-5-full-medium"}), [])
+            snapshots = []
+            for _ in range(2):
+                init_arca_style_tables(db)
+                with closing(sqlite3.connect(db)) as conn:
+                    snapshot = []
+                    for table in ("arca_style_items", "arca_style_images"):
+                        row = conn.execute(
+                            f"SELECT model,raw_metadata_json,model_id,model_family,model_generation,model_variant,quality_toggle,uc_preset FROM {table} WHERE id=1"
+                        ).fetchone()
+                        self.assertEqual(row, (
+                            source, raw, "nai-diffusion-5-full-medium", "v5", "v5", "full-medium", 0, 2,
+                        ))
+                        self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 1)
+                        snapshot.append(row)
+                    snapshots.append(snapshot)
+                filtered = list_arca_styles(db, {"model": "nai-diffusion-5-full-medium"})
+                self.assertEqual([item["id"] for item in filtered], [1])
+                detail = get_arca_style_detail(db, 1, {"model": "nai-diffusion-5-full-medium"})
+                self.assertEqual([image["model_id"] for image in detail["images"]], ["nai-diffusion-5-full-medium"])
+            self.assertEqual(snapshots[0], snapshots[1])
 
     def test_v5_uses_official_v4_prompt_character_caption_shape_and_preserves_raw_model(self):
         payload = {

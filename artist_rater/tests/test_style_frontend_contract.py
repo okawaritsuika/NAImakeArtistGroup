@@ -1,4 +1,5 @@
 import unittest
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 import subprocess
@@ -9,6 +10,43 @@ HTML_PATH = ROOT / "templates" / "index.html"
 JS_PATH = ROOT / "static" / "style_maker.js"
 CSS_PATH = ROOT / "static" / "style.css"
 BEHAVIOR_TEST_PATH = ROOT / "tests" / "style_maker_behavior.test.js"
+GRAPH_BEHAVIOR_TEST_PATH = ROOT / "tests" / "style_weight_graph_behavior.test.js"
+
+
+class ElementContractParser(HTMLParser):
+    """Track actual ancestry so moved controls remain covered across modal layouts."""
+    VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self, html):
+        super().__init__()
+        self.stack = []
+        self.by_id = {}
+        self.nodes = []
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        node = {"tag": tag, "attrs": dict(attrs), "parents": self.stack[:], "text": ""}
+        self.nodes.append(node)
+        element_id = node["attrs"].get("id")
+        if element_id:
+            if element_id in self.by_id:
+                raise AssertionError(f"Duplicate DOM id: {element_id}")
+            self.by_id[element_id] = node
+        if tag not in self.VOID_TAGS:
+            self.stack.append(node)
+
+    def handle_endtag(self, tag):
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index]["tag"] == tag:
+                del self.stack[index:]
+                break
+
+    def handle_data(self, data):
+        for node in self.stack:
+            node["text"] += data
+
+    def ancestor_ids(self, element_id):
+        return [node["attrs"].get("id") for node in self.by_id[element_id]["parents"]]
 
 
 class NestedWorkspacePanelParser(HTMLParser):
@@ -39,6 +77,49 @@ class NestedWorkspacePanelParser(HTMLParser):
 
 
 class StyleFrontendContractTest(unittest.TestCase):
+    def test_fixed_only_random_selection_control_is_in_artist_conditions(self):
+        dom = ElementContractParser(self.html)
+        self.assertIn("styleArtistsPanel", dom.ancestor_ids("styleFixedArtistsOnly"))
+        self.assertIn("고정 작가에서만 랜덤 선택", dom.by_id["styleArtistsPanel"]["text"])
+        self.assertRegex(self.css, r"\.style-fixed-artists-only\s*\{[^}]*min-height:\s*44px")
+
+    def test_confirmed_setting_choices_match_generation_controls_and_keep_unknown(self):
+        for confirmed, generation in (
+            ("confirmedStyleSampler", "generationSampler"),
+            ("confirmedStyleScheduler", "generationScheduler"),
+        ):
+            def choices(element_id):
+                select = re.search(r'<select id="' + element_id + r'"[^>]*>(.*?)</select>', self.html, re.S)
+                self.assertIsNotNone(select, element_id)
+                return re.findall(r'<option value="([^"]*)"', select.group(1))
+            self.assertEqual(choices(confirmed), [""] + choices(generation))
+        for field, bounds in (
+            ("confirmedStyleSteps", ('min="1"', 'max="50"', 'step="1"')),
+            ("confirmedStyleScale", ('min="0"', 'max="10"', 'step="0.1"')),
+            ("confirmedStyleCfgRescale", ('min="0"', 'max="1"', 'step="0.01"')),
+        ):
+            control = re.search(r'<input id="' + field + r'"[^>]*>', self.html).group(0)
+            for bound in bounds:
+                self.assertIn(bound, control)
+
+    def test_confirmed_settings_keep_footer_outside_scroll_and_stack_on_small_screens(self):
+        dialog = self.css.split(".confirmed-style-dialog {", 1)[1].split("}", 1)[0]
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr) auto auto", dialog)
+        self.assertIn("100dvh", dialog)
+        responsive = self.css.split("@media (max-width: 1050px)", 1)[1]
+        self.assertIn("grid-auto-rows: max-content", responsive)
+        self.assertIn(".confirmed-style-image-scroller {\n    overflow: visible", responsive)
+        mobile = self.css.split("@media (max-width: 760px)", 1)[1]
+        self.assertIn(".confirmed-style-settings-grid {\n    grid-template-columns: 1fr", mobile)
+        self.assertIn(".confirmed-style-dialog > .modal-actions", mobile)
+
+    def test_medium_model_controls_have_wrapping_hint_and_full_width_model_row(self):
+        self.assertIn('value="nai-diffusion-5-full-medium"', self.html)
+        self.assertIn('id="generationMediumHint"', self.html)
+        self.assertIn('id="comparisonMediumHint"', self.html)
+        self.assertIn('.generation-parameters-body > .model-parameter-row {\n  grid-column: 1 / -1;', self.css)
+        self.assertIn('overflow-wrap: anywhere;', self.css)
+
     @classmethod
     def setUpClass(cls):
         cls.html = HTML_PATH.read_text(encoding="utf-8")
@@ -163,8 +244,8 @@ class StyleFrontendContractTest(unittest.TestCase):
             'id="styleArtistPosition"',
             'id="styleArtistWeight"',
             'id="styleArtistList"',
-            '가중치 표',
-            '여기서도 바로 수정',
+            '고정 작가 편집',
+            'id="openStyleAddArtist"',
             'style-artist-row-head',
             'id="addStyleArtist"',
             'id="basePrompt"',
@@ -183,35 +264,15 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.html)
 
-    def test_weight_profile_uses_left_preview_and_editor_modal(self):
-        for marker in (
-            'id="weightGraphPreview"',
-            'id="openWeightGraph"',
-            'id="weightGraphModal"',
-            'id="weightGraph"',
-            'id="closeWeightGraph"',
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, self.html)
-        self.assertLess(
-            self.html.index('id="styleArtistList"'),
-            self.html.index('id="latestStyleResult"'),
-        )
-        self.assertLess(
-            self.html.index('id="styleArtistList"'),
-            self.html.index('id="styleMakerEditor"'),
-        )
-        settings_start = self.html.index('id="styleMakerSettings"')
-        editor_start = self.html.index('id="styleMakerEditor"')
-        preview_index = self.html.index('id="weightGraphPreview"')
-        result_index = self.html.index('id="latestStyleResult"')
-        self.assertLess(settings_start, preview_index)
-        self.assertLess(preview_index, editor_start)
-        self.assertGreater(result_index, editor_start)
-        self.assertLess(
-            self.html.index('id="latestStyleResult"'),
-            self.html.index('id="artistPromptPreview"'),
-        )
+    def test_weight_profile_uses_settings_preview_and_separate_editors(self):
+        dom = ElementContractParser(self.html)
+        for element_id in ("openWeightGraph", "weightGraphPreview"):
+            self.assertIn("styleWeightsPanel", dom.ancestor_ids(element_id))
+        self.assertIn("weightGraphModal", dom.ancestor_ids("weightGraph"))
+        self.assertIn("weightTableModal", dom.ancestor_ids("weightTableArtistList"))
+        self.assertNotIn("styleMakerSettings", dom.ancestor_ids("styleArtistList"))
+        self.assertIn("styleMakerEditor", dom.ancestor_ids("latestStyleResult"))
+        self.assertIn("styleCombinationModal", dom.ancestor_ids("artistPromptPreview"))
 
     def test_weight_table_has_full_size_editor_modal_and_random_controls(self):
         for marker in (
@@ -269,41 +330,40 @@ class StyleFrontendContractTest(unittest.TestCase):
                 self.assertIn(f">{label}</option>", sampler_html)
         self.assertIn('value="k_euler_ancestral" selected', sampler_html)
 
-    def test_style_settings_have_collapsible_groups_and_one_outer_scroll(self):
-        self.assertNotIn('id="toggleStyleSettingsBody"', self.html)
-        for label in ("작가 구성", "허용 평점", "가중치 설정", "가중치 표"):
-            with self.subTest(label=label):
-                self.assertIn(f"<summary>{label}</summary>", self.html)
-        self.assertGreaterEqual(self.html.count('class="style-settings-section" open'), 3)
-        self.assertIn(".style-settings-body", self.css)
-        self.assertIn("overflow-y: auto", self.css)
-        self.assertIn("scrollbar-gutter: stable", self.css)
-        self.assertEqual(self.html.count('class="style-artist-table-scroll"'), 2)
-        self.assertIn(".style-artist-table-scroll", self.css)
-        self.assertIn("overflow-x: auto", self.css)
-        self.assertIn("min-width: 430px", self.css)
+    def test_style_settings_use_two_tabs_and_number_only_rating_buttons(self):
+        dom = ElementContractParser(self.html)
+        settings = dom.by_id["styleMakerSettings"]
+        self.assertFalse(any(node["tag"] == "details" and settings in node["parents"] for node in dom.nodes))
+        for tab, panel in (("styleArtistsTab", "styleArtistsPanel"), ("styleWeightsTab", "styleWeightsPanel")):
+            self.assertEqual("tab", dom.by_id[tab]["attrs"]["role"])
+            self.assertEqual(panel, dom.by_id[tab]["attrs"]["aria-controls"])
+            self.assertEqual("tabpanel", dom.by_id[panel]["attrs"]["role"])
+            self.assertEqual(tab, dom.by_id[panel]["attrs"]["aria-labelledby"])
+        self.assertEqual("true", dom.by_id["styleArtistsTab"]["attrs"]["aria-selected"])
+        self.assertEqual("false", dom.by_id["styleWeightsTab"]["attrs"]["aria-selected"])
+        scores = [node for node in dom.nodes if "data-score" in node["attrs"] and dom.by_id["styleScoreButtons"] in node["parents"]]
+        self.assertEqual([str(score) for score in range(1, 6)], [node["text"].strip() for node in scores])
+        self.assertTrue(all(node["attrs"].get("aria-pressed") in ("true", "false") for node in scores))
+        for control in ("styleArtistCountDown", "styleArtistCount", "styleArtistCountUp", "styleScoreAll"):
+            self.assertIn("styleArtistsPanel", dom.ancestor_ids(control))
+        self.assertRegex(self.css, r"#styleMakerSettings \.style-settings-body\s*\{[^}]*overflow:\s*hidden")
 
-    def test_weight_graph_edits_fixed_artists_as_overlays_not_bottom_table(self):
-        overlay_start = self.script.index("function renderWeightGraphFixedArtistOverlays")
-        overlay_end = self.script.index("function renderWeightGraph()", overlay_start)
-        overlay_script = self.script[overlay_start:overlay_end]
-        self.assertNotIn('id="weightGraphFixedArtistList"', self.html)
-        self.assertNotIn('class="weight-graph-fixed-artists"', self.html)
-        self.assertIn("function renderWeightGraphFixedArtistOverlays", self.script)
-        self.assertIn("weight-fixed-artist-card", overlay_script)
-        self.assertIn("const overlayEntries = entries.map", overlay_script)
-        self.assertIn("occupiedLanes", overlay_script)
-        self.assertIn("overlayEntries.forEach(({ artist: item, index, slot, stackIndex, visualStackIndex })", overlay_script)
-        self.assertIn('dataTransfer.setData("application/x-fixed-style-artist"', overlay_script)
-        self.assertIn('dataTransfer.setData("application/x-fixed-style-artists"', overlay_script)
-        self.assertIn(".weight-fixed-artist-card", self.css)
-        self.assertIn("position: absolute", self.css)
-        self.assertIn("--fixed-card-x-offset", self.css)
-        self.assertNotIn("translate(-50%, 50%)", self.css)
-        self.assertIn("weight-fixed-drop-indicator", self.script)
-        self.assertIn(".weight-fixed-drop-indicator", self.css)
-        self.assertIn("weight-fixed-artist-select", self.script)
-        self.assertIn(".weight-fixed-artist-card.selected", self.css)
+    def test_weight_graph_uses_all_slot_overview_and_transactional_footer(self):
+        dom = ElementContractParser(self.html)
+        body = dom.by_id["weightGraph"]
+        for element_id in ("weightGraphStatus", "cancelWeightGraph", "applyWeightGraph"):
+            self.assertIn("weightGraphModal", dom.ancestor_ids(element_id))
+            self.assertNotIn(body, dom.by_id[element_id]["parents"])
+            self.assertTrue(any(node["tag"] == "footer" for node in dom.by_id[element_id]["parents"]))
+        render = self.script.split("function renderWeightGraph()", 1)[1].split("function currentStyleArtistFragment", 1)[0]
+        self.assertIn("renderWeightProfileGraph(graph)", render)
+        self.assertNotIn("renderWeightGraphFixedArtistOverlays(graph)", render)
+        self.assertNotIn('column.className = "weight-column"', render)
+        for marker in ("weightProfileSlotValues", "weightProfileFromSlotValues", "weightGraphDraft", '"weightGraphArtist"', '"weightGraphValue"', '"data-weight-slot"', "function applyWeightGraphModal()"):
+            self.assertIn(marker, self.script)
+        self.assertRegex(self.css, r"\.weight-graph-dialog\s*\{[^}]*grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto")
+        self.assertRegex(self.css, r"\.weight-graph\.weight-overview\s*\{[^}]*overflow-x:\s*hidden")
+        self.assertIn(".weight-overview-detail", self.css)
 
     def test_fixed_artist_add_controls_prevent_label_overlap(self):
         self.assertIn(".artist-add-row .field > span", self.css)
@@ -312,18 +372,18 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn(".style-editor-head .status", self.css)
         self.assertIn("overflow-wrap: anywhere", self.css)
 
-    def test_random_weight_add_control_sits_below_the_weight_field(self):
-        rule_start = self.css.index(".artist-add-row > .style-artist-random-add {")
-        rule_end = self.css.index("}", rule_start)
-        rule = self.css[rule_start:rule_end]
-        self.assertIn("grid-column: 4 / 5", rule)
-        self.assertIn("grid-row: 2", rule)
+    def test_random_weight_add_controls_remain_in_both_artist_editors(self):
+        dom = ElementContractParser(self.html)
+        self.assertIn("styleAddArtistModal", dom.ancestor_ids("styleArtistRandomWeight"))
+        self.assertIn("weightTableModal", dom.ancestor_ids("weightTableArtistRandomWeight"))
+        self.assertIn("styleAddArtistModal", dom.ancestor_ids("styleArtistWeight"))
+        self.assertIn("weightTableModal", dom.ancestor_ids("weightTableArtistWeight"))
         self.assertEqual(self.html.count('class="compact-check style-artist-random-add"'), 2)
 
-    def test_latest_generation_result_keeps_large_preview_space(self):
-        self.assertIn("grid-template-rows: auto auto minmax(420px, 1fr) auto", self.css)
-        self.assertIn("min-height: 420px", self.css)
-        self.assertIn("max-height: min(72vh, 820px)", self.css)
+    def test_latest_generation_result_fits_remaining_viewport_space(self):
+        self.assertRegex(self.css, r"#styleMakerEditor\s*\{[^}]*grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto")
+        self.assertRegex(self.css, r"#styleMakerEditor #latestStyleResult\s*\{[^}]*min-height:\s*0")
+        self.assertRegex(self.css, r"#latestStyleResult>img\s*\{[^}]*object-fit:\s*contain")
 
     def test_generation_result_metadata_includes_saved_parameters(self):
         script = JS_PATH.read_text(encoding="utf-8")
@@ -734,23 +794,20 @@ class StyleFrontendContractTest(unittest.TestCase):
         ):
             self.assertIn(marker, self.script)
 
-    def test_workspace_uses_internal_scroll_and_responsive_grid(self):
-        for marker in (
-            ".style-maker-layout",
-            "minmax(210px, 280px)",
-            "minmax(0, 1fr)",
-            "minmax(520px, 640px)",
-            "overflow: auto",
-            ".weight-column",
-            "grid-template-columns: 1fr",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, self.css)
+    def test_workspace_has_viewport_grid_and_owned_internal_scroll(self):
+        self.assertRegex(self.css, r"body\.style-maker-active\s*\{[^}]*height:\s*100dvh[^}]*overflow:\s*hidden")
+        self.assertRegex(self.css, r"#style-maker-tab\.active\s*\{[^}]*grid-template-rows:\s*auto minmax\(0,\s*1fr\)")
+        for marker in ("--settings-width", "--generation-width", "--history-width"):
+            self.assertIn(marker, self.css)
+        self.assertRegex(self.css, r"#styleMakerGeneration \.generation-scroll\s*\{[^}]*overflow:\s*hidden")
+        self.assertRegex(self.css, r"#styleMakerHistory \.style-history-scroll\s*\{[^}]*overflow-y:\s*auto[^}]*overflow-x:\s*hidden")
 
-    def test_workspace_switches_before_the_981_to_1008_pixel_clipping_range(self):
-        self.assertIn("@media (max-width: 1320px)", self.css)
-        self.assertIn("grid-template-columns: minmax(210px, 280px) minmax(0, 1fr) minmax(520px, 640px)", self.css)
-        self.assertIn("overflow-x: auto", self.css)
+    def test_workspace_switches_side_panels_to_overlays_at_1100_pixels(self):
+        breakpoint = re.search(r"@media\s*\(max-width:\s*1100px\)", self.css)
+        self.assertIsNotNone(breakpoint)
+        responsive = self.css[breakpoint.start():]
+        self.assertRegex(responsive, r"#styleMakerGeneration\s*\{[^}]*position:\s*absolute")
+        self.assertRegex(responsive, r"#styleMakerHistory:not\(\.history-collapsed\)\s*\{[^}]*position:\s*absolute")
 
     def test_prompt_workspace_and_groups_have_responsive_styles(self):
         for marker in (
@@ -764,11 +821,12 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.css)
 
-    def test_artist_tags_are_above_quality_tags_and_base_buttons_can_be_excluded(self):
-        self.assertIn('id="artistPromptTokens"', self.html)
-        self.assertLess(self.html.index('id="artistPromptTokens"'), self.html.index('id="basePromptTokens"'))
-        self.assertIn("function excludeBasePromptToken", self.script)
-        self.assertIn('chip.addEventListener("click", () => excludeBasePromptToken(token))', self.script)
+    def test_artist_tags_remain_in_extra_prompt_editor_and_base_tokens_can_be_excluded(self):
+        dom = ElementContractParser(self.html)
+        self.assertIn("stylePromptExtrasModal", dom.ancestor_ids("artistPromptTokens"))
+        self.assertIn("styleMakerGeneration", dom.ancestor_ids("basePrompt"))
+        self.assertIn("excludeBasePromptToken", self.script)
+        self.assertIn("excludedPromptTagList", self.html)
 
     def test_score_and_drag_controls_expose_accessible_state(self):
         source = JS_PATH.read_text(encoding="utf-8")
@@ -890,7 +948,11 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.css)
         self.assertIn('class="style-maker-pane style-maker-history history-collapsed"', self.html)
-        self.assertLess(self.html.index('id="styleHistoryDetail"'), self.html.index('id="styleHistoryList"'))
+        self.assertLess(self.html.index('id="styleHistoryList"'), self.html.index('id="styleHistoryDetail"'))
+        dom = ElementContractParser(self.html)
+        self.assertTrue(any('style-history-scroll' in node['attrs'].get('class', '').split() for node in dom.by_id['styleHistoryList']['parents']))
+        self.assertFalse(any('style-history-scroll' in node['attrs'].get('class', '').split() for node in dom.by_id['styleHistoryDetail']['parents']))
+        self.assertTrue(any(node["tag"] == "svg" and dom.by_id["styleHistoryRail"] in node["parents"] for node in dom.nodes))
         self.assertIn('load.textContent = "설정 반영"', self.script)
         self.assertIn('confirm.textContent = "확정 그림체로"', self.script)
         self.assertIn('remove.textContent = "×"', self.script)
@@ -928,20 +990,13 @@ class StyleFrontendContractTest(unittest.TestCase):
         detail_end = self.script.index('function renderStyleHistoryList(', detail_start)
         self.assertNotIn('remove.textContent', self.script[detail_start:detail_end])
 
-    def test_style_maker_narrow_layout_keeps_panes_in_flow(self):
-        responsive = self.css[self.css.index("@media (max-width: 1320px)"):]
-        for marker in (
-            "body.style-maker-active main",
-            "overflow: auto",
-            "height: auto",
-            "overflow-x: hidden",
-            "overflow-y: visible",
-            ".style-maker-pane",
-            "overflow: hidden",
-            ".style-history-scroll",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, responsive)
+    def test_style_maker_narrow_layout_keeps_fixed_panels_over_the_result(self):
+        breakpoint = re.search(r"@media\s*\(max-width:\s*760px\)\s*\{\s*body\.style-maker-active main", self.css)
+        self.assertIsNotNone(breakpoint)
+        responsive = self.css[breakpoint.start():]
+        self.assertRegex(responsive, r"#styleMakerSettings\s*\{[^}]*position:\s*absolute")
+        self.assertRegex(responsive, r"#styleMakerLayout\s*\{[^}]*--settings-width:\s*0px")
+        self.assertIn("max-height:calc(100dvh - 16px)", responsive.replace("max-height: ", "max-height:"))
 
     def test_single_generation_randomizes_enabled_targets_before_generation(self):
         start = self.script.index("async function generateOneRandomizedStyle()")
@@ -957,9 +1012,60 @@ class StyleFrontendContractTest(unittest.TestCase):
         parser.feed(self.html)
         self.assertEqual([], parser.nested_panels)
 
+    def test_prompt_and_generation_share_a_panel_and_only_generation_actions_float(self):
+        dom = ElementContractParser(self.html)
+        for control in ("basePrompt", "negativePrompt", "generationLimitMode", "generationCount", "styleRandomTargets"):
+            self.assertIn("styleMakerGeneration", dom.ancestor_ids(control))
+        for control in ("leadingPrompt", "fixedPrompt", "characterPromptList", "promptGroupList"):
+            self.assertIn("stylePromptExtrasModal", dom.ancestor_ids(control))
+        for control in ("generationModel", "generationSampler", "generationScale", "generationMediumHint"):
+            self.assertIn("styleGenerationParametersModal", dom.ancestor_ids(control))
+        for control in ("remoteGenerateOne", "remoteStartContinuous", "remotePauseContinuous", "remoteStopContinuous"):
+            self.assertIn("generationRemote", dom.ancestor_ids(control))
+            self.assertNotIn("styleMakerGeneration", dom.ancestor_ids(control))
+        for control in ("generateOne", "startContinuous", "pauseContinuous", "stopContinuous"):
+            self.assertTrue(any("hidden" in node["attrs"].get("class", "").split() for node in dom.by_id[control]["parents"]))
+        self.assertEqual("true", dom.by_id["toggleStyleSettings"]["attrs"]["aria-expanded"])
+        self.assertIn("openGenerationRemote", dom.by_id)
+
+    def test_workspace_modal_actions_stay_outside_the_scroll_body(self):
+        dom = ElementContractParser(self.html)
+        for modal_id in (
+            "styleAddArtistModal", "styleCombinationModal", "stylePromptExtrasModal",
+            "styleGenerationParametersModal", "styleSharedMixModal", "styleUsageModal",
+            "ratingTagRulesModal", "weightTableModal",
+        ):
+            with self.subTest(modal=modal_id):
+                modal = dom.by_id[modal_id]
+                bodies = [node for node in dom.nodes if modal in node["parents"] and "workspace-modal-body" in node["attrs"].get("class", "").split()]
+                self.assertEqual(1, len(bodies))
+                footer_actions = [node for node in dom.nodes if node["tag"] == "button" and modal in node["parents"] and any(parent["tag"] == "footer" or "modal-actions" in parent["attrs"].get("class", "").split() for parent in node["parents"])]
+                self.assertTrue(footer_actions)
+                self.assertTrue(all(bodies[0] not in button["parents"] for button in footer_actions))
+        self.assertRegex(self.css, r"\.workspace-dialog\s*\{[^}]*grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto")
+        self.assertRegex(self.css, r"\.workspace-modal-body\s*\{[^}]*overflow:\s*auto")
+
+    def test_excluded_prompts_restore_from_the_main_prompt_panel(self):
+        dom = ElementContractParser(self.html)
+        for control in ("excludedPromptTab", "excludedPromptPanel", "excludedPromptTagList", "restoreAllExcludedPrompts"):
+            self.assertIn("styleMakerGeneration", dom.ancestor_ids(control))
+            self.assertNotIn("stylePromptExtrasModal", dom.ancestor_ids(control))
+        self.assertEqual("excludedPromptPanel", dom.by_id["excludedPromptTab"]["attrs"]["aria-controls"])
+        self.assertEqual("excludedPromptTab", dom.by_id["excludedPromptPanel"]["attrs"]["aria-labelledby"])
+        self.assertNotIn("excludedPromptTags", dom.ancestor_ids("restoreAllExcludedPrompts"))
+        self.assertRegex(self.css, r"#styleMakerGeneration #excludedPromptTags\s*\{[^}]*min-height:0;[^}]*overflow:auto")
+
+    def test_combination_separates_selection_from_the_fixed_candidate_editor(self):
+        dom = ElementContractParser(self.html)
+        self.assertIn("styleCombinationModal", dom.ancestor_ids("styleCombinationSummary"))
+        self.assertIn("styleCombinationCandidates", dom.ancestor_ids("styleArtistList"))
+        self.assertNotIn("styleCombinationCandidates", dom.ancestor_ids("styleCurrentCombination"))
+        self.assertEqual("details", dom.by_id["styleCombinationCandidates"]["tag"])
+        self.assertNotIn("open", dom.by_id["styleCombinationCandidates"]["attrs"])
+
     def test_style_editor_behavior_with_node(self):
         result = subprocess.run(
-            ["node", "--test", str(BEHAVIOR_TEST_PATH)],
+            ["node", "--test", str(BEHAVIOR_TEST_PATH), str(GRAPH_BEHAVIOR_TEST_PATH)],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -1065,35 +1171,15 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.css)
 
-    def test_empty_style_result_only_compacts_style_maker_editor(self):
-        self.assertNotIn(
-            ".style-maker-layout:has(#latestStyleResult > .latest-result-placeholder)",
-            self.css,
-        )
-        self.assertNotIn(
-            ".style-maker-layout:has(#latestStyleResult > .latest-result-meta:only-child)",
-            self.css,
-        )
-
-        editor_start = self.css.index(".style-maker-editor {")
-        editor_rule = self.css[editor_start:self.css.index("}", editor_start)]
-        for marker in ("overflow-y: auto", "scrollbar-gutter: stable"):
-            with self.subTest(editor_marker=marker):
-                self.assertIn(marker, editor_rule)
-
-        compact_start = self.css.index(
-            ".style-maker-editor:has(#latestStyleResult > .latest-result-placeholder)"
-        )
-        compact_rule = self.css[compact_start:self.css.index("}", compact_start)]
-        for marker in (
-            ".style-maker-editor:has(#latestStyleResult > .latest-result-meta:only-child)",
-            "grid-template-rows: auto auto auto auto",
-            "align-content: start",
-            "align-self: start",
-        ):
-            with self.subTest(compact_marker=marker):
-                self.assertIn(marker, compact_rule)
-        self.assertNotIn("align-items: start", compact_rule)
+    def test_empty_style_result_does_not_change_workspace_columns_or_hide_controls(self):
+        self.assertNotIn(".style-maker-layout:has(#latestStyleResult > .latest-result-placeholder)", self.css)
+        self.assertNotIn(".style-maker-layout:has(#latestStyleResult > .latest-result-meta:only-child)", self.css)
+        self.assertRegex(self.css, r"#styleMakerEditor\s*\{[^}]*align-self:\s*stretch")
+        self.assertRegex(self.css, r"#styleMakerEditor #latestStyleResult\s*\{[^}]*min-height:\s*0")
+        dom = ElementContractParser(self.html)
+        for element_id in ("rerollStyleArtists", "rerollStyleWeights", "rerollStyleAll"):
+            self.assertIn("styleMakerEditor", dom.ancestor_ids(element_id))
+            self.assertNotIn("latestStyleResult", dom.ancestor_ids(element_id))
 
     def test_style_manager_desktop_rows_stretch_scroll_panes_and_stack_on_mobile(self):
         manager_start = self.css.index(".style-manager-view.active {")
@@ -1125,43 +1211,18 @@ class StyleFrontendContractTest(unittest.TestCase):
             with self.subTest(mobile_marker=marker):
                 self.assertIn(marker, mobile_css)
 
-    def test_small_viewports_constrain_style_maker_and_comparison_min_content(self):
-        responsive_start = self.css.index("@media (max-width: 900px)")
-        responsive = self.css[responsive_start:]
-        for marker in (
-            "body.style-maker-active",
-            "grid-template-columns: minmax(0, 1fr)",
-            "body.style-maker-active .topbar",
-            "body.style-maker-active main",
-            "body.style-maker-active .tabs",
-            "body.style-maker-active .style-maker-layout",
-            "body.style-maker-active .generation-scroll",
-            "width: 100%",
-            "max-width: 100%",
-        ):
-            with self.subTest(style_maker_marker=marker):
-                self.assertIn(marker, responsive)
-        for marker in (
-            ".style-maker-pane",
-            "overflow: visible",
-            ".style-settings-body",
-            ".generation-scroll",
-        ):
-            with self.subTest(style_maker_mobile_marker=marker):
-                self.assertIn(marker, responsive)
+    def test_small_viewports_keep_comparison_min_content_constrained(self):
         comparison_mobile_start = self.css.index("@media (max-width: 760px)")
         comparison_mobile = self.css[comparison_mobile_start:self.css.index(".topbar", comparison_mobile_start)]
         self.assertIn(".comparison-editor:not(.detail-collapsed):not(.settings-collapsed)", comparison_mobile)
         self.assertIn("grid-template-columns: minmax(0, 1fr)", comparison_mobile)
 
-    def test_wide_layouts_remain_multi_column_until_the_900px_breakpoint(self):
+    def test_pick_layout_remains_multi_column_until_the_900px_breakpoint(self):
         wide = self.css[self.css.index("@media (max-width: 1320px)"):self.css.index("@media (max-width: 900px)")]
         self.assertNotIn(".pick-layout", wide)
-        self.assertNotIn(".style-maker-layout", wide)
         narrow = self.css[self.css.index("@media (max-width: 900px)"):]
         for marker in (
             ".pick-layout",
-            ".style-maker-layout",
             "grid-template-columns: 1fr",
             "height: auto",
             "min-height: 0",
@@ -1196,26 +1257,14 @@ class StyleFrontendContractTest(unittest.TestCase):
             self.assertNotIn(marker, self.html)
         self.assertNotIn("shared_dependency_percent", self.script)
 
-    def test_shared_dependency_reference_picker_can_collapse_and_clear_fixed_state(self):
-        for marker in (
-            'id="sharedDependencyReferencePicker"',
-            'class="shared-dependency-reference-picker" open',
-            'id="sharedDependencyReferenceSummary"',
-            'id="clearSharedDependencyReference"',
-            "고정 해제 · 랜덤으로",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, self.html)
-        for marker in (
-            "function clearSharedDependencyReference()",
-            "styleState.sharedDependencyReferenceMode = \"random\"",
-            "styleState.sharedDependencyReferenceId = null",
-            "styleState.sharedDependencyReference = null",
-            'styleElement("clearSharedDependencyReference")?.addEventListener',
-            ".shared-dependency-reference-picker > summary",
-        ):
-            with self.subTest(marker=marker):
-                self.assertIn(marker, self.script if marker.startswith(("function", "styleState", "styleElement")) else self.css)
+    def test_shared_dependency_reference_summary_and_mix_modal_preserve_clear_fixed_action(self):
+        dom = ElementContractParser(self.html)
+        for element_id in ("sharedDependencyReferencePicker", "sharedDependencyReferenceSummary", "openSharedDependencyReference"):
+            self.assertIn("styleWeightsPanel", dom.ancestor_ids(element_id))
+        self.assertIn("styleSharedMixModal", dom.ancestor_ids("clearSharedDependencyReference"))
+        self.assertIn("고정 해제 · 랜덤으로", dom.by_id["clearSharedDependencyReference"]["text"])
+        for marker in ("function clearSharedDependencyReference()", 'styleState.sharedDependencyReferenceMode = "random"', "styleState.sharedDependencyReferenceId = null", "styleState.sharedDependencyReference = null", 'styleElement("clearSharedDependencyReference")?.addEventListener'):
+            self.assertIn(marker, self.script)
 
     def test_generated_detail_shows_shared_dependency_snapshot_link(self):
         for marker in (
@@ -1235,7 +1284,7 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn('class="help-tooltip-wrap"', self.html)
         self.assertIn('class="help-tooltip-button"', self.html)
         self.assertIn('role="tooltip"', self.html)
-        self.assertIn('aria-label="공유 그림체 의존 비율 설명"', self.html)
+        self.assertIn('aria-describedby="help-rating-exclusion"', self.html)
         self.assertIn(".help-tooltip-button:focus-visible", self.css)
         self.assertIn(".field-label", self.css)
         self.assertIn(".field .help-tooltip-content", self.css)
@@ -1243,31 +1292,21 @@ class StyleFrontendContractTest(unittest.TestCase):
         self.assertIn('class="field-label"><span>제외할 태그/프롬프트</span><span class="help-tooltip-wrap"', self.html)
         self.assertEqual(self.html.count('id="help-exclude-query"'), 1)
 
-    def test_style_maker_tooltips_are_attached_to_labels_and_layered_above_ui(self):
-        for marker in (
-            'class="field-label tooltip-section-label"><span>공유 작가 범위</span><span class="help-tooltip-wrap"',
-            'class="field-label tooltip-section-label"><span>공급원 비율</span><span class="help-tooltip-wrap"',
-            'class="field-label"><span>여기서도 바로 수정</span><span class="help-tooltip-wrap"',
-            'class="field-label"><strong>수집 태그로 작가 제외</strong><span class="help-tooltip-wrap"',
-        ):
-            self.assertIn(marker, self.html)
-        for tooltip_id in (
-            "help-shared-range",
-            "help-shared-ratios",
-            "help-weight-table",
-            "help-rating-exclusion",
-        ):
-            self.assertEqual(self.html.count(f'id="{tooltip_id}"'), 1)
+    def test_style_maker_moved_controls_retain_modal_help_and_accessible_tooltips(self):
+        dom = ElementContractParser(self.html)
+        self.assertIn("ratingTagRulesModal", dom.ancestor_ids("help-rating-exclusion"))
+        self.assertIn("styleSharedMixModal", dom.ancestor_ids("sharedDependencyRatioSummary"))
+        self.assertIn("합계 100%", dom.by_id["sharedDependencyRatioSummary"]["text"])
+        self.assertIn("후보가 부족하면", dom.by_id["sharedDependencyRatioSummary"]["text"])
+        self.assertIn("순서 0은", dom.by_id["weightTableModal"]["text"])
         self.assertIn(".help-tooltip-wrap:focus-within", self.css)
         self.assertIn("z-index: 1001", self.css)
 
-    def test_high_score_control_is_before_score_buttons(self):
-        section_start = self.html.index('<summary>허용 평점</summary>')
-        body_start = self.html.index('<div class="style-settings-section-body">', section_start)
-        prefer_index = self.html.index('id="preferHighScores"', section_start)
-        score_index = self.html.index('id="styleScoreButtons"', section_start)
-        self.assertLess(body_start, prefer_index)
-        self.assertLess(prefer_index, score_index)
+    def test_high_score_preference_remains_with_artist_conditions(self):
+        dom = ElementContractParser(self.html)
+        self.assertIn("styleArtistsPanel", dom.ancestor_ids("preferHighScores"))
+        self.assertIn("styleArtistsPanel", dom.ancestor_ids("styleScoreButtons"))
+        self.assertEqual("checkbox", dom.by_id["preferHighScores"]["attrs"]["type"])
 
     def test_novelai_v5_model_controls_and_usage_contract(self):
         for marker in (

@@ -60,6 +60,8 @@ TABLE_ORDER = [
     "style_group_decisions",
     "style_group_images",
     "style_group_image_artists",
+    "style_worldcups",
+    "style_worldcup_participants",
 ]
 
 SKIP_TABLES = {
@@ -79,6 +81,7 @@ PATH_COLUMNS = {
     "arca_style_images": {"image_path": "shared"},
     "style_group_images": {"image_path": "style_group"},
     "style_groups": {"reference_image_path": "style_group"},
+    "style_worldcup_participants": {"image_path": "shared"},
 }
 
 FK_COLUMNS = {
@@ -99,6 +102,7 @@ FK_COLUMNS = {
     ("style_group_decisions", "source_id"): ("style_group_sources", "id"),
     ("style_group_images", "group_id"): ("style_groups", "id"),
     ("style_group_image_artists", "image_id"): ("style_group_images", "id"),
+    ("style_worldcup_participants", "worldcup_id"): ("style_worldcups", "id"),
     ("nai_artist_test_items", "test_id"): ("nai_artist_tests", "id"),
     ("nai_artist_test_items", "generated_image_id"): ("generated_images", "id"),
     ("nai_artist_test_ratings", "test_id"): ("nai_artist_tests", "id"),
@@ -117,6 +121,7 @@ NATURAL_KEYS = {
     "confirmed_style_images": ("image_path",),
     "arca_style_items": ("source_url",),
     "arca_style_images": ("item_id", "image_url"),
+    "arca_collection_run_items": ("run_id", "item_id"),
     "arca_collection_invalidations": (
         "keyword", "tabs", "max_pages", "max_posts", "search_scope", "invalidated_date"
     ),
@@ -132,6 +137,8 @@ NATURAL_KEYS = {
     "style_group_decisions": ("group_id", "source_id", "candidate_key"),
     "style_group_images": ("group_id", "sha256"),
     "style_group_image_artists": ("image_id", "artist_key"),
+    "style_worldcups": ("uuid",),
+    "style_worldcup_participants": ("worldcup_id", "ordinal"),
 }
 
 
@@ -499,6 +506,12 @@ def _merge_table(connection, source, table, id_maps, path_map):
             if column in mapped:
                 mapped[column] = _mapped_foreign_value(table, column, mapped[column], id_maps)
                 category = PATH_COLUMNS.get(table, {}).get(column)
+                if table == "style_worldcup_participants" and column == "image_path":
+                    # Only pre-source snapshots default to shared. Unknown
+                    # sources must not borrow a same-named file from another root.
+                    category = {"shared": "shared", "confirmed": "confirmed"}.get(
+                        mapped.get("image_source", "shared")
+                    )
                 if category:
                     mapped[column] = _map_path(mapped[column], category, path_map)
         mapped = _map_special_values(table, mapped, id_maps)
@@ -529,6 +542,11 @@ def _merge_table(connection, source, table, id_maps, path_map):
                 f'SELECT * FROM "{table}" WHERE id=?', (new_id,)
             ).fetchone()
             existing[key] = inserted
+        else:
+            # Composite-key tables can receive the same mapped row from
+            # several deduplicated parents.  Cache each insertion too, so
+            # those duplicates do not trigger a full-table conflict scan.
+            existing[key] = mapped
     return table_map
 
 

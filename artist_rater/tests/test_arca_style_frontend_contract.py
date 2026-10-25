@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -143,7 +144,12 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn(".arca-statistics-sample-gallery", css)
         self.assertIn(".arca-statistics-content", css)
         self.assertIn(".arca-recommendation-filter", css)
-        self.assertIn("grid-template-columns: minmax(180px, 1.35fr) repeat(2, minmax(140px, 1fr)) auto", css)
+        self.assertIn("grid-template-columns: minmax(210px, 1.2fr) minmax(150px, 1fr) repeat(2, minmax(120px, .8fr)) auto", css)
+        self.assertIn('.arca-statistics-model-field { grid-column: 1 / -1; }', css)
+        self.assertIn('id="arcaStatisticsFeedback"', html)
+        self.assertIn('id="retryArcaStatistics"', html)
+        self.assertLess(html.index('class="arca-recommendation-filter"'), html.index('class="arca-statistics-model-tabs"'))
+        self.assertNotIn('renderArcaStyleStatistics({});', source)
         self.assertIn("@media (max-width: 700px) { .arca-recommendation-filter { grid-template-columns: 1fr 1fr; }", css)
         self.assertIn(".arca-statistics-sort-button", css)
         self.assertIn(".arca-statistic-inline-image", css)
@@ -184,6 +190,43 @@ class ArcaStyleFrontendContractTest(unittest.TestCase):
         self.assertIn("globalThis.promptTagAutocomplete?.bind?.(input)", source)
         self.assertIn("globalThis.promptTagAutocomplete?.hide?.()", source)
         self.assertNotIn('"arcaEditMemo"', source[source.index('"arcaEditPrompt", "arcaEditNegativePrompt"'):source.index('"arcaEditPrompt", "arcaEditNegativePrompt"') + 100])
+
+    def test_stats_refresh_is_a_separate_accessible_full_width_action(self):
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('<button id="refreshArcaStats" type="button" aria-describedby="arcaStatsRefreshHint">조회·추천 갱신</button>', html)
+        self.assertIn('id="arcaStatsRefreshHint"', html)
+        self.assertIn("수집할 때 사용한 검색어로 목록을 먼저 확인하고, 남은 글만 개별 확인합니다. 이미지와 프롬프트는 유지합니다.", html)
+        self.assertIn("당일 수집한 날짜는 새 글 확인을 위해 다시 검색합니다.", html)
+        css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+        self.assertIn(".arca-collection-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));", css)
+        self.assertIn("#refreshArcaStats { grid-column: 1 / -1; }", css)
+        self.assertIn(".arca-collection-actions button { min-width: 0; min-height: 44px; overflow-wrap: anywhere; }", css)
+
+    def test_stats_refresh_model_dialog_keeps_actions_outside_the_scroll_body(self):
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+        modal = html.split('<div id="arcaStatsRefreshModal"', 1)[1].split('<div id="arcaTagStatisticsModal"', 1)[0]
+        self.assertIn('role="dialog" aria-modal="true" aria-labelledby="arcaStatsRefreshTitle" tabindex="-1"', modal)
+        for marker in ('data-close-arca-stats-refresh', 'id="closeArcaStatsRefresh"',
+                       'class="arca-stats-refresh-body"', 'id="arcaStatsRefreshStatus"',
+                       'id="cancelArcaStatsRefresh"', 'id="startArcaStatsRefresh"'):
+            self.assertIn(marker, modal)
+        self.assertIn('value="v5" selected', modal)
+        self.assertIn('</div>\n        <footer class="arca-stats-refresh-actions">', modal)
+        self.assertIn("선택한 모델의 이미지가 있는 저장 게시글", modal)
+        refresh_options = re.search(r'<select id="arcaStatsRefreshModel">(.*?)</select>', modal, re.S).group(1)
+        list_options = re.search(r'<select id="arcaModelFilter">(.*?)</select>', html, re.S).group(1)
+        self.assertEqual(re.findall(r'<option value="([^"]+)"', refresh_options),
+                         re.findall(r'<option value="([^"]+)"', list_options))
+        css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+        dialog = re.search(r'\.arca-stats-refresh-dialog \{([^}]+)\}', css).group(1)
+        for rule in ("width: min(480px, 100%)", "height: auto", "max-height: min(640px, calc(100dvh - 32px))",
+                     "grid-template-rows: auto minmax(0, 1fr) auto", "overflow: hidden", "min-width: 0", "min-height: 0"):
+            self.assertIn(rule, dialog)
+        body = re.search(r'\.arca-stats-refresh-body \{([^}]+)\}', css).group(1)
+        for rule in ("min-width: 0", "min-height: 0", "overflow-y: auto", "overflow-x: hidden"):
+            self.assertIn(rule, body)
+        self.assertIn("#arcaStatsRefreshModal { padding: 16px; }", css)
+        self.assertIn(".arca-stats-refresh-dialog button, #arcaStatsRefreshModel { min-width: 0; min-height: 44px; }", css)
 
     def test_image_level_model_filter_contract(self):
         html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
