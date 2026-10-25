@@ -2,6 +2,7 @@ const arcaState = {
   loaded: false, collecting: false, selectedId: null, selectedItem: null, timer: null, pollTimer: null,
   loginPollTimer: null, activeJobId: null, browserConnected: false,
   pendingCollectionPayload: null, loginImporting: false, browserSessionLoadPromise: null,
+  credentialsSaved: false, credentialsBusy: false, loginPending: false,
   imageRestoreEstimate: null,
   statsRefreshModel: "v5", statsRefreshStarting: false,
   coverageTimer: null, statisticsLoaded: false, statisticsData: null, statisticsView: "artist",
@@ -84,7 +85,7 @@ function fillMissingArcaDates(value = {}, today = "") {
 }
 
 function isArcaCollectionBusy(value) {
-  return Boolean(value?.collecting || value?.pendingCollectionPayload);
+  return Boolean(value?.collecting || value?.pendingCollectionPayload || value?.credentialsBusy || value?.loginPending || value?.loginImporting);
 }
 
 function shouldRefreshArcaBrowserSession(eventType, visibilityState) {
@@ -612,11 +613,100 @@ function setArcaCollectionControlsDisabled(disabled) {
     const element = arcaEl(id);
     if (element) element.disabled = disabled;
   }
+  updateArcaCredentialControls();
 }
 
 function renderArcaBrowserSession(status) {
   arcaState.browserConnected = Boolean(status?.connected);
+  arcaState.loginPending = isArcaBrowserSessionPending(status);
+  updateArcaCredentialControls();
   arcaSetStatus("arcaBrowserSessionState", arcaBrowserSessionText(status), status?.connected ? "ok" : status?.error ? "error" : "");
+}
+
+function arcaLoginFetch(url, options = {}) {
+  return arcaFetch(url, { ...options, cache: "no-store", headers: {
+    "Content-Type": "application/json", "X-Arca-Local-Request": "1",
+  } });
+}
+
+function updateArcaCredentialControls() {
+  const busy = isArcaCollectionBusy(arcaState);
+  for (const id of ["arcaLoginUsername", "arcaLoginPassword", "saveArcaCredentials", "deleteArcaCredentials"]) {
+    const element = arcaEl(id);
+    if (element) element.disabled = busy;
+  }
+  for (const id of ["collectArcaStyles", "collectArcaUrl", "refreshArcaStats", "restoreArcaImages", "confirmRestoreArcaImages", "importArcaBrowserSession"]) {
+    const element = arcaEl(id);
+    if (element) element.disabled = busy;
+  }
+}
+
+function renderArcaCredentials(status) {
+  arcaState.credentialsSaved = Boolean(status?.saved);
+  const username = arcaEl("arcaLoginUsername");
+  if (username && !username.value) username.value = status?.username || "";
+  const button = arcaEl("importArcaBrowserSession");
+  if (button) button.textContent = status?.saved ? "저장된 계정으로 로그인" : "자동 연결 / 전용 로그인 창";
+  arcaSetStatus("arcaCredentialsStatus", status?.saved
+    ? `${status.username} 계정이 저장되어 있습니다. 비밀번호는 화면에 다시 표시하지 않습니다.`
+    : "저장된 계정이 없습니다.");
+}
+
+async function loadArcaCredentials() {
+  try {
+    renderArcaCredentials(await arcaLoginFetch("/api/arca-styles/credentials"));
+  } catch (error) {
+    arcaSetStatus("arcaCredentialsStatus", error.message, "error");
+  }
+}
+
+async function saveArcaCredentials() {
+  if (isArcaCollectionBusy(arcaState)) return;
+  const username = arcaEl("arcaLoginUsername")?.value.trim() || "";
+  const passwordInput = arcaEl("arcaLoginPassword");
+  const password = passwordInput?.value || "";
+  if (!username || !password) {
+    arcaSetStatus("arcaCredentialsStatus", "아이디와 비밀번호를 입력해 주세요.", "error");
+    return;
+  }
+  arcaState.credentialsBusy = true;
+  updateArcaCredentialControls();
+  let saved = false;
+  try {
+    const pending = arcaLoginFetch("/api/arca-styles/credentials", {
+      method: "POST", body: JSON.stringify({ username, password }),
+    });
+    if (passwordInput) passwordInput.value = "";
+    renderArcaCredentials(await pending);
+    saved = true;
+  } catch (error) {
+    arcaSetStatus("arcaCredentialsStatus", error.message, "error");
+  } finally {
+    if (passwordInput) passwordInput.value = "";
+    arcaState.credentialsBusy = false;
+    updateArcaCredentialControls();
+  }
+  if (saved) await importArcaBrowserSession();
+}
+
+async function deleteArcaCredentials() {
+  if (isArcaCollectionBusy(arcaState)) return;
+  arcaState.credentialsBusy = true;
+  updateArcaCredentialControls();
+  try {
+    const status = await arcaLoginFetch("/api/arca-styles/credentials", { method: "DELETE" });
+    for (const id of ["arcaLoginUsername", "arcaLoginPassword"]) {
+      const input = arcaEl(id);
+      if (input) input.value = "";
+    }
+    renderArcaCredentials(status);
+    arcaSetStatus("arcaCredentialsStatus", "저장된 계정을 삭제했습니다. 현재 연결된 로그인은 유지됩니다.");
+  } catch (error) {
+    arcaSetStatus("arcaCredentialsStatus", error.message, "error");
+  } finally {
+    arcaState.credentialsBusy = false;
+    updateArcaCredentialControls();
+  }
 }
 
 function clearArcaBrowserSessionPoll() {
@@ -682,13 +772,14 @@ function scheduleArcaBrowserSessionPoll() {
 }
 
 async function importArcaBrowserSession() {
-  if (arcaState.loginImporting) return;
+  if (arcaState.loginImporting || arcaState.credentialsBusy || arcaState.collecting || arcaState.loginPending) return;
   arcaState.loginImporting = true;
+  updateArcaCredentialControls();
   const button = arcaEl("importArcaBrowserSession");
   if (button) button.disabled = true;
-  arcaSetStatus("arcaBrowserSessionState", "Chrome과 Edge에서 로그인 확인 중…");
+  arcaSetStatus("arcaBrowserSessionState", arcaState.credentialsSaved ? "저장된 계정으로 전용 로그인 창 여는 중…" : "Chrome과 Edge에서 로그인 확인 중…");
   try {
-    const status = await arcaFetch("/api/arca-styles/browser-session/import", { method: "POST" });
+    const status = await arcaLoginFetch("/api/arca-styles/browser-session/import", { method: "POST" });
     await handleArcaBrowserSessionStatus(status, true);
   } catch (error) {
     renderArcaBrowserSession({ connected: false, error: error.message });
@@ -696,7 +787,8 @@ async function importArcaBrowserSession() {
     clearPendingArcaCollection();
   } finally {
     arcaState.loginImporting = false;
-    if (button) button.disabled = Boolean(arcaState.collecting || arcaState.pendingCollectionPayload);
+    updateArcaCredentialControls();
+    if (button) button.disabled = isArcaCollectionBusy(arcaState);
   }
 }
 
@@ -1880,7 +1972,7 @@ async function restoreArcaImages() {
 }
 
 async function collectArcaUrl() {
-  if (arcaState.collecting) return;
+  if (isArcaCollectionBusy(arcaState)) return;
   const payload = normalizeArcaUrlPayload(arcaEl("arcaDirectUrl")?.value, arcaEl("arcaWebpCompress")?.checked);
   if (!payload.source_url) {
     arcaSetStatus("arcaCollectorStatus", "추가할 게시글 링크를 입력해 주세요.", "error");
@@ -1974,6 +2066,8 @@ function bindArcaCollector() {
   arcaEl("arcaImageArchiveFile")?.addEventListener("change", (event) => uploadLocalArcaImageArchive(event.target.files?.[0]));
   arcaEl("collectArcaUrl")?.addEventListener("click", collectArcaUrl);
   arcaEl("importArcaBrowserSession")?.addEventListener("click", importArcaBrowserSession);
+  arcaEl("saveArcaCredentials")?.addEventListener("click", saveArcaCredentials);
+  arcaEl("deleteArcaCredentials")?.addEventListener("click", deleteArcaCredentials);
   arcaEl("setupArcaSessionBridge")?.addEventListener("click", setupArcaSessionBridge);
   arcaEl("refreshArcaBrowserSession")?.addEventListener("click", loadArcaBrowserSession);
   arcaEl("pauseArcaCollection")?.addEventListener("click", () => controlArcaCollection("pause"));
@@ -2089,6 +2183,7 @@ function bindArcaCollector() {
     else if (!arcaEl("arcaTagStatisticsModal")?.classList.contains("hidden")) closeArcaTagStatistics();
   });
   loadArcaBrowserSession();
+  loadArcaCredentials();
   loadArcaSearchCoverage();
   loadCurrentArcaCollectionJob();
 }

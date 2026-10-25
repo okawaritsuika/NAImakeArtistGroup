@@ -18,6 +18,7 @@ class ArcaStyleApiTest(unittest.TestCase):
                 "CONFIRMED_STYLE_IMAGE_DIR", "COMPARISON_IMAGE_DIR",
                 "ARCA_STYLE_IMAGE_DIR", "SETTINGS_JSON_PATH", "DB_PATH",
                 "ARCA_STYLE_SEED_PATH", "MERGE_SOURCE_DIRS",
+                "ARCA_CREDENTIALS",
             )
         }
         app.DATA_DIR = self.data_dir
@@ -30,6 +31,7 @@ class ArcaStyleApiTest(unittest.TestCase):
         app.DB_PATH = self.data_dir / "test.sqlite"
         app.ARCA_STYLE_SEED_PATH = self.data_dir / "missing-seed.sqlite"
         app.MERGE_SOURCE_DIRS = []
+        app.ARCA_CREDENTIALS = app.ArcaCredentialsStore(self.data_dir / "arca_credentials.bin")
         app.init_db()
         app.app.config["TESTING"] = True
         self.client = app.app.test_client()
@@ -128,7 +130,7 @@ class ArcaStyleApiTest(unittest.TestCase):
             "connected": False, "browser": "", "error": "", "state": "waiting",
             "message": "로그인 창에서 아카라이브에 로그인해 주세요.",
         }
-        response = self.client.post("/api/arca-styles/browser-session/import")
+        response = self.client.post("/api/arca-styles/browser-session/import", headers={"X-Arca-Local-Request": "1"})
         self.assertEqual(response.status_code, 202)
         self.assertNotIn("secret-cookie", response.get_data(as_text=True))
         self.assertEqual(set(response.get_json()), {"connected", "browser", "error", "state", "message"})
@@ -138,7 +140,7 @@ class ArcaStyleApiTest(unittest.TestCase):
     @patch("app.ARCA_LOGIN_MANAGER")
     def test_browser_session_import_does_not_open_window_when_auto_import_succeeds(self, manager, import_session):
         import_session.return_value = {"connected": True, "browser": "Edge", "error": ""}
-        response = self.client.post("/api/arca-styles/browser-session/import")
+        response = self.client.post("/api/arca-styles/browser-session/import", headers={"X-Arca-Local-Request": "1"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["state"], "connected")
         manager.start.assert_not_called()

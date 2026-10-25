@@ -25,10 +25,12 @@ from arca_chrome_extension import (
     install_arca_session_bridge,
 )
 from arca_login_window import ArcaLoginWindowManager
+from arca_credentials import ArcaCredentialsError, ArcaCredentialsStore
 
 from arca_style_collector import (
     ArcaCollectorError,
     connect_arca_cookie_jar,
+    clear_arca_browser_session,
     delete_arca_style,
     get_collection_job,
     get_latest_resumable_collection_job,
@@ -255,8 +257,10 @@ _danbooru_last_request_started = None
 
 ARCA_LOGIN_MANAGER = ArcaLoginWindowManager(
     DATA_DIR / "arca_login_profile",
-    lambda jar: connect_arca_cookie_jar(jar, "전용 Chrome"),
+    lambda jar, **kwargs: connect_arca_cookie_jar(jar, "전용 Chrome", **kwargs),
 )
+ARCA_CREDENTIALS = ArcaCredentialsStore(DATA_DIR / "arca_credentials.bin")
+ARCA_ACCOUNT_LOCK = threading.RLock()
 
 
 def configure_data_directories(data_dirs, primary_data_dir=None):
@@ -264,7 +268,7 @@ def configure_data_directories(data_dirs, primary_data_dir=None):
 
     global DATA_DIR, THUMBNAIL_DIR, GENERATED_DIR, CONFIRMED_STYLE_IMAGE_DIR
     global COMPARISON_IMAGE_DIR, ARCA_STYLE_IMAGE_DIR, STYLE_GROUP_IMAGE_DIR, SETTINGS_JSON_PATH, DB_PATH
-    global ARCA_LOGIN_MANAGER, MERGE_SOURCE_DIRS
+    global ARCA_LOGIN_MANAGER, ARCA_CREDENTIALS, MERGE_SOURCE_DIRS
     primary, sources = normalize_data_dirs(data_dirs, primary_data_dir)
     DATA_DIR = primary
     MERGE_SOURCE_DIRS = sources
@@ -278,8 +282,9 @@ def configure_data_directories(data_dirs, primary_data_dir=None):
     DB_PATH = DATA_DIR / "artist_rater.sqlite"
     ARCA_LOGIN_MANAGER = ArcaLoginWindowManager(
         DATA_DIR / "arca_login_profile",
-        lambda jar: connect_arca_cookie_jar(jar, "전용 Chrome"),
+        lambda jar, **kwargs: connect_arca_cookie_jar(jar, "전용 Chrome", **kwargs),
     )
+    ARCA_CREDENTIALS = ArcaCredentialsStore(DATA_DIR / "arca_credentials.bin")
     return DATA_DIR, list(MERGE_SOURCE_DIRS)
 
 app = Flask(
@@ -4995,12 +5000,66 @@ def api_arca_browser_session_status():
     return json_response(_safe_arca_browser_status(get_arca_browser_session_status()))
 
 
+def _arca_credentials_request_is_local():
+    # A custom header prevents cross-site forms; Host also blocks DNS rebinding.
+    if not _external_injection_request_is_local():
+        return False
+    if request.headers.get("X-Arca-Local-Request") != "1":
+        return False
+    try:
+        host = urlparse(request.host_url).hostname
+    except ValueError:
+        return False
+    if host not in {"localhost", "127.0.0.1", "::1"}:
+        return False
+    origin = request.headers.get("Origin")
+    return not origin or origin == request.host_url.rstrip("/")
+
+
+@app.route("/api/arca-styles/credentials", methods=["GET", "POST", "DELETE"])
+def api_arca_credentials():
+    if not _arca_credentials_request_is_local():
+        return json_response({"error": "앱 화면에서 로그인 정보를 변경해 주세요."}, 403)
+    try:
+        with ARCA_ACCOUNT_LOCK:
+            if request.method != "GET" and ARCA_LOGIN_MANAGER.status().get("state") in {"opening", "waiting"}:
+                return json_response({"error": "열린 로그인 창을 완료하거나 닫은 뒤 계정을 변경해 주세요."}, 409)
+            if request.method == "POST":
+                if request.mimetype != "application/json":
+                    return json_response({"error": "JSON 요청이 필요합니다."}, 415)
+                if request.content_length is None or request.content_length > 32768:
+                    return json_response({"error": "로그인 정보가 너무 깁니다."}, 413)
+                payload = request.get_json(silent=True)
+                if not isinstance(payload, dict):
+                    return json_response({"error": "아이디와 비밀번호를 입력해 주세요."}, 400)
+                ARCA_CREDENTIALS.save(payload.get("username"), payload.get("password"))
+            elif request.method == "DELETE":
+                ARCA_CREDENTIALS.delete()
+            response = json_response(ARCA_CREDENTIALS.status())
+    except ArcaCredentialsError as exc:
+        response = json_response({"error": str(exc)}, 400)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.route("/api/arca-styles/browser-session/import", methods=["POST"])
 def api_import_arca_browser_session():
-    imported = import_arca_browser_session()
-    if imported.get("connected"):
-        return json_response(_safe_arca_browser_status(imported), 200)
-    return json_response(_safe_arca_browser_status(imported, ARCA_LOGIN_MANAGER.start()), 202)
+    if not _arca_credentials_request_is_local():
+        return json_response({"error": "앱 화면에서 로그인 연결을 시작해 주세요."}, 403)
+    with ARCA_ACCOUNT_LOCK:
+        try:
+            credentials = ARCA_CREDENTIALS.load()
+        except ArcaCredentialsError as exc:
+            return json_response({"error": str(exc)}, 400)
+        if credentials:
+            # Saved accounts never fall back to a different account in daily Chrome.
+            clear_arca_browser_session()
+            status = ARCA_LOGIN_MANAGER.start(credentials=credentials)
+            return json_response(_safe_arca_browser_status({}, status), 202)
+        imported = import_arca_browser_session()
+        if imported.get("connected"):
+            return json_response(_safe_arca_browser_status(imported), 200)
+        return json_response(_safe_arca_browser_status(imported, ARCA_LOGIN_MANAGER.start()), 202)
 
 
 @app.route("/api/arca-styles/browser-session/extension", methods=["POST"])

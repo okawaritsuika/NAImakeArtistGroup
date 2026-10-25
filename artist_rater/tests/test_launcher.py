@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import launcher
 
@@ -38,6 +39,13 @@ class FakeResponse:
 
 
 class LauncherControllerTest(unittest.TestCase):
+    def test_server_port_override_keeps_loopback_and_default_port(self):
+        for options, expected in (([], 5001), (["--port", "51234"], 51234)):
+            with self.subTest(options=options), patch("launcher.sys.argv", ["launcher.py", "--server", "--data-dir", "fixture-data", *options]), \
+                    patch("app.configure_data_directories"), patch("app.init_db"), patch("app.app.run") as run, patch("builtins.print"):
+                launcher.main()
+                run.assert_called_once_with(host="127.0.0.1", port=expected, debug=False)
+
     def test_data_directory_options_allow_repeated_sources_and_primary_selection(self):
         data_dirs, primary = launcher.parse_data_directory_options(
             ["--data-dir", "C:/one", "--data-dir", "C:/two", "--primary-data-dir", "C:/two"]
@@ -132,7 +140,7 @@ class LauncherControllerTest(unittest.TestCase):
                 controller.remove_data_directory("C:/one")
 
     def test_packaged_version_matches_next_release(self):
-        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.13")
+        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.14")
 
     def test_independent_frozen_environment_removes_parent_bootloader_state(self):
         env = launcher.independent_frozen_environment({

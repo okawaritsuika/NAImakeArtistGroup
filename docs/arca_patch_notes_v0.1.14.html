@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>v0.1.14 · 아카라이브 계정 저장과 자동 로그인</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0c1318; --panel:#131f27; --line:#2a3c45; --text:#eaf2f4; --muted:#b0c1c9; --mint:#9de8d4; --mint-bg:#193c35; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif; font-size:15px; line-height:1.8; word-break:keep-all; overflow-wrap:anywhere; }
+    main { width:min(100% - 48px,960px); margin:0 auto; padding:48px 0 32px; }
+    p,h1,h2,h3 { margin:0; }
+    a { color:var(--mint); text-underline-offset:4px; }
+    a:focus-visible,summary:focus-visible { outline:3px solid var(--mint); outline-offset:5px; }
+    .eyebrow { color:#8da7b2; font-size:11px; font-weight:700; letter-spacing:.14em; }
+    .release { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin:18px 0 16px; color:var(--muted); font-size:13px; }
+    .badge { border:1px solid #467466; border-radius:100px; padding:2px 12px; background:var(--mint-bg); color:var(--mint); font-weight:700; }
+    h1 { font-size:clamp(28px,4.5vw,43px); line-height:1.35; font-weight:750; letter-spacing:-.05em; }
+    h1 span { color:var(--mint); }
+    .intro { max-width:660px; margin-top:18px; color:var(--muted); font-size:16px; }
+    .actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:24px; }
+    .button { display:inline-flex; align-items:center; justify-content:center; min-height:46px; padding:10px 18px; border:1px solid #3b535d; border-radius:9px; color:var(--text); font-size:14px; font-weight:700; line-height:1.5; text-decoration:none; }
+    .button.primary { border-color:var(--mint); background:var(--mint); color:#102b24; }
+    .button:hover { border-color:var(--mint); }
+    .update { margin-top:12px; color:#94adb7; font-size:12px; }
+    header { padding-bottom:30px; border-bottom:1px solid var(--line); }
+    section { margin-top:30px; }
+    .section-head { display:flex; align-items:baseline; flex-wrap:wrap; gap:8px 16px; margin-bottom:14px; }
+    h2 { font-size:21px; line-height:1.5; letter-spacing:-.025em; }
+    .section-head p { color:#91abb5; font-size:13px; }
+    .features { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+    .card { min-width:0; padding:20px; border:1px solid var(--line); border-radius:13px; background:var(--panel); }
+    .card h3 { margin:8px 0; font-size:16px; line-height:1.5; }
+    .card p { color:var(--muted); font-size:14px; }
+    .tag { color:var(--mint); font-size:11px; font-weight:700; letter-spacing:.06em; }
+    .path { padding:13px 16px; border:1px solid #33574d; border-radius:10px; background:#122a25; color:#cae9df; font-size:14px; }
+    .path span { padding:0 5px; color:#7bb5a2; }
+    .steps { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0 0; padding:0; list-style:none; counter-reset:step; }
+    .steps li { position:relative; min-width:0; padding:18px 18px 18px 55px; border:1px solid var(--line); border-radius:11px; counter-increment:step; }
+    .steps li::before { content:counter(step,decimal-leading-zero); position:absolute; left:18px; top:19px; color:var(--mint); font-size:12px; font-weight:750; }
+    .steps strong { display:block; margin-bottom:4px; font-size:15px; }
+    .steps p { color:var(--muted); font-size:14px; }
+    .scope { margin-top:14px; padding-left:14px; border-left:3px solid #638e80; color:var(--muted); font-size:14px; }
+    .scope strong { color:var(--text); }
+    .help { padding:22px; border:1px solid #465048; border-radius:13px; background:#1c2423; }
+    .help > p { margin-top:9px; color:var(--muted); font-size:14px; }
+    .codes { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:16px; }
+    .codes p { min-width:0; color:#bccdc7; font-size:13px; }
+    code { font-family:Consolas,monospace; color:#d8f6e8; font-size:.95em; }
+    .codes code { display:block; margin-bottom:3px; font-weight:700; }
+    .report { margin-top:18px; padding-top:16px; border-top:1px solid #3a4943; color:var(--muted); font-size:13px; }
+    .report strong { color:#e3eee6; }
+    .privacy { margin-top:10px; color:var(--mint); font-size:13px; }
+    footer { display:flex; flex-wrap:wrap; justify-content:space-between; gap:10px; margin-top:28px; padding-top:16px; border-top:1px solid var(--line); color:#8da7b2; font-size:12px; }
+    @media(max-width:780px) { main { padding-top:30px; } .features { grid-template-columns:1fr; } .card { padding:16px 18px; } .card h3 { margin:3px 0 5px; } }
+    @media(max-width:520px) { main { width:calc(100% - 32px); padding-top:24px; } h1 { font-size:29px; } .intro { font-size:15px; } .actions { flex-direction:column; } .steps,.codes { grid-template-columns:1fr; } section { margin-top:26px; } .help { padding:18px; } .path { font-size:13px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">DANBOORU ARTIST RATER · UPDATE</p>
+    <div class="release"><span class="badge">v0.1.14</span><span>아카라이브 로그인 개선</span></div>
+    <h1>아카라이브 로그인,<br><span>계정을 저장해 더 간편하게</span></h1>
+    <p class="intro">아이디와 비밀번호를 저장하면 앱 전용 Chrome 창에 한 번 자동 입력합니다. 확장 프로그램 설치 없이 로그인 연결을 시작할 수 있습니다.</p>
+    <div class="actions">
+      <a class="button primary" href="https://github.com/okawaritsuika/NAImakeArtistGroup/releases/download/v0.1.14/DanbooruArtistRater.exe">v0.1.14 EXE 다운로드</a>
+      <a class="button" href="https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.14">GitHub 릴리스</a>
+    </div>
+    <p class="update">Windows · Chrome 설치 필요 · 업데이트 시 기존 EXE 옆의 data 폴더를 유지해 주세요.</p>
+  </header>
+
+  <section aria-labelledby="changes-title">
+    <div class="section-head"><h2 id="changes-title">이번에 달라진 점</h2></div>
+    <div class="features">
+      <article class="card"><span class="tag">ACCOUNT</span><h3>계정 정보를 암호화해 저장</h3><p>아이디와 비밀번호 전체를 Windows DPAPI로 암호화합니다. 저장 정보는 같은 Windows 사용자 계정에서만 복원할 수 있습니다.</p></article>
+      <article class="card"><span class="tag">BROWSER</span><h3>계정별 전용 Chrome</h3><p>앱이 관리하는 계정별 로그인 창을 사용합니다. 로그인 화면 단계에 맞춰 정보를 한 번 입력하며, 반복해서 제출하지 않습니다.</p></article>
+      <article class="card"><span class="tag">CHOICE</span><h3>확장 프로그램은 선택</h3><p>계정 저장 방식으로 바로 시작하거나, 기존 확장으로 평소 Chrome의 로그인을 연결할 수 있습니다.</p></article>
+    </div>
+  </section>
+
+  <section aria-labelledby="start-title">
+    <div class="section-head"><h2 id="start-title">이렇게 시작하세요</h2><p>처음 한 번 계정을 저장합니다.</p></div>
+    <p class="path">공유 그림체 수집 <span>›</span> 🔞 게시판 로그인 <span>›</span> <strong>계정 저장하고 자동 로그인</strong></p>
+    <ol class="steps">
+      <li><strong>계정 입력</strong><p>위 메뉴를 펼쳐 아카라이브 아이디와 비밀번호를 입력합니다.</p></li>
+      <li><strong>저장하고 로그인</strong><p>버튼을 누르면 전용 Chrome이 열리고 로그인 정보를 자동 입력합니다.</p></li>
+      <li><strong>열린 창에서 인증 완료</strong><p>캡차나 추가 인증이 나오면 직접 완료하고, 앱의 로그인 연결 상태를 확인해 주세요.</p></li>
+      <li><strong>다음에는 한 번의 클릭</strong><p><b>저장된 계정으로 로그인</b>을 눌러 다시 연결합니다. 비밀번호를 매번 입력할 필요가 줄어듭니다.</p></li>
+    </ol>
+    <p class="scope"><strong>R18 기간 수집</strong>에서 로그인이 필요하면 연결 후 대기 중인 수집을 자동으로 이어갑니다.<br><strong>링크 추가·조회/추천 갱신</strong>은 먼저 로그인을 연결한 뒤 실행해 주세요.</p>
+  </section>
+
+  <section class="help" aria-labelledby="help-title">
+    <h2 id="help-title">연결이 계속 실패한다면</h2>
+    <p>Chrome에서 로그인하는 단계와 앱이 게시판에 접속하는 단계는 별도입니다. 계정을 저장해도 인증서·프록시·사이트 차단 같은 앱의 네트워크 문제는 남을 수 있습니다.</p>
+    <div class="codes">
+      <p><code>ARCA_TLS</code>보안 인증서 확인 실패입니다. PC 날짜·시간과 보안 프로그램의 HTTPS 검사 설정을 확인해 주세요.</p>
+      <p><code>ARCA_PROXY</code>프록시 연결 실패입니다. Windows 또는 사용 중인 네트워크의 프록시 설정을 확인해 주세요.</p>
+    </div>
+    <div class="report"><strong>오류 제보에 필요한 내용</strong><br>앱 버전 · 누른 버튼 · 화면에 나온 오류 문구 전체 · 전용 Chrome 창이 닫힌 시점</div>
+    <p class="privacy">비밀번호나 쿠키 파일은 보내지 마세요. 화면을 공유할 때는 아이디도 가려 주세요.</p>
+  </section>
+
+  <footer><span>Danbooru Artist Rater · v0.1.14</span><a href="https://arca.live/b/aiart/177316727">프로그램 소개 본글</a></footer>
+</main>
+</body>
+</html>

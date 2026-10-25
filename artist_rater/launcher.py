@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 
 
 APP_URL = "http://127.0.0.1:5001"
-CURRENT_VERSION = "v0.1.13"
+CURRENT_VERSION = "v0.1.14"
 GITHUB_LATEST_RELEASE_API = (
     "https://api.github.com/repos/okawaritsuika/NAImakeArtistGroup/releases/latest"
 )
@@ -895,6 +895,11 @@ def main():
     if "--server" in sys.argv:
         from app import app, configure_data_directories, init_db
 
+        server_parser = argparse.ArgumentParser(add_help=False)
+        server_parser.add_argument("--port", type=int, default=5001)
+        server_options, _ = server_parser.parse_known_args(sys.argv[1:])
+        if not 1 <= server_options.port <= 65535:
+            server_parser.error("port must be between 1 and 65535")
         if has_cli_data_configuration:
             configure_data_directories(data_dirs, primary_data_dir)
         else:
@@ -905,8 +910,8 @@ def main():
             configure_data_directories(controller.data_dirs, controller.primary_data_dir)
         init_db()
         print("Danbooru Artist Rater")
-        print(f"Open {APP_URL}")
-        app.run(host="127.0.0.1", port=5001, debug=False)
+        print(f"Open http://127.0.0.1:{server_options.port}")
+        app.run(host="127.0.0.1", port=server_options.port, debug=False)
         return
     controller_options = {
         "app_dir": default_app_dir,

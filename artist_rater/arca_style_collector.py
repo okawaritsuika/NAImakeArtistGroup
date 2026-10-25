@@ -197,6 +197,10 @@ def connect_arca_cookie_jar(cookie_jar, browser, validator=None, user_agent=""):
                 return dict(_ARCA_BROWSER_STATUS)
     except requests.Timeout:
         return clear_arca_browser_session("아카라이브 로그인 확인 시간이 초과되었습니다. 잠시 후 다시 연결해 주세요.")
+    except requests.exceptions.SSLError:
+        return clear_arca_browser_session("앱에서 아카라이브의 보안 인증서를 확인하지 못했습니다. PC 날짜·시간과 보안 프로그램의 HTTPS 검사 설정을 확인해 주세요. (ARCA_TLS)")
+    except requests.exceptions.ProxyError:
+        return clear_arca_browser_session("앱의 프록시 연결에 실패했습니다. Windows 또는 네트워크의 프록시 설정을 확인해 주세요. (ARCA_PROXY)")
     except requests.ConnectionError:
         return clear_arca_browser_session("아카라이브에 접속하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 연결해 주세요.")
     except requests.HTTPError as exc:

@@ -4337,6 +4337,12 @@ textarea {
 .arca-browser-session { display: grid; gap: 8px; padding: 10px; border: 1px solid #303a49; border-radius: 10px; background: #111720; }
 .arca-browser-session > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .arca-browser-session .status { margin: 0; text-align: right; }
+.arca-credentials-setup { min-width: 0; }
+.arca-credentials-setup > summary { cursor: pointer; }
+.arca-credentials-setup .field { margin-top: 8px; }
+.arca-credentials-setup input { min-width: 0; width: 100%; box-sizing: border-box; }
+.arca-credentials-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.arca-credentials-setup .status { text-align: left; overflow-wrap: anywhere; }
 .arca-image-download-options { border: 1px solid #303a49; border-radius: 10px; background: #111720; }
 .arca-image-download-options > summary { display: grid; gap: 3px; padding: 11px 12px; cursor: pointer; list-style-position: inside; font-weight: 700; }
 .arca-image-download-options > summary span:last-child { padding-left: 18px; color: var(--muted); font-size: 12px; font-weight: 500; }

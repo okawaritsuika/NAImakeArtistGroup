@@ -223,6 +223,10 @@ class ArcaCollectorTest(unittest.TestCase):
         jar = CookieJar()
         jar.set_cookie(self._cookie(".arca.live", "session", "test-secret"))
         cases = [(requests.Timeout("test-secret"), "시간"), (requests.ConnectionError("test-secret"), "네트워크")]
+        cases.extend([
+            (requests.exceptions.SSLError("test-secret"), "ARCA_TLS"),
+            (requests.exceptions.ProxyError("test-secret"), "ARCA_PROXY"),
+        ])
         for code, expected in [(403, "차단"), (429, "요청이 많"), (503, "HTTP 503")]:
             response = requests.Response()
             response.status_code = code

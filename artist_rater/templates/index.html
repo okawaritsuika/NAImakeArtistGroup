@@ -869,6 +869,17 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. -->
           <section class="arca-browser-session">
             <div><strong>🔞 게시판 로그인</strong><span id="arcaBrowserSessionState" class="status">브라우저 로그인 연결 안 됨</span></div>
             <button id="importArcaBrowserSession" type="button">자동 연결 / 전용 로그인 창</button>
+            <details class="arca-credentials-setup">
+              <summary>계정 저장하고 자동 로그인</summary>
+              <p class="notice">확장 프로그램 없이 전용 Chrome 창에서 로그인합니다. 저장한 정보는 이 Windows 사용자 계정에서만 복원할 수 있습니다. 캡차·추가 인증은 열린 창에서 직접 완료해 주세요.</p>
+              <label class="field"><span>아카라이브 아이디</span><input id="arcaLoginUsername" type="text" autocomplete="username" maxlength="256" spellcheck="false"></label>
+              <label class="field"><span>비밀번호</span><input id="arcaLoginPassword" type="password" autocomplete="off" maxlength="4096" placeholder="저장하거나 변경할 비밀번호"></label>
+              <div class="arca-credentials-actions">
+                <button id="saveArcaCredentials" type="button">저장하고 로그인</button>
+                <button id="deleteArcaCredentials" type="button">저장된 계정 삭제</button>
+              </div>
+              <p id="arcaCredentialsStatus" class="status" aria-live="polite"></p>
+            </details>
             <details class="arca-session-bridge-setup">
               <summary>지금 쓰는 Chrome 로그인 그대로 연결하기</summary>
               <p class="notice">처음 한 번만 아래 확장을 등록하면, 현재 Chrome의 아카라이브 로그인만 로컬 앱에 전달할 수 있습니다. 이미 설치했다면 앱 업데이트 후 <strong>설치 폴더 열기</strong>를 누르고, <code>chrome://extensions</code>에서 <strong>Arca Session Bridge 새로고침</strong> 후 <strong>현재 로그인 연결</strong>을 눌러 주세요.</p>
