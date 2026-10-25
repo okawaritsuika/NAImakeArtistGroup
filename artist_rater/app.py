@@ -4972,12 +4972,21 @@ def _safe_arca_browser_status(status, login_status=None):
             "state": "connected", "message": f"{browser or '브라우저'} 로그인 연결됨",
         }
     login_status = login_status or ARCA_LOGIN_MANAGER.status()
+    state = str(login_status.get("state") or "idle")
+    error = str(status.get("error") or "")
+    if state in {"opening", "waiting"}:
+        error = str(login_status.get("error") or "")
+        message = str(login_status.get("message") or "로그인 창에서 아카라이브에 로그인해 주세요.")
+    elif error:
+        state, message = "failed", error
+    elif state in {"failed", "cancelled"}:
+        error = str(login_status.get("error") or "")
+        message = str(login_status.get("message") or error or "브라우저 로그인 연결 안 됨")
+    else:
+        state, message = "idle", "브라우저 로그인 연결 안 됨"
     return {
-        "connected": bool(login_status.get("connected")),
-        "browser": str(login_status.get("browser") or ""),
-        "error": str(login_status.get("error") or ""),
-        "state": str(login_status.get("state") or "idle"),
-        "message": str(login_status.get("message") or "브라우저 로그인 연결 안 됨"),
+        "connected": False, "browser": "", "error": error,
+        "state": state, "message": message,
     }
 
 
@@ -5002,7 +5011,9 @@ def api_connect_arca_browser_extension():
         cookie_jar = extension_payload_to_cookie_jar(request.get_json(silent=True))
     except ArcaChromeExtensionError as exc:
         return json_response({"error": str(exc)}, 400)
-    connected = connect_arca_cookie_jar(cookie_jar, "현재 Chrome")
+    connected = connect_arca_cookie_jar(
+        cookie_jar, "현재 Chrome", user_agent=request.headers.get("User-Agent", ""),
+    )
     if connected.get("connected"):
         return json_response(_safe_arca_browser_status(connected))
     error = str(connected.get("error") or "아카라이브 로그인을 확인하지 못했습니다.")

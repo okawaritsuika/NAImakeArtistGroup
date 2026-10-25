@@ -170,6 +170,39 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         connect.assert_not_called()
 
+    @patch("app.ARCA_LOGIN_MANAGER")
+    @patch("app.get_arca_browser_session_status")
+    def test_browser_status_keeps_actual_failure_over_old_login_window_success(self, get_status, manager):
+        message = "아카라이브 로그인 확인 요청이 차단되었습니다."
+        get_status.return_value = {"connected": False, "browser": "", "error": message}
+        manager.status.return_value = {"connected": True, "browser": "전용 Chrome", "state": "connected"}
+        result = self.client.get("/api/arca-styles/browser-session").get_json()
+        self.assertFalse(result["connected"])
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["error"], message)
+        self.assertEqual(result["message"], message)
+
+    @patch("app.ARCA_LOGIN_MANAGER")
+    @patch("app.get_arca_browser_session_status")
+    def test_browser_status_does_not_restore_cleared_session_from_manager(self, get_status, manager):
+        get_status.return_value = {"connected": False, "browser": "", "error": ""}
+        manager.status.return_value = {"connected": True, "browser": "전용 Chrome", "state": "connected"}
+        result = self.client.get("/api/arca-styles/browser-session").get_json()
+        self.assertFalse(result["connected"])
+        self.assertEqual(result["state"], "idle")
+
+    @patch("app.connect_arca_cookie_jar")
+    def test_browser_extension_passes_browser_user_agent_to_validation(self, connect):
+        connect.return_value = {"connected": True, "browser": "현재 Chrome", "error": ""}
+        response = self.client.post(
+            "/api/arca-styles/browser-session/extension",
+            headers={"X-Arca-Session-Bridge": "1", "User-Agent": "Chrome-bridge-test/1.0"},
+            json={"cookies": [{"name": "session", "value": "test-secret", "domain": ".arca.live", "path": "/"}]},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(connect.call_args.kwargs.get("user_agent"), "Chrome-bridge-test/1.0")
+        self.assertNotIn("test-secret", response.get_data(as_text=True))
+
     @patch("app.install_arca_session_bridge")
     def test_browser_extension_setup_opens_persistent_install_folder(self, install):
         install.return_value = Path(self.temp.name) / "arca_session_bridge"

@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +43,14 @@ class ChromeExtensionAssetTest(unittest.TestCase):
         self.assertIn('"X-Arca-Session-Bridge": "1"', script)
         for marker in ("console.", "localStorage", "sessionStorage", "chrome.storage"):
             self.assertNotIn(marker, script)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for popup behavior tests")
+    def test_popup_login_result_behavior(self):
+        result = subprocess.run(
+            [shutil.which("node"), "--test", str(ROOT / "tests" / "arca_session_bridge_behavior.test.js")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class ExtensionCookiePayloadTest(unittest.TestCase):

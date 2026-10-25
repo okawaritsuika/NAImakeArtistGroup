@@ -85,6 +85,7 @@ class ArcaCollectionStopped(ArcaCollectorError):
 
 _ARCA_BROWSER_LOCK = RLock()
 _ARCA_BROWSER_COOKIES = CookieJar()
+_ARCA_BROWSER_USER_AGENT = ""
 _ARCA_BROWSER_STATUS = {"connected": False, "browser": "", "error": ""}
 _COLLECTION_CONTROL_LOCK = RLock()
 _COLLECTION_CONTROLS = {}
@@ -137,9 +138,10 @@ def _is_arca_cookie(cookie):
 
 
 def clear_arca_browser_session(error=""):
-    global _ARCA_BROWSER_COOKIES, _ARCA_BROWSER_STATUS
+    global _ARCA_BROWSER_COOKIES, _ARCA_BROWSER_STATUS, _ARCA_BROWSER_USER_AGENT
     with _ARCA_BROWSER_LOCK:
         _ARCA_BROWSER_COOKIES = CookieJar()
+        _ARCA_BROWSER_USER_AGENT = ""
         _ARCA_BROWSER_STATUS = {"connected": False, "browser": "", "error": str(error or "")}
         return dict(_ARCA_BROWSER_STATUS)
 
@@ -155,32 +157,59 @@ def snapshot_imported_arca_cookies():
 
 
 def _apply_imported_arca_cookies(session):
-    for cookie in snapshot_imported_arca_cookies():
-        session.cookies.set_cookie(cookie)
+    with _ARCA_BROWSER_LOCK:
+        for cookie in _ARCA_BROWSER_COOKIES:
+            session.cookies.set_cookie(copy.copy(cookie))
+        if _ARCA_BROWSER_USER_AGENT:
+            session.headers["User-Agent"] = _ARCA_BROWSER_USER_AGENT
     return session
 
 
-def connect_arca_cookie_jar(cookie_jar, browser, validator=None):
-    global _ARCA_BROWSER_COOKIES, _ARCA_BROWSER_STATUS
+def connect_arca_cookie_jar(cookie_jar, browser, validator=None, user_agent=""):
+    global _ARCA_BROWSER_COOKIES, _ARCA_BROWSER_STATUS, _ARCA_BROWSER_USER_AGENT
     filtered = CookieJar()
     for cookie in cookie_jar or []:
         if _is_arca_cookie(cookie):
             filtered.set_cookie(copy.copy(cookie))
     if not list(filtered):
         return clear_arca_browser_session("아카라이브 로그인 정보를 찾지 못했습니다.")
+    if not isinstance(user_agent, str) or len(user_agent) > 1024 or any(
+        ord(character) < 32 or ord(character) > 126 for character in user_agent
+    ):
+        user_agent = ""
+    user_agent = user_agent.strip() or USER_AGENT
     try:
-        session = create_arca_session()
-        for cookie in filtered:
-            session.cookies.set_cookie(copy.copy(cookie))
-        categories = (validator or discover_category_params)(session)
-        if "R18_NAI" not in categories:
-            return clear_arca_browser_session("로그인했지만 🔞 NAI 접근을 확인하지 못했습니다.")
-        with _ARCA_BROWSER_LOCK:
-            _ARCA_BROWSER_COOKIES = filtered
-            _ARCA_BROWSER_STATUS = {"connected": True, "browser": str(browser or ""), "error": ""}
-            return dict(_ARCA_BROWSER_STATUS)
+        with closing(create_arca_session()) as session:
+            # Login checks should return promptly; collection retains its retries.
+            session.mount("https://", HTTPAdapter(max_retries=0))
+            session.headers["User-Agent"] = user_agent
+            for cookie in filtered:
+                session.cookies.set_cookie(copy.copy(cookie))
+            categories = (validator or discover_category_params)(session)
+            if "R18_NAI" not in categories:
+                return clear_arca_browser_session(
+                    "🔞 NAI 접근을 확인하지 못했습니다. 이 Chrome에서 아카라이브 로그인과 🔞 NAI 탭 접근을 확인한 뒤 다시 연결해 주세요."
+                )
+            with _ARCA_BROWSER_LOCK:
+                _ARCA_BROWSER_COOKIES = filtered
+                _ARCA_BROWSER_USER_AGENT = user_agent
+                _ARCA_BROWSER_STATUS = {"connected": True, "browser": str(browser or ""), "error": ""}
+                return dict(_ARCA_BROWSER_STATUS)
+    except requests.Timeout:
+        return clear_arca_browser_session("아카라이브 로그인 확인 시간이 초과되었습니다. 잠시 후 다시 연결해 주세요.")
+    except requests.ConnectionError:
+        return clear_arca_browser_session("아카라이브에 접속하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 연결해 주세요.")
+    except requests.HTTPError as exc:
+        status = getattr(exc.response, "status_code", None)
+        if status in {401, 403}:
+            message = "아카라이브가 앱의 로그인 확인 요청을 거부하거나 차단했습니다. Chrome에서 게시판 접근을 확인한 뒤 다시 연결해 주세요."
+        elif status == 429:
+            message = "아카라이브 요청이 많아 로그인 확인이 제한되었습니다. 잠시 후 다시 연결해 주세요."
+        else:
+            message = f"아카라이브 로그인 확인 중 서버 오류가 발생했습니다. (HTTP {status})"
+        return clear_arca_browser_session(message)
     except Exception:
-        return clear_arca_browser_session("아카라이브 로그인 확인에 실패했습니다.")
+        return clear_arca_browser_session("아카라이브 로그인 확인에 실패했습니다. Chrome에서 게시판 접근을 확인한 뒤 다시 연결해 주세요.")
 
 
 def import_arca_browser_session(loaders=None, validator=None):

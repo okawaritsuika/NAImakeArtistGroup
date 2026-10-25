@@ -196,6 +196,60 @@ class ArcaCollectorTest(unittest.TestCase):
         self.assertEqual(snapshot_imported_arca_cookies(), [])
         self.assertNotIn("invalid-secret", str(status))
 
+    def test_connection_preserves_browser_user_agent_for_validation_and_collection(self):
+        jar = CookieJar()
+        jar.set_cookie(self._cookie(".arca.live", "session", "test-secret"))
+        seen = []
+
+        def validator(session):
+            seen.append(session.headers["User-Agent"])
+            return {"R18_NAI": {"category": "r18"}}
+
+        status = connect_arca_cookie_jar(jar, "현재 Chrome", validator=validator, user_agent="Chrome-bridge-test/1.0")
+        self.assertTrue(status["connected"])
+        self.assertEqual(seen, ["Chrome-bridge-test/1.0"])
+        with create_arca_session() as session:
+            collector_module._apply_imported_arca_cookies(session)
+            self.assertEqual(session.headers["User-Agent"], "Chrome-bridge-test/1.0")
+            self.assertEqual(session.cookies.get("session"), "test-secret")
+        self.assertNotIn("Chrome-bridge-test", str(status))
+        clear_arca_browser_session()
+        with create_arca_session() as session:
+            collector_module._apply_imported_arca_cookies(session)
+            self.assertEqual(session.headers["User-Agent"], USER_AGENT)
+            self.assertEqual(list(session.cookies), [])
+
+    def test_connection_reports_safe_network_failures_and_closes_validation_session(self):
+        jar = CookieJar()
+        jar.set_cookie(self._cookie(".arca.live", "session", "test-secret"))
+        cases = [(requests.Timeout("test-secret"), "시간"), (requests.ConnectionError("test-secret"), "네트워크")]
+        for code, expected in [(403, "차단"), (429, "요청이 많"), (503, "HTTP 503")]:
+            response = requests.Response()
+            response.status_code = code
+            cases.append((requests.HTTPError("test-secret", response=response), expected))
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__, expected=expected):
+                with create_arca_session() as session:
+                    def validator(actual):
+                        self.assertEqual(actual.get_adapter("https://arca.live").max_retries.total, 0)
+                        raise error
+                    with patch.object(session, "close", wraps=session.close) as close, patch.object(collector_module, "create_arca_session", return_value=session):
+                        result = connect_arca_cookie_jar(jar, "현재 Chrome", validator=validator)
+                        close.assert_called_once()
+                    self.assertFalse(result["connected"])
+                    self.assertIn(expected, result["error"])
+                    self.assertNotIn("test-secret", str(result))
+                    self.assertEqual(snapshot_imported_arca_cookies(), [])
+
+    def test_connection_ignores_invalid_user_agent_without_header_injection(self):
+        jar = CookieJar()
+        jar.set_cookie(self._cookie(".arca.live", "session", "test-secret"))
+        for invalid in ["bad\r\nInjected: value", "x" * 1025, None]:
+            def validator(session):
+                self.assertEqual(session.headers["User-Agent"], USER_AGENT)
+                return {"R18_NAI": {"category": "r18"}}
+            self.assertTrue(connect_arca_cookie_jar(jar, "현재 Chrome", validator=validator, user_agent=invalid)["connected"])
+
     def test_discovers_nai_and_r18_category_queries_from_board_links(self):
         html = '''
         <a href="/b/aiart?category=nai">NAI</a>
@@ -684,7 +738,9 @@ class ArcaCollectorTest(unittest.TestCase):
         )
 
         class Session:
-            def __init__(self): self.cookies = CookieJar()
+            def __init__(self):
+                self.cookies = CookieJar()
+                self.headers = {}
 
         session = Session()
         article = {

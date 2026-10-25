@@ -717,7 +717,7 @@ async function setupArcaSessionBridge() {
       }
     }
     const suffix = copied ? " 폴더 경로도 복사했습니다." : path ? ` 선택할 폴더: ${path}` : "";
-    arcaSetStatus("arcaSessionBridgeSetupStatus", `설치 폴더를 열었습니다.${suffix}`, "success");
+    arcaSetStatus("arcaSessionBridgeSetupStatus", `설치 폴더를 열었습니다.${suffix} 이미 설치했다면 chrome://extensions에서 Arca Session Bridge를 새로고침한 뒤 현재 로그인 연결을 눌러 주세요.`, "success");
   } catch (error) {
     arcaSetStatus("arcaSessionBridgeSetupStatus", error.message, "error");
   } finally {

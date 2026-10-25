@@ -22,7 +22,13 @@ connectButton.addEventListener("click", async () => {
   connectButton.disabled = true;
   setStatus("Chrome 로그인 확인 중…");
   try {
-    const cookies = await chrome.cookies.getAll({ domain: "arca.live" });
+    let cookies;
+    try {
+      cookies = await chrome.cookies.getAll({ domain: "arca.live" });
+    } catch (_error) {
+      setStatus("Chrome 쿠키를 읽지 못했습니다. 확장의 아카라이브 사이트 접근 권한을 확인해 주세요.", "error");
+      return;
+    }
     if (!cookies.length) {
       setStatus("이 Chrome에서 아카라이브 로그인을 찾지 못했습니다.", "error");
       return;
@@ -36,8 +42,13 @@ connectButton.addEventListener("click", async () => {
       body: JSON.stringify({ cookies: transferableCookies(cookies) }),
     });
     const result = await response.json().catch(() => ({}));
-    if (!response.ok || !result.connected) {
-      setStatus("로그인 연결을 확인하지 못했습니다.", "error");
+    if (!response.ok || !result?.connected) {
+      const message = typeof result?.error === "string" && result.error.trim()
+        ? result.error
+        : response.status === 404
+          ? "로컬 앱에 Chrome 로그인 연결 기능이 없습니다. 앱을 업데이트한 뒤 다시 연결해 주세요."
+          : `로컬 앱의 로그인 확인 응답이 올바르지 않습니다. (HTTP ${response.status})`;
+      setStatus(message, "error");
       return;
     }
     setStatus("아카라이브 로그인을 연결했습니다.", "success");
