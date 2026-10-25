@@ -1,5 +1,7 @@
 # v0.1.12 — 이상형 월드컵과 그림체 제작 개선
 
+[EXE 다운로드](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/download/v0.1.12/DanbooruArtistRater.exe) · [GitHub 릴리스](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.12) · [프로그램 소개 본글](https://arca.live/b/aiart/177316727)
+
 - 공유·확정 그림체로 이상형 월드컵을 만들고 참가 갤러리에서 필터·자동 선택·영역 선택으로 명단을 구성할 수 있습니다. 참가 수 제한 없이 부전승을 배정하고, 대결 자동 저장·이어하기·우승 결과와 전체 기록 확인을 지원합니다.
 - 그림체 제작 화면의 작가 조건, 프롬프트, 히스토리와 생성 리모콘을 정리했습니다. 고정·캐릭터 프롬프트와 생성 설정을 모달에서 편집하고, 가중치 그래프와 현재 조합·제외 태그 복구를 사용할 수 있습니다.
 - NovelAI V5 Full Medium을 추가했습니다. 모델 전용 생성 설정과 네거티브 프리셋을 적용하며 생성 기록·확정 그림체·비교군·이미지 메타데이터에 모델 정보를 보존합니다.

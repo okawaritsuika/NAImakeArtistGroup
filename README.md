@@ -2,6 +2,12 @@
 
 Danbooru 작가를 평가하고, 평가 결과로 NovelAI용 그림체 프롬프트를 구성하는 Windows 로컬 도구입니다. 아카라이브의 그림체 공유 게시글과 이미지 메타데이터도 수집·정리할 수 있습니다.
 
+## 다운로드
+
+[v0.1.12 EXE 다운로드](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/download/v0.1.12/DanbooruArtistRater.exe) · [릴리스 및 변경사항](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.12) · [아카라이브 소개 본글](https://arca.live/b/aiart/177316727)
+
+업데이트할 때는 기존 EXE 옆의 `data` 폴더를 유지해 주세요.
+
 ## 주요 기능
 
 - Danbooru 작가 검색, 샘플 확인, 1~5점 평가
