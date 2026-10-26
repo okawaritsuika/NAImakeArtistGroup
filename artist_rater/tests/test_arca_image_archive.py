@@ -1,13 +1,15 @@
 import hashlib
 import io
 import json
+import os
+import ssl
 import sqlite3
 import tempfile
 import unittest
 import zipfile
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import arca_image_archive as archive_module
 from arca_image_archive import (
@@ -235,6 +237,232 @@ class ArcaImageArchiveTest(unittest.TestCase):
             second = append_local_upload(upload["upload_id"], 3, io.BytesIO(b"def"), 3)
         self.assertEqual(first["uploaded_bytes"], 3)
         self.assertEqual(second["uploaded_bytes"], 6)
+
+    def add_image(self, db_path, item_id, image_id, source, url):
+        with closing(sqlite3.connect(db_path)) as connection, connection:
+            connection.execute(
+                "INSERT INTO arca_style_items(id,source_url,collected_at,updated_at) VALUES(?,?,'now','now')",
+                (item_id, source),
+            )
+            connection.execute(
+                "INSERT INTO arca_style_images(id,item_id,image_url,metadata_status,created_at) VALUES(?,?,?,'ok','now')",
+                (image_id, item_id, url),
+            )
+
+    def legacy_spec(self, path, image_bytes=5):
+        return {
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "image_count": 1,
+            "image_bytes": image_bytes,
+        }
+
+    def test_legacy_pack_auto_detects_and_uses_historical_key_after_seed_ids_change(self):
+        source = "https://arca.live/b/aiart/1"
+        old_url = "https://ac.namu.la/path/one.png?expires=1&key=old"
+        refreshed_url = "https://ac.arca.live/path/one.png?expires=99&key=new"
+        name = hashlib.sha256(old_url.encode()).hexdigest() + ".png"
+        self.add_image(self.seed_path, 50, 60, source, refreshed_url)
+        self.add_image(self.db_path, 90, 100, source, refreshed_url)
+        path = self.make_archive([(1, 1, name, b"image")])
+        keys = {name: [source, archive_module._image_identity(old_url)]}
+        with (
+            patch.object(archive_module, "LEGACY_ARCHIVES", (self.legacy_spec(path),)),
+            patch.object(archive_module, "_legacy_image_keys", return_value=keys),
+        ):
+            result = install_image_archive(path, self.db_path, self.image_dir, self.seed_path)
+        self.assertEqual(result, {"installed": 1, "reused": 0, "updated_rows": 1, "skipped_rows": 0})
+        self.assertEqual((self.image_dir / name).read_bytes(), b"image")
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertEqual(connection.execute("SELECT image_path FROM arca_style_images WHERE id=100").fetchone()[0], name)
+
+    def test_legacy_pack_hash_mismatch_is_rejected_before_extracting_or_linking(self):
+        path = self.make_archive([(1, 1, "a" * 64 + ".png", b"image")])
+        spec = self.legacy_spec(path)
+        spec["sha256"] = "0" * 64
+        with patch.object(archive_module, "LEGACY_ARCHIVES", (spec,)):
+            with self.assertRaisesRegex(ArcaImageArchiveError, "SHA-256"):
+                install_image_archive(path, self.db_path, self.image_dir, self.seed_path)
+        self.assertFalse(self.image_dir.exists())
+        self.assertTrue(path.is_file())
+
+    def test_legacy_pack_installs_current_seed_images_and_skips_removed_sources(self):
+        source = "https://arca.live/b/aiart/1"
+        url = "https://ac.namu.la/one.png"
+        name = hashlib.sha256(url.encode()).hexdigest() + ".png"
+        removed_name = "b" * 64 + ".png"
+        self.add_image(self.seed_path, 50, 60, source, url)
+        self.add_image(self.db_path, 90, 100, source, url)
+        path = self.make_archive([(1, 1, name, b"image"), (2, 2, removed_name, b"other")])
+        spec = self.legacy_spec(path, image_bytes=10)
+        spec["image_count"] = 2
+        keys = {
+            name: [source, archive_module._image_identity(url)],
+            removed_name: ["https://arca.live/b/aiart/2", archive_module._image_identity("https://ac.namu.la/removed.png")],
+        }
+        with (
+            patch.object(archive_module, "LEGACY_ARCHIVES", (spec,)),
+            patch.object(archive_module, "_legacy_image_keys", return_value=keys),
+        ):
+            result = install_image_archive(path, self.db_path, self.image_dir, self.seed_path)
+        self.assertEqual(result, {"installed": 1, "reused": 0, "updated_rows": 1, "skipped_rows": 1})
+        self.assertEqual((self.image_dir / name).read_bytes(), b"image")
+        self.assertFalse((self.image_dir / removed_name).exists())
+
+    def test_legacy_manifest_ids_cannot_link_an_unknown_filename_to_another_image(self):
+        source = "https://arca.live/b/aiart/1"
+        self.add_image(self.seed_path, 1, 1, source, "https://ac.namu.la/actual.png")
+        self.add_image(self.db_path, 1, 1, source, "https://ac.namu.la/actual.png")
+        name = "a" * 64 + ".png"
+        path = self.make_archive([(1, 1, name, b"image")])
+        with (
+            patch.object(archive_module, "LEGACY_ARCHIVES", (self.legacy_spec(path),)),
+            patch.object(archive_module, "_legacy_image_keys", return_value={}),
+        ):
+            with self.assertRaises(ArcaImageArchiveError):
+                install_image_archive(path, self.db_path, self.image_dir, self.seed_path)
+        self.assertFalse((self.image_dir / name).exists())
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            self.assertFalse(connection.execute("SELECT image_path FROM arca_style_images").fetchone()[0])
+
+    def test_legacy_upload_uses_selected_size_through_append_finish_and_resume(self):
+        spec = {"bytes": 9, "sha256": "0" * 64, "image_count": 1, "image_bytes": 5}
+        with (
+            patch.object(archive_module, "ARCHIVE_BYTES", 6),
+            patch.object(archive_module, "LEGACY_ARCHIVES", (spec,)),
+            patch.object(archive_module, "_check_free_space"),
+            patch.object(archive_module, "_start_archive_job", return_value=42) as start_job,
+        ):
+            upload = start_local_upload(self.root, "renamed legacy.ZIP", 9)
+            token = upload["upload_id"]
+            first = append_local_upload(token, 0, io.BytesIO(b"abcdef"), 6)
+            second = append_local_upload(token, 6, io.BytesIO(b"ghi"), 3)
+            self.assertEqual(first["total_bytes"], 9)
+            self.assertEqual(second, {"uploaded_bytes": 9, "total_bytes": 9})
+            with self.assertRaises(ArcaImageArchiveError):
+                append_local_upload(token, 9, io.BytesIO(b"j"), 1)
+            self.assertEqual(archive_module.finish_local_upload(
+                self.db_path, self.image_dir, self.root, self.seed_path, token,
+            ), 42)
+            final_path = start_job.call_args.args[-1]
+            self.assertEqual(final_path.read_bytes(), b"abcdefghi")
+            job = {"request_json": json.dumps({"mode": "local_upload", "archive_path": str(final_path)})}
+            self.assertEqual(archive_module.resume_archive_job(
+                self.db_path, self.image_dir, self.root, self.seed_path, job,
+            ), 42)
+            self.assertEqual(start_job.call_count, 2)
+
+    def test_incomplete_legacy_upload_cannot_start_an_install(self):
+        spec = {"bytes": 9, "sha256": "0" * 64, "image_count": 1, "image_bytes": 5}
+        with (
+            patch.object(archive_module, "LEGACY_ARCHIVES", (spec,)),
+            patch.object(archive_module, "_check_free_space"),
+            patch.object(archive_module, "_start_archive_job") as start_job,
+        ):
+            upload = start_local_upload(self.root, "legacy.zip", 9)
+            append_local_upload(upload["upload_id"], 0, io.BytesIO(b"abc"), 3)
+            with self.assertRaises(ArcaImageArchiveError):
+                archive_module.finish_local_upload(
+                    self.db_path, self.image_dir, self.root, self.seed_path, upload["upload_id"],
+                )
+            start_job.assert_not_called()
+
+    def test_unknown_zip_size_and_non_zip_extension_are_rejected_before_upload(self):
+        for name, size in (("unknown.zip", 123), ("images.txt", archive_module.ARCHIVE_BYTES)):
+            with self.subTest(name=name), self.assertRaises(ArcaImageArchiveError):
+                start_local_upload(self.root, name, size)
+        self.assertFalse(list(self.root.glob("shared_images_upload_*")))
+
+    def test_completed_legacy_job_reports_its_own_image_count(self):
+        path = self.root / "legacy.zip"
+        path.write_bytes(b"fixture")
+        job_id = archive_module._create_archive_job(self.db_path, "local", path)
+        with (
+            patch.object(archive_module, "install_image_archive", return_value={
+                "installed": 1, "reused": 1, "updated_rows": 2, "skipped_rows": 1,
+            }),
+            patch.object(archive_module, "_missing_seed_images", return_value=0),
+        ):
+            archive_module._run_archive_job(
+                self.db_path, self.image_dir, self.root, self.seed_path, job_id, "local", path,
+            )
+        job = get_collection_job(self.db_path, job_id)
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["total_posts"], 3)
+        self.assertEqual(job["scanned_posts"], 3)
+        self.assertEqual(job["downloaded_images"], 2)
+        self.assertTrue(path.exists())
+
+    def test_download_tls_context_ignores_missing_optional_keylog_path(self):
+        keylog = str(self.root / "missing-debug-directory" / "keys.log")
+        with patch.dict(os.environ, {"SSLKEYLOGFILE": keylog}):
+            adapter = archive_module._ArchiveHTTPSAdapter()
+            try:
+                context = adapter.poolmanager.connection_pool_kw["ssl_context"]
+                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                self.assertTrue(context.check_hostname)
+                self.assertGreaterEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+                self.assertIsNone(context.keylog_filename)
+                self.assertEqual(os.environ["SSLKEYLOGFILE"], keylog)
+                self.assertFalse(Path(keylog).parent.exists())
+            finally:
+                adapter.close()
+
+    def test_http_and_https_proxy_pools_keep_verified_download_context(self):
+        adapter = archive_module._ArchiveHTTPSAdapter()
+        try:
+            context = adapter.poolmanager.connection_pool_kw["ssl_context"]
+            for proxy in ("http://proxy.invalid:8080", "https://proxy.invalid:8443"):
+                with self.subTest(proxy=proxy):
+                    manager = adapter.proxy_manager_for(proxy)
+                    self.assertIs(manager.connection_pool_kw["ssl_context"], context)
+                    if proxy.startswith("https:"):
+                        self.assertIs(manager.proxy_ssl_context, context)
+                    self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                    self.assertTrue(context.check_hostname)
+        finally:
+            adapter.close()
+
+    def test_download_tls_connection_loads_ca_without_recreating_default_context(self):
+        adapter = archive_module._ArchiveHTTPSAdapter()
+        try:
+            pool = adapter.poolmanager.connection_from_url("https://example.invalid/")
+            adapter.cert_verify(pool, "https://example.invalid/", True, None)
+            connection = pool._new_conn()
+            context = adapter.poolmanager.connection_pool_kw["ssl_context"]
+            with (
+                patch.object(connection, "_new_conn", return_value=MagicMock()),
+                patch("urllib3.connection.create_urllib3_context", side_effect=AssertionError("Default TLS context must not be recreated")),
+                patch("urllib3.util.ssl_._ssl_wrap_socket_impl", return_value=MagicMock()) as wrap_socket,
+            ):
+                connection.connect()
+            self.assertIs(connection.ssl_context, context)
+            self.assertTrue(connection.is_verified)
+            self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(context.check_hostname)
+            wrap_socket.assert_called_once()
+            connection.close()
+        finally:
+            adapter.close()
+
+    def test_internal_download_session_mounts_tls_adapter_and_closes_after_error(self):
+        session = MagicMock()
+        session.get.side_effect = archive_module.requests.ConnectionError("fixture network failure")
+        with (
+            patch.object(archive_module.requests, "Session", return_value=session),
+            patch.object(archive_module, "_check_free_space"),
+        ):
+            with self.assertRaises(archive_module.requests.ConnectionError):
+                download_google_archive(self.root / "download.partial")
+        session.mount.assert_called_once()
+        scheme, adapter = session.mount.call_args.args
+        self.assertEqual(scheme, "https://")
+        self.assertIsInstance(adapter, archive_module._ArchiveHTTPSAdapter)
+        self.assertEqual(adapter._ssl_context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(adapter._ssl_context.check_hostname)
+        session.close.assert_called_once()
+        adapter.close()
 
 
 if __name__ == "__main__":

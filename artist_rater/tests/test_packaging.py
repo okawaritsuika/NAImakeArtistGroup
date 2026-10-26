@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,15 @@ class PackagingTest(unittest.TestCase):
         self.assertIn('"$staticDir;static"', script)
         self.assertIn("export_arca_seed.py", script)
         self.assertIn('"$seedDb;."', script)
+        self.assertIn('$legacyImageIndex = Join-Path $appDir "arca_image_archive_legacy.json"', script)
+        self.assertIn('"$legacyImageIndex;."', script)
+        legacy = json.loads((root / "artist_rater" / "arca_image_archive_legacy.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(legacy), 1687)
+        for name, (source, identity) in legacy.items():
+            self.assertRegex(name, r"^[0-9a-f]{64}\.png$")
+            self.assertTrue(source.startswith("https://arca.live/b/"))
+            self.assertNotIn("expires=", identity)
+            self.assertNotIn("key=", identity)
         self.assertNotIn("data;data", script)
 
     def test_gitignore_excludes_release_secrets_and_generated_state(self):

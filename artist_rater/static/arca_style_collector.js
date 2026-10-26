@@ -356,20 +356,33 @@ function arcaSummaryText(result) {
     : `페이지 ${result.scanned_pages || 0} · 글 ${result.scanned_posts || 0} · 신규 ${result.saved || 0} · 갱신 ${result.updated || 0}`;
 }
 
+function archiveDisplayStage(job) {
+  if (!["failed", "stopped", "interrupted"].includes(job?.stage)) return job?.stage;
+  const bytes = job?.progress?.bytes || [job?.downloaded_bytes || 0, job?.estimated_bytes ?? null];
+  const total = Number(bytes[1]);
+  if (Number.isFinite(total) && total > 0) {
+    if (Number(bytes[0] || 0) < total) return "downloading_archive";
+    const processed = job?.progress?.posts?.[0] ?? job?.scanned_posts ?? 0;
+    if (!Number(processed)) return "preparing_archive";
+  }
+  return job?.stage;
+}
+
 function collectionProgress(job) {
   if (job?.status === "completed" && job?.skipped_existing) {
     return { determinate: true, percent: 100 };
   }
   if (job?.job_type === "image_archive") {
-    if (job.stage === "downloading_archive") {
-      const bytes = job?.progress?.bytes || [0, null];
+    const stage = archiveDisplayStage(job);
+    if (stage === "downloading_archive") {
+      const bytes = job?.progress?.bytes || [job?.downloaded_bytes || 0, job?.estimated_bytes ?? null];
       const done = Number(bytes[0] || 0);
       const total = bytes[1] == null ? null : Number(bytes[1]);
       return total && Number.isFinite(total)
         ? { determinate: true, percent: Math.min(100, Math.round(done * 100 / total)) }
         : { determinate: false, percent: 0 };
     }
-    if (job.stage === "verifying_archive") return { determinate: false, percent: 0 };
+    if (["verifying_archive", "preparing_archive"].includes(stage)) return { determinate: false, percent: 0 };
   }
   const posts = job?.progress?.posts || [job?.scanned_posts || 0, job?.total_posts ?? null];
   const done = Number(posts[0] || 0);
@@ -450,10 +463,12 @@ function collectionCountsText(job) {
   const total = (pair) => pair[1] == null ? "?" : pair[1];
   if (job?.job_type === "image_archive") {
     const bytes = progress.bytes || [job?.downloaded_bytes || 0, job?.estimated_bytes ?? null];
-    if (job.stage === "downloading_archive") {
+    const stage = archiveDisplayStage(job);
+    if (stage === "downloading_archive") {
       return `ZIP 다운로드 ${formatBytes(bytes[0])}/${bytes[1] == null ? "?" : formatBytes(bytes[1])}`;
     }
-    if (job.stage === "verifying_archive") return "ZIP SHA-256 및 매니페스트 확인 중";
+    if (stage === "verifying_archive") return "ZIP SHA-256 및 매니페스트 확인 중";
+    if (stage === "preparing_archive") return "ZIP 다운로드 완료 · 설치 준비";
     return `압축 해제 ${posts[0] || 0}/${total(posts)} · 준비 ${progress.images || 0}장`;
   }
   if (job?.job_type === "image_url_refresh") {

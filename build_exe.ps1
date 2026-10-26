@@ -12,6 +12,7 @@ $workDir = Join-Path $appDir ".build"
 $templatesDir = Join-Path $appDir "templates"
 $staticDir = Join-Path $appDir "static"
 $seedDb = Join-Path $appDir "arca_style_seed.sqlite"
+$legacyImageIndex = Join-Path $appDir "arca_image_archive_legacy.json"
 
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 Push-Location $appDir
@@ -37,6 +38,7 @@ try {
         --add-data "$templatesDir;templates" `
         --add-data "$staticDir;static" `
         --add-data "$seedDb;." `
+        --add-data "$legacyImageIndex;." `
         --collect-all playwright `
         --hidden-import app `
         --hidden-import browser_cookie3 `

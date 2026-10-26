@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import sqlite3
 import time
 import uuid
@@ -37,6 +38,12 @@ ARCHIVE_SHA256 = "212398f7be51a8ca945b332af162b0f53c24dec436384288ddd01d668191c7
 ARCHIVE_IMAGE_COUNT = 4_425
 ARCHIVE_IMAGE_BYTES = 691_163_540
 ARCHIVE_SEED_SHA256 = "24bb6a2a76def6602441ebe5f4c0cc16a9e83a8af278a7b8314d159a87efc022"
+LEGACY_ARCHIVES = ({
+    "bytes": 3_328_615_720,
+    "sha256": "a0e11b9ea5e6b07f8efd789eb5e78c4b4addfea318e4d1d692c0eeff26a5e4f6",
+    "image_count": 1_687,
+    "image_bytes": 3_327_765_422,
+},)
 ARCHIVE_FORMAT = "naimakeartistgroup-shared-images"
 DOWNLOAD_CHUNK_BYTES = 4 * 1024 * 1024
 LOCAL_UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024
@@ -51,6 +58,24 @@ class ArcaImageArchiveError(ArcaCollectorError):
     pass
 
 
+class _ArchiveHTTPSAdapter(requests.adapters.HTTPAdapter):
+    """Keep TLS verification without inheriting optional SSL key-log paths."""
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        # create_default_context/urllib3 also open SSLKEYLOGFILE from the parent
+        # environment. A missing debug folder must not prevent ZIP downloads.
+        self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self._ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        pool_kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs["ssl_context"] = self._ssl_context
+        if proxy.lower().startswith("https://"):
+            proxy_kwargs["proxy_ssl_context"] = self._ssl_context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
 def _connect(db_path):
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
@@ -62,8 +87,18 @@ def _archive_path(data_dir, suffix=".partial"):
     return Path(data_dir) / f"{ARCHIVE_FILENAME}{suffix}"
 
 
-def _check_free_space(data_dir, archive_remaining):
-    required = max(0, int(archive_remaining)) + ARCHIVE_IMAGE_BYTES + INSTALL_FREE_SPACE_MARGIN
+def _archive_spec(size):
+    if size == ARCHIVE_BYTES:
+        return {"bytes": ARCHIVE_BYTES, "sha256": ARCHIVE_SHA256,
+                "image_count": ARCHIVE_IMAGE_COUNT, "image_bytes": ARCHIVE_IMAGE_BYTES}
+    for spec in LEGACY_ARCHIVES:
+        if size == spec["bytes"]:
+            return spec
+    raise ArcaImageArchiveError("지원하는 배포 ZIP 크기가 아닙니다. 다운로드 완료 여부와 이미지팩 버전을 확인해 주세요.")
+
+
+def _check_free_space(data_dir, archive_remaining, image_bytes=ARCHIVE_IMAGE_BYTES):
+    required = max(0, int(archive_remaining)) + image_bytes + INSTALL_FREE_SPACE_MARGIN
     free = shutil.disk_usage(Path(data_dir)).free
     if free < required:
         raise ArcaImageArchiveError(
@@ -128,6 +163,8 @@ def download_google_archive(target, progress=None, control=None, session=None):
         return target
     own_session = session is None
     session = session or requests.Session()
+    if own_session:
+        session.mount("https://", _ArchiveHTTPSAdapter())
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
     })
@@ -220,22 +257,29 @@ def _validated_manifest(archive, expected_count=ARCHIVE_IMAGE_COUNT, expected_by
     return files
 
 
+def _legacy_image_keys():
+    # Public release metadata only; historical row ids are never used for linking.
+    return json.loads(Path(__file__).with_name("arca_image_archive_legacy.json").read_text(encoding="utf-8"))
+
+
 def _matching_database_rows(db_path, seed_db_path, manifest_files):
     """Resolve archive entries through stable seed metadata, never local row ids."""
     seed_path = Path(seed_db_path)
     if not seed_path.is_file():
         raise ArcaImageArchiveError("공유 그림체 ZIP 연결용 기본 DB를 찾지 못했습니다.")
-    manifest_ids = {item["image_id"] for item in manifest_files}
     with closing(_connect(seed_path)) as seed:
         seed_rows = seed.execute(
             "SELECT image.id,image.item_id,image.image_url,item.source_url "
             "FROM arca_style_images image "
             "JOIN arca_style_items item ON item.id=image.item_id",
         ).fetchall()
-    seed_by_id = {row["id"]: dict(row) for row in seed_rows if row["id"] in manifest_ids}
     archive_keys = {}
     modern = all("image_identity" in entry for entry in manifest_files)
     seed_keys = {(row["source_url"], _image_identity(row["image_url"])) for row in seed_rows}
+    legacy_keys = {} if modern else _legacy_image_keys()
+    for row in seed_rows:
+        name = hashlib.sha256(row["image_url"].encode()).hexdigest() + ".png"
+        legacy_keys.setdefault(name, (row["source_url"], _image_identity(row["image_url"])))
     for entry in manifest_files:
         if modern:
             key = (entry["source_url"], entry["image_identity"])
@@ -243,18 +287,12 @@ def _matching_database_rows(db_path, seed_db_path, manifest_files):
                 raise ArcaImageArchiveError("공유 그림체 ZIP과 기본 DB의 이미지 연결 정보가 일치하지 않습니다.")
             archive_keys[key] = entry["name"]
             continue
-        seed_row = seed_by_id.get(entry["image_id"])
-        expected_name = (
-            hashlib.sha256(seed_row["image_url"].encode()).hexdigest() + ".png"
-            if seed_row else ""
-        )
-        if (
-            not seed_row
-            or seed_row["item_id"] != entry["item_id"]
-            or expected_name != entry["name"]
-        ):
-            raise ArcaImageArchiveError("공유 그림체 ZIP과 기본 DB의 이미지 연결 정보가 일치하지 않습니다.")
-        key = (seed_row["source_url"], _image_identity(seed_row["image_url"]))
+        key = legacy_keys.get(entry["name"])
+        if key is None:
+            continue
+        key = tuple(key)
+        if key not in seed_keys:
+            continue
         if key in archive_keys:
             raise ArcaImageArchiveError("공유 그림체 ZIP의 안정 이미지 식별자가 중복됩니다.")
         archive_keys[key] = entry["name"]
@@ -274,13 +312,13 @@ def _matching_database_rows(db_path, seed_db_path, manifest_files):
         key = (row["source_url"], _image_identity(row["image_url"]))
         stable_rows.setdefault(key, []).append(dict(row))
 
+    keys_by_name = {name: key for key, name in archive_keys.items()}
     result = {}
     for entry in manifest_files:
         if modern:
             stable_key = (entry["source_url"], entry["image_identity"])
         else:
-            seed_row = seed_by_id[entry["image_id"]]
-            stable_key = (seed_row["source_url"], _image_identity(seed_row["image_url"]))
+            stable_key = keys_by_name.get(entry["name"])
         if stable_key in stable_rows:
             result[entry["name"]] = stable_rows[stable_key]
     return result
@@ -293,12 +331,24 @@ def install_image_archive(
     seed_db_path,
     progress=None,
     control=None,
-    expected_archive_sha256=ARCHIVE_SHA256,
-    expected_archive_bytes=ARCHIVE_BYTES,
-    expected_count=ARCHIVE_IMAGE_COUNT,
-    expected_bytes=ARCHIVE_IMAGE_BYTES,
+    expected_archive_sha256=None,
+    expected_archive_bytes=None,
+    expected_count=None,
+    expected_bytes=None,
 ):
     archive_path = Path(archive_path)
+    if expected_archive_bytes is None:
+        if not archive_path.is_file():
+            raise ArcaImageArchiveError("공유 그림체 ZIP을 찾지 못했습니다.")
+        spec = _archive_spec(archive_path.stat().st_size)
+        expected_archive_sha256 = spec["sha256"]
+        expected_archive_bytes = spec["bytes"]
+        expected_count = spec["image_count"]
+        expected_bytes = spec["image_bytes"]
+    else:
+        expected_archive_sha256 = expected_archive_sha256 or ARCHIVE_SHA256
+        expected_count = ARCHIVE_IMAGE_COUNT if expected_count is None else expected_count
+        expected_bytes = ARCHIVE_IMAGE_BYTES if expected_bytes is None else expected_bytes
     if not archive_path.is_file() or archive_path.stat().st_size != expected_archive_bytes:
         raise ArcaImageArchiveError("공유 그림체 ZIP의 파일 크기가 예상과 다릅니다.")
     digest = _sha256_file(archive_path, control=control)
@@ -446,7 +496,9 @@ def _run_archive_job(db_path, image_dir, data_dir, seed_db_path, job_id, mode, a
                 control=lambda: control("downloading_archive"),
             )
         else:
-            update_collection_job(db_path, job_id, downloaded_bytes=ARCHIVE_BYTES)
+            archive_bytes = Path(archive_path).stat().st_size
+            update_collection_job(db_path, job_id, downloaded_bytes=archive_bytes,
+                                  estimated_bytes=archive_bytes)
         update_collection_job(db_path, job_id, stage="verifying_archive")
 
         def install_progress(processed, total, installed, reused, elapsed):
@@ -474,7 +526,8 @@ def _run_archive_job(db_path, image_dir, data_dir, seed_db_path, job_id, mode, a
             warning += (" " if warning else "") + f"기본 그림체 이미지 {missing}장이 아직 없습니다. 앱 버전과 이미지팩을 확인해 주세요."
         update_collection_job(
             db_path, job_id, status="completed", stage="completed",
-            scanned_posts=ARCHIVE_IMAGE_COUNT,
+            total_posts=result["installed"] + result["reused"] + result["skipped_rows"],
+            scanned_posts=result["installed"] + result["reused"] + result["skipped_rows"],
             downloaded_images=result["installed"] + result["reused"], updated=result["installed"], error=warning,
         )
         if not warning:
@@ -526,44 +579,49 @@ def resume_archive_job(db_path, image_dir, data_dir, seed_db_path, job):
         data_root = Path(data_dir).resolve()
         if archive_path.parent != data_root or not archive_path.name.startswith("shared_images_upload_"):
             raise ArcaImageArchiveError("이전 로컬 ZIP 경로가 올바르지 않습니다.")
-        if not archive_path.is_file() or archive_path.stat().st_size != ARCHIVE_BYTES:
+        if not archive_path.is_file():
             raise ArcaImageArchiveError("이전 로컬 ZIP을 찾지 못했습니다. 다시 선택해 주세요.")
+        _archive_spec(archive_path.stat().st_size)
         return start_local_archive_job(db_path, image_dir, data_dir, seed_db_path, archive_path)
     raise ArcaImageArchiveError("이전 ZIP 작업 방식을 확인하지 못했습니다.")
 
 
 def start_local_upload(data_dir, filename, size):
-    if Path(str(filename or "")).suffix.lower() != ".zip" or int(size or 0) != ARCHIVE_BYTES:
-        raise ArcaImageArchiveError("선택한 ZIP의 파일명 또는 크기가 배포 파일과 다릅니다.")
-    _check_free_space(data_dir, ARCHIVE_BYTES)
+    if Path(str(filename or "")).suffix.lower() != ".zip":
+        raise ArcaImageArchiveError("공유 그림체 이미지팩 ZIP 파일을 선택해 주세요.")
+    if type(size) is not int:
+        raise ArcaImageArchiveError("ZIP 파일 크기가 올바르지 않습니다.")
+    spec = _archive_spec(size)
+    _check_free_space(data_dir, size, spec["image_bytes"])
     token = uuid.uuid4().hex
     path = Path(data_dir) / f"shared_images_upload_{token}.zip.partial"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"")
     with _UPLOAD_LOCK:
-        _LOCAL_UPLOADS[token] = path
+        _LOCAL_UPLOADS[token] = {"path": path, "bytes": size}
     return {"upload_id": token, "chunk_bytes": LOCAL_UPLOAD_CHUNK_BYTES, "uploaded_bytes": 0}
 
 
 def discard_local_upload(upload_id):
     with _UPLOAD_LOCK:
-        path = _LOCAL_UPLOADS.pop(upload_id, None)
-    if path is not None:
-        path.unlink(missing_ok=True)
+        upload = _LOCAL_UPLOADS.pop(upload_id, None)
+    if upload is not None:
+        upload["path"].unlink(missing_ok=True)
 
 
 def append_local_upload(upload_id, offset, stream, content_length):
     if not isinstance(upload_id, str) or not re.fullmatch(r"[0-9a-f]{32}", upload_id):
         raise ArcaImageArchiveError("로컬 ZIP 업로드 식별자가 올바르지 않습니다.")
     with _UPLOAD_LOCK:
-        path = _LOCAL_UPLOADS.get(upload_id)
-    if path is None or not path.is_file():
+        upload = _LOCAL_UPLOADS.get(upload_id)
+    if upload is None or not upload["path"].is_file():
         raise ArcaImageArchiveError("로컬 ZIP 업로드 작업을 찾지 못했습니다.")
+    path = upload["path"]
     if type(offset) is not int or offset != path.stat().st_size:
         raise ArcaImageArchiveError("로컬 ZIP 업로드 위치가 일치하지 않습니다.")
     if content_length is None or not 0 < content_length <= LOCAL_UPLOAD_CHUNK_BYTES:
         raise ArcaImageArchiveError("로컬 ZIP 조각 크기가 올바르지 않습니다.")
-    if offset + content_length > ARCHIVE_BYTES:
+    if offset + content_length > upload["bytes"]:
         raise ArcaImageArchiveError("로컬 ZIP 크기가 예상보다 큽니다.")
     remaining = content_length
     with path.open("ab") as handle:
@@ -573,14 +631,15 @@ def append_local_upload(upload_id, offset, stream, content_length):
                 raise ArcaImageArchiveError("로컬 ZIP 조각이 중간에 끊겼습니다.")
             handle.write(chunk)
             remaining -= len(chunk)
-    return {"uploaded_bytes": path.stat().st_size, "total_bytes": ARCHIVE_BYTES}
+    return {"uploaded_bytes": path.stat().st_size, "total_bytes": upload["bytes"]}
 
 
 def finish_local_upload(db_path, image_dir, data_dir, seed_db_path, upload_id):
     with _UPLOAD_LOCK:
-        path = _LOCAL_UPLOADS.pop(upload_id, None)
-    if path is None or not path.is_file() or path.stat().st_size != ARCHIVE_BYTES:
+        upload = _LOCAL_UPLOADS.pop(upload_id, None)
+    if upload is None or not upload["path"].is_file() or upload["path"].stat().st_size != upload["bytes"]:
         raise ArcaImageArchiveError("로컬 ZIP 업로드가 완료되지 않았습니다.")
+    path = upload["path"]
     final_path = path.with_suffix("")
     os.replace(path, final_path)
     return start_local_archive_job(db_path, image_dir, data_dir, seed_db_path, final_path)

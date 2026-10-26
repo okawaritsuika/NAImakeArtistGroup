@@ -600,6 +600,32 @@ test("collection progress handles known and unknown totals", () => {
   assert.equal(arcaSummaryText({ job_type: "image_archive", downloaded_images: 1687 }), "공유 그림체 이미지 1687장을 ZIP에서 설치했습니다.");
 });
 
+test("failed and stopped archive downloads keep byte progress instead of extraction counts", () => {
+  for (const stage of ["failed", "stopped", "interrupted"]) {
+    const job = { job_type: "image_archive", status: stage, stage,
+      progress: { bytes: [0, 2048], posts: [0, 4425], images: 0 } };
+    assert.equal(collectionCountsText(job), "ZIP 다운로드 0 B/2.00 KB");
+    assert.deepEqual(collectionProgress(job), { determinate: true, percent: 0 });
+    job.progress.bytes[0] = 1024;
+    assert.equal(collectionCountsText(job), "ZIP 다운로드 1.00 KB/2.00 KB");
+    assert.deepEqual(collectionProgress(job), { determinate: true, percent: 50 });
+  }
+  const rawJob = { job_type: "image_archive", stage: "failed", downloaded_bytes: 1024, estimated_bytes: 2048 };
+  assert.equal(collectionCountsText(rawJob), "ZIP 다운로드 1.00 KB/2.00 KB");
+  assert.deepEqual(collectionProgress(rawJob), { determinate: true, percent: 50 });
+});
+
+test("archive failures after downloading do not claim extraction has started", () => {
+  const job = { job_type: "image_archive", status: "failed", stage: "failed",
+    progress: { bytes: [2048, 2048], posts: [0, 4425], images: 0 } };
+  assert.equal(collectionCountsText(job), "ZIP 다운로드 완료 · 설치 준비");
+  assert.deepEqual(collectionProgress(job), { determinate: false, percent: 0 });
+  job.progress.posts = [100, 200];
+  job.progress.images = 95;
+  assert.equal(collectionCountsText(job), "압축 해제 100/200 · 준비 95장");
+  assert.deepEqual(collectionProgress(job), { determinate: true, percent: 50 });
+});
+
 test("collection panel stays open while active and can close after completion", () => {
   for (const status of ["queued", "running", "pause_requested", "paused", "stop_requested"]) {
     assert.equal(shouldOpenArcaCollectionPanel(status), true);
