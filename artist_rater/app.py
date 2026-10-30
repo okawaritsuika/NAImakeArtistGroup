@@ -5059,6 +5059,9 @@ def api_import_arca_browser_session():
         imported = import_arca_browser_session()
         if imported.get("connected"):
             return json_response(_safe_arca_browser_status(imported), 200)
+        # The fallback window owns the next result; do not retain an old
+        # auto-import error that would hide its startup failure during polling.
+        imported = clear_arca_browser_session()
         return json_response(_safe_arca_browser_status(imported, ARCA_LOGIN_MANAGER.start()), 202)
 
 

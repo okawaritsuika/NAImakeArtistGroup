@@ -1,6 +1,7 @@
 import json
 import argparse
 import os
+import ssl
 import subprocess
 import sys
 import threading
@@ -8,6 +9,7 @@ import time
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from tkinter import (
     BOTH,
     END,
@@ -27,11 +29,12 @@ from urllib.request import Request, urlopen
 
 
 APP_URL = "http://127.0.0.1:5001"
-CURRENT_VERSION = "v0.1.16"
+CURRENT_VERSION = "v0.1.17"
 GITHUB_LATEST_RELEASE_API = (
     "https://api.github.com/repos/okawaritsuika/NAImakeArtistGroup/releases/latest"
 )
 RELEASE_ASSET_NAME = "DanbooruArtistRater.exe"
+UPDATE_CHECK_TIMEOUT_SECONDS = 20
 LAUNCHER_SETTINGS_NAME = "launcher_settings.json"
 LAUNCHER_THEME = {
     "window_bg": "#f5f5f7",
@@ -92,6 +95,17 @@ def normalize_version(value):
         except ValueError:
             break
     return tuple(parts or [0])
+
+
+def _urlopen_verified(request, timeout):
+    if request.type != "https":
+        return urlopen(request, timeout=timeout)
+    # Optional TLS debug paths inherited from another app must not break updates.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_default_certs()
+    context.set_alpn_protocols(["http/1.1"])
+    return urlopen(request, timeout=timeout, context=context)
 
 
 def independent_frozen_environment(environment=None):
@@ -184,7 +198,7 @@ class LauncherController:
         self.popen = popen or subprocess.Popen
         self.process_run = process_run or subprocess.run
         self.browser_open = browser_open or webbrowser.open
-        self.urlopen = urlopen or globals()["urlopen"]
+        self.urlopen = urlopen or _urlopen_verified
         self.executable = Path(executable or sys.executable).resolve()
         self.frozen = bool(getattr(sys, "frozen", False) if frozen is None else frozen)
         self.process = None
@@ -806,16 +820,43 @@ class LauncherApp:
             self.status_dot.config(fg=LAUNCHER_THEME["success"])
         self.write(f"{message}\n")
 
-    def run_background(self, action, on_success):
+    def run_background(self, action, on_success, *, timeout_seconds=None, on_error=None):
+        results = Queue()
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
         def worker():
             try:
                 result = action()
             except Exception as exc:
-                self.root.after(0, lambda: self.set_status(f"오류: {exc}"))
-                return
-            self.root.after(0, lambda: on_success(result))
+                results.put((False, str(exc), time.monotonic()))
+            else:
+                results.put((True, result, time.monotonic()))
+
+        def fail(message):
+            if on_error is not None:
+                on_error(message)
+            else:
+                self.set_status(f"오류: {message}")
+
+        def poll_result():
+            try:
+                succeeded, result, completed_at = results.get_nowait()
+            except Empty:
+                if deadline is None or time.monotonic() < deadline:
+                    self.root.after(100, poll_result)
+                    return
+            else:
+                if deadline is None or completed_at < deadline:
+                    if succeeded:
+                        on_success(result)
+                    else:
+                        fail(result)
+                    return
+            fail("응답 시간이 초과되었습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.")
 
         threading.Thread(target=worker, daemon=True).start()
+        # Tk scheduling and widgets are touched only by the main thread.
+        self.root.after(100, poll_result)
 
     def save_auto_open_site(self):
         try:
@@ -850,9 +891,14 @@ class LauncherApp:
         self.set_status(self.controller.open_site())
 
     def check_update(self):
+        if getattr(self, "_update_check_running", False):
+            return
+        self._update_check_running = True
+        self.latest_update = None
         self.set_status("업데이트를 확인하는 중입니다...")
 
         def on_success(info):
+            self._update_check_running = False
             self.latest_update = info
             status = (
                 f"새 버전이 있습니다: {info.latest_version}"
@@ -864,7 +910,16 @@ class LauncherApp:
                 self.write("\n릴리스 노트\n")
                 self.write(info.release_notes.strip() + "\n\n")
 
-        self.run_background(self.controller.check_update, on_success)
+        def on_error(message):
+            self._update_check_running = False
+            self.set_status(f"오류: 업데이트 확인 실패: {message}")
+
+        self.run_background(
+            self.controller.check_update,
+            on_success,
+            timeout_seconds=UPDATE_CHECK_TIMEOUT_SECONDS,
+            on_error=on_error,
+        )
 
     def install_update(self):
         if not self.latest_update:

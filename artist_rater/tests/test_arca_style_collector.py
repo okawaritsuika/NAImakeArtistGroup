@@ -1,6 +1,8 @@
 import json
 import gzip
 import io
+import os
+import ssl
 import sqlite3
 import struct
 import tempfile
@@ -12,7 +14,7 @@ from contextlib import closing
 from datetime import date
 from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from PIL import Image
 import requests
 
@@ -184,6 +186,93 @@ class ArcaCollectorTest(unittest.TestCase):
         )
         self.assertEqual(status, {"connected": True, "browser": "전용 Chrome", "error": ""})
         self.assertEqual(len(snapshot_imported_arca_cookies()), 1)
+
+    def test_auto_import_uses_bounded_validation_and_closes_each_session(self):
+        jar = CookieJar()
+        jar.set_cookie(self._cookie(".arca.live", "session", "test-secret"))
+        sessions = [create_arca_session(), create_arca_session()]
+        for session in sessions:
+            session.close = MagicMock(wraps=session.close)
+        seen = []
+
+        def validator(session):
+            seen.append(session)
+            self.assertEqual(session.get_adapter("https://arca.live").max_retries.total, 0)
+            return {} if len(seen) == 1 else {"R18_NAI": {"category": "r18"}}
+
+        with patch.object(collector_module, "create_arca_session", side_effect=sessions):
+            result = import_arca_browser_session(
+                loaders=[("Chrome", lambda: jar), ("Edge", lambda: jar)], validator=validator,
+            )
+        self.assertTrue(result["connected"])
+        self.assertEqual(result["browser"], "Edge")
+        self.assertEqual(seen, sessions)
+        for session in sessions:
+            session.close.assert_called_once()
+
+    def test_auto_import_handles_optional_provider_initialization_failure(self):
+        import builtins
+
+        original_import = builtins.__import__
+
+        def failing_import(name, *args, **kwargs):
+            if name == "browser_cookie3":
+                raise RuntimeError("private Windows provider error")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=failing_import):
+            result = import_arca_browser_session()
+        self.assertFalse(result["connected"])
+        self.assertIn("시작하지 못했습니다", result["error"])
+        self.assertNotIn("private", result["error"])
+
+    def test_login_and_collection_tls_ignore_missing_debug_log_without_network(self):
+        keylog = str(Path(self.temp.name) / "missing-debug-directory" / "keys.log")
+
+        def check_connection(session):
+            adapter = session.get_adapter("https://arca.live")
+            pool = adapter.poolmanager.connection_from_url("https://arca.live/")
+            adapter.cert_verify(pool, "https://arca.live/", True, None)
+            connection = pool._new_conn()
+            with patch.object(connection, "_new_conn", return_value=MagicMock()), \
+                    patch("urllib3.util.ssl_._ssl_wrap_socket_impl", return_value=MagicMock()):
+                connection.connect()
+            context = connection.ssl_context
+            self.assertIsNotNone(context)
+            self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(context.check_hostname)
+            self.assertIsNone(context.keylog_filename)
+            self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
+            connection.close()
+            return {"R18_NAI": {"category": "r18"}}
+
+        jar = CookieJar()
+        jar.set_cookie(self._cookie(".arca.live", "session", "test-secret"))
+        with patch.dict(os.environ, {"SSLKEYLOGFILE": keylog}):
+            with create_arca_session() as session:
+                check_connection(session)
+                with collector_module._clone_arca_session(session, use_retries=False) as worker:
+                    check_connection(worker)
+                    self.assertEqual(worker.get_adapter("https://arca.live").max_retries.total, 0)
+                self.assertEqual(session.get_adapter("https://arca.live").max_retries.total, 3)
+            result = connect_arca_cookie_jar(jar, "현재 Chrome", validator=check_connection)
+            self.assertTrue(result["connected"], result)
+            self.assertEqual(os.environ["SSLKEYLOGFILE"], keylog)
+            self.assertFalse(Path(keylog).parent.exists())
+
+    def test_arca_tls_preserves_default_requests_handshake_settings(self):
+        from urllib3.util.ssl_ import create_urllib3_context
+
+        with patch.dict(os.environ, {"SSLKEYLOGFILE": ""}):
+            expected = create_urllib3_context()
+        with create_arca_session() as session:
+            actual = session.get_adapter("https://arca.live")._ssl_context
+            self.assertEqual(actual.options, expected.options)
+            self.assertEqual(actual.post_handshake_auth, expected.post_handshake_auth)
+            self.assertEqual(actual.minimum_version, expected.minimum_version)
+            self.assertEqual(actual.get_ciphers(), expected.get_ciphers())
+            self.assertEqual(actual.check_hostname, expected.check_hostname)
+            self.assertEqual(actual.verify_mode, expected.verify_mode)
 
     def test_rejects_login_window_cookie_without_r18_access(self):
         jar = CookieJar()

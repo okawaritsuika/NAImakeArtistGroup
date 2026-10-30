@@ -5,6 +5,7 @@ import io
 import json
 import math
 import re
+import ssl
 import sqlite3
 import struct
 import time
@@ -110,6 +111,28 @@ class _RequestPacer:
             self._next_start = max(self._next_start, time.monotonic() + max(0.0, float(seconds)))
 
 
+class ArcaHTTPSAdapter(HTTPAdapter):
+    """Keep TLS verification without inheriting optional SSL key-log paths."""
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        # A missing debug folder must not prevent login, collection or downloads.
+        self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        self._ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        # Match urllib3's normal TLS handshake; only optional key logging differs.
+        # A bare SSLContext changes the handshake and Arca rejects it with 403.
+        self._ssl_context.options |= ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_COMPRESSION | ssl.OP_NO_TICKET
+        self._ssl_context.post_handshake_auth = True
+        self._ssl_context.hostname_checks_common_name = False
+        pool_kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs["ssl_context"] = self._ssl_context
+        if proxy.lower().startswith("https://"):
+            proxy_kwargs["proxy_ssl_context"] = self._ssl_context
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
 def create_arca_session():
     session = requests.Session()
     session.headers.update({
@@ -128,7 +151,7 @@ def create_arca_session():
         allowed_methods=frozenset({"GET"}),
         raise_on_status=True,
     )
-    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.mount("https://", ArcaHTTPSAdapter(max_retries=retries))
     return session
 
 
@@ -181,7 +204,7 @@ def connect_arca_cookie_jar(cookie_jar, browser, validator=None, user_agent=""):
     try:
         with closing(create_arca_session()) as session:
             # Login checks should return promptly; collection retains its retries.
-            session.mount("https://", HTTPAdapter(max_retries=0))
+            session.mount("https://", ArcaHTTPSAdapter(max_retries=0))
             session.headers["User-Agent"] = user_agent
             for cookie in filtered:
                 session.cookies.set_cookie(copy.copy(cookie))
@@ -217,36 +240,25 @@ def connect_arca_cookie_jar(cookie_jar, browser, validator=None, user_agent=""):
 
 
 def import_arca_browser_session(loaders=None, validator=None):
-    global _ARCA_BROWSER_COOKIES, _ARCA_BROWSER_STATUS
     clear_arca_browser_session()
     if loaders is None:
         try:
             import browser_cookie3
         except ImportError:
             return clear_arca_browser_session("브라우저 로그인 가져오기 구성요소가 설치되지 않았습니다.")
+        except Exception:
+            # Optional Windows cookie providers can fail while importing COM/WMI.
+            # The dedicated Chrome login must still be available in windowed EXEs.
+            return clear_arca_browser_session("브라우저 로그인 가져오기 구성요소를 시작하지 못했습니다.")
         loaders = [
             ("Chrome", lambda: browser_cookie3.chrome(domain_name="arca.live")),
             ("Edge", lambda: browser_cookie3.edge(domain_name="arca.live")),
         ]
-    validator = validator or discover_category_params
     for browser, loader in loaders:
         try:
-            filtered = CookieJar()
-            for cookie in loader():
-                if _is_arca_cookie(cookie):
-                    filtered.set_cookie(copy.copy(cookie))
-            if not list(filtered):
-                continue
-            session = create_arca_session()
-            for cookie in filtered:
-                session.cookies.set_cookie(copy.copy(cookie))
-            categories = validator(session)
-            if "R18_NAI" not in categories:
-                continue
-            with _ARCA_BROWSER_LOCK:
-                _ARCA_BROWSER_COOKIES = filtered
-                _ARCA_BROWSER_STATUS = {"connected": True, "browser": browser, "error": ""}
-                return dict(_ARCA_BROWSER_STATUS)
+            result = connect_arca_cookie_jar(loader(), browser, validator=validator)
+            if result["connected"]:
+                return result
         except Exception:
             continue
     return clear_arca_browser_session("Chrome 또는 Edge에서 로그인된 아카라이브 세션을 찾지 못했습니다.")
@@ -2769,6 +2781,8 @@ def fetch_html(session, url):
 
 def _clone_arca_session(session, use_retries=True):
     cloned = create_arca_session() if use_retries else requests.Session()
+    if not use_retries:
+        cloned.mount("https://", ArcaHTTPSAdapter(max_retries=0))
     headers = getattr(session, "headers", None)
     if headers:
         cloned.headers.update(dict(headers))

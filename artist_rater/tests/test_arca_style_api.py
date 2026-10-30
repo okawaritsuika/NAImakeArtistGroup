@@ -163,6 +163,33 @@ class ArcaStyleApiTest(unittest.TestCase):
         self.assertEqual(browser, "현재 Chrome")
         self.assertEqual([(cookie.name, cookie.domain) for cookie in cookie_jar], [("arca-session", ".arca.live")])
 
+    @patch("app.ARCA_LOGIN_MANAGER")
+    def test_auto_import_failure_does_not_hide_login_window_startup_error(self, manager):
+        self.addCleanup(app.clear_arca_browser_session)
+        manager.start.return_value = {"state": "opening", "message": "로그인 창 여는 중…"}
+        reason = "Chrome 로그인 창과 연결하지 못했습니다."
+        manager.status.return_value = {"state": "failed", "message": reason, "error": reason}
+        with patch("app.import_arca_browser_session", side_effect=lambda: app.clear_arca_browser_session("자동 가져오기 실패")):
+            response = self.client.post("/api/arca-styles/browser-session/import", headers={"X-Arca-Local-Request": "1"})
+            self.assertEqual(response.status_code, 202)
+        status = self.client.get("/api/arca-styles/browser-session").get_json()
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["message"], reason)
+
+    @patch("app.connect_arca_cookie_jar")
+    def test_naim_bridge_payload_is_compatible_with_artist_app(self, connect):
+        connect.return_value = {"connected": True, "browser": "현재 Chrome", "error": ""}
+        response = self.client.post(
+            "/api/arca-styles/browser-session/extension",
+            headers={"X-Arca-Session-Bridge": "1", "User-Agent": "Synthetic Chrome/1.0"},
+            json={"cookies": [{"name": "session", "value": "synthetic-session", "domain": ".arca.live", "path": "/"}],
+                  "user_agent": "Synthetic Chrome/1.0"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["connected"])
+        self.assertEqual(connect.call_args.kwargs["user_agent"], "Synthetic Chrome/1.0")
+        self.assertNotIn("synthetic-session", response.get_data(as_text=True))
+
     @patch("app.connect_arca_cookie_jar")
     def test_browser_extension_rejects_requests_without_bridge_header(self, connect):
         response = self.client.post(

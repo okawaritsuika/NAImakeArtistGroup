@@ -88,7 +88,7 @@ def reserve_local_port():
         return sock.getsockname()[1]
 
 
-def wait_for_cdp(endpoint, process, timeout_seconds=10):
+def wait_for_cdp(endpoint, process, timeout_seconds=30):
     opener = build_opener(ProxyHandler({}))
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:

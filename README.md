@@ -4,9 +4,11 @@ Danbooru 작가를 평가하고, 평가 결과로 NovelAI용 그림체 프롬프
 
 ## 다운로드
 
-[v0.1.12 EXE 다운로드](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/download/v0.1.12/DanbooruArtistRater.exe) · [릴리스 및 변경사항](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.12) · [아카라이브 소개 본글](https://arca.live/b/aiart/177316727)
+[v0.1.17 EXE 다운로드](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/download/v0.1.17/DanbooruArtistRater.exe) · [릴리스 및 변경사항](https://github.com/okawaritsuika/NAImakeArtistGroup/releases/tag/v0.1.17) · [아카라이브 소개 본글](https://arca.live/b/aiart/177316727)
 
 업데이트할 때는 기존 EXE 옆의 `data` 폴더를 유지해 주세요.
+
+이전 버전에서 업데이트 확인이 계속 멈춰 있다면 위 EXE를 직접 받아 교체해 주세요. v0.1.17부터는 업데이트 확인 실패와 시간 초과를 표시하고 다시 시도할 수 있습니다.
 
 ## 주요 기능
 
@@ -126,7 +128,9 @@ v0.1.14부터는 `공유 그림체 수집 → 🔞 게시판 로그인 → 계�
 
 기존 확장 사용자는 앱 업데이트 후 **설치 폴더 열기**를 다시 눌러 확장 파일을 갱신하고,
 Chrome의 `chrome://extensions`에서 **Arca Session Bridge 새로고침**을 누른 뒤 **현재 로그인 연결**을 눌러 주세요.
-확장 버전은 `1.0.1`입니다. 연결 실패 시 표시되는 구체적인 이유를 확인하고, 앱에서는 **연결 상태 확인**으로 결과를 갱신합니다.
+앱에 포함된 확장 버전은 `1.0.2`입니다. 연결이 지연되면 시간 초과를 안내합니다. 연결 실패 시 표시되는 구체적인 이유를 확인하고, 앱에서는 **연결 상태 확인**으로 결과를 갱신합니다.
+
+NAI Image Manager의 **Arca Session Bridge (NAI Apps) 1.1.1**도 그대로 사용할 수 있습니다. 이 확장의 **현재 로그인 연결**은 NAIM(5000)과 NAImakeArtistGroup(5001)에 각각 연결하며, 앱마다 결과를 따로 표시합니다.
 
 확장은 `arca.live` 쿠키 읽기와 `127.0.0.1` 로컬 앱 연결 권한만 사용합니다. 전달된 Arca 쿠키는 앱 프로세스 메모리에만 있고 응답·로그·설정 파일에는 저장되지 않습니다. NovelAI App Key도 GitHub나 EXE에 포함되지 않으며 사용자 PC의 `data/settings.json`에만 저장됩니다.
 

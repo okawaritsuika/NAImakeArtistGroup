@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import ssl
 import tempfile
 import unittest
 from pathlib import Path
@@ -140,7 +142,7 @@ class LauncherControllerTest(unittest.TestCase):
                 controller.remove_data_directory("C:/one")
 
     def test_packaged_version_matches_next_release(self):
-        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.16")
+        self.assertEqual(launcher.CURRENT_VERSION, "v0.1.17")
 
     def test_independent_frozen_environment_removes_parent_bootloader_state(self):
         env = launcher.independent_frozen_environment({
@@ -409,6 +411,129 @@ class LauncherControllerTest(unittest.TestCase):
         self.assertEqual(info.latest_version, "v0.2.0")
         self.assertEqual(info.asset_url, "https://github.test/app.exe")
         self.assertIn("새 리모콘", info.release_notes)
+
+    def test_background_failure_is_displayed_after_worker_has_exited(self):
+        callbacks = []
+        statuses = []
+
+        class Root:
+            def after(self, delay, callback):
+                callbacks.append(callback)
+
+        class ImmediateThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        def failed_check():
+            raise OSError("connection timed out")
+
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.root = Root()
+        app.set_status = statuses.append
+        with patch.object(launcher.threading, "Thread", ImmediateThread):
+            app.run_background(failed_check, lambda result: self.fail("Unexpected success"))
+        self.assertEqual(statuses, [])
+        callbacks.pop(0)()
+        self.assertEqual(statuses, ["오류: connection timed out"])
+
+    def test_background_worker_never_calls_tk_and_delivers_success_on_poll(self):
+        callbacks = []
+        workers = []
+        completed = []
+
+        class Root:
+            def after(self, delay, callback):
+                callbacks.append(callback)
+
+        class DeferredThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                workers.append(self.target)
+
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.root = Root()
+        with patch.object(launcher.threading, "Thread", DeferredThread):
+            app.run_background(lambda: "ready", completed.append)
+        with patch.object(app.root, "after", side_effect=AssertionError("Worker called Tk")):
+            workers.pop(0)()
+        self.assertEqual(completed, [])
+        callbacks.pop(0)()
+        self.assertEqual(completed, ["ready"])
+
+    def test_update_check_times_out_allows_retry_and_ignores_late_result(self):
+        callbacks = []
+        workers = []
+        statuses = []
+        info = launcher.UpdateInfo("v1", "v2", True, "notes", "asset", "release")
+
+        class Root:
+            def after(self, delay, callback):
+                callbacks.append(callback)
+
+        class DeferredThread:
+            def __init__(self, target, daemon):
+                self.target = target
+
+            def start(self):
+                workers.append(self.target)
+
+        class Controller:
+            def check_update(self):
+                return info
+
+        app = launcher.LauncherApp.__new__(launcher.LauncherApp)
+        app.root = Root()
+        app.controller = Controller()
+        app.latest_update = object()
+        app.set_status = statuses.append
+        app.write = lambda message: None
+        with (
+            patch.object(launcher.threading, "Thread", DeferredThread),
+            patch.object(launcher.time, "monotonic", return_value=100) as clock,
+        ):
+            app.check_update()
+            app.check_update()
+            self.assertEqual(len(workers), 1)
+            self.assertIsNone(app.latest_update)
+            clock.return_value = 100 + launcher.UPDATE_CHECK_TIMEOUT_SECONDS
+            callbacks.pop(0)()
+            self.assertIn("응답 시간이 초과", statuses[-1])
+            self.assertFalse(app._update_check_running)
+
+            # A stalled old request must not overwrite the result of a retry.
+            app.check_update()
+            workers.pop(0)()
+            self.assertIsNone(app.latest_update)
+            workers.pop(0)()
+            callbacks.pop(0)()
+            self.assertIs(app.latest_update, info)
+            self.assertFalse(app._update_check_running)
+            self.assertEqual(statuses[-1], "새 버전이 있습니다: v2")
+            self.assertEqual(callbacks, [])
+
+    def test_update_check_uses_verified_tls_without_optional_keylog_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            keylog = str(Path(temp_dir) / "missing-debug-directory" / "keys.log")
+            payload = json.dumps({"tag_name": "v0.2.0"}).encode("utf-8")
+            with (
+                patch.dict(os.environ, {"SSLKEYLOGFILE": keylog}),
+                patch.object(launcher, "urlopen", return_value=FakeResponse(payload)) as open_url,
+            ):
+                controller = launcher.LauncherController(data_dir=temp_dir)
+                controller.check_update()
+                context = open_url.call_args.kwargs["context"]
+                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                self.assertTrue(context.check_hostname)
+                self.assertGreaterEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+                self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
+                self.assertIsNone(context.keylog_filename)
+                self.assertEqual(os.environ["SSLKEYLOGFILE"], keylog)
+                self.assertFalse(Path(keylog).parent.exists())
 
     def test_download_update_writes_asset_to_updates_directory(self):
         with tempfile.TemporaryDirectory() as temp_dir:

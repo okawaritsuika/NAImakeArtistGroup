@@ -3,7 +3,6 @@ import json
 import os
 import re
 import shutil
-import ssl
 import sqlite3
 import time
 import uuid
@@ -17,6 +16,7 @@ import requests
 from PIL import Image
 
 from arca_style_collector import (
+    ArcaHTTPSAdapter as _ArchiveHTTPSAdapter,
     ArcaCollectionStopped,
     ArcaCollectorError,
     _image_identity,
@@ -56,24 +56,6 @@ _LOCAL_UPLOADS = {}
 
 class ArcaImageArchiveError(ArcaCollectorError):
     pass
-
-
-class _ArchiveHTTPSAdapter(requests.adapters.HTTPAdapter):
-    """Keep TLS verification without inheriting optional SSL key-log paths."""
-
-    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        # create_default_context/urllib3 also open SSLKEYLOGFILE from the parent
-        # environment. A missing debug folder must not prevent ZIP downloads.
-        self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        self._ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        pool_kwargs["ssl_context"] = self._ssl_context
-        return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
-
-    def proxy_manager_for(self, proxy, **proxy_kwargs):
-        proxy_kwargs["ssl_context"] = self._ssl_context
-        if proxy.lower().startswith("https://"):
-            proxy_kwargs["proxy_ssl_context"] = self._ssl_context
-        return super().proxy_manager_for(proxy, **proxy_kwargs)
 
 
 def _connect(db_path):

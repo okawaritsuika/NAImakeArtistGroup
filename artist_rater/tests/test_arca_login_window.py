@@ -304,6 +304,16 @@ class ArcaLoginWindowManagerTest(unittest.TestCase):
         proxy.assert_called_once_with({})
         opener.open.assert_called_once_with("http://127.0.0.1:43123/json/version", timeout=0.5)
 
+    def test_cdp_readiness_allows_chrome_starting_after_ten_seconds(self):
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        opener = Mock()
+        opener.open.return_value = response
+        with patch.object(login, "build_opener", return_value=opener), \
+                patch.object(login.time, "monotonic", side_effect=[0, 11]):
+            self.assertTrue(login.wait_for_cdp("http://127.0.0.1:43123", FakeProcess()))
+
     def test_cdp_failure_is_classified_and_stops_only_the_created_process(self):
         process = FakeProcess()
         with self.assertRaises(ArcaLoginWindowError) as raised:
